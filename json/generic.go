@@ -63,7 +63,9 @@ func (g *G[T]) UnmarshalJSON(data []byte) error {
 	if tp == nil {
 		return fmt.Errorf("type:%s is not binding", proxy.Type)
 	}
-
+	if len(proxy.Data) == 0 {
+		return nil
+	}
 	if len(proxy.Data) == 4 && string(proxy.Data) == "null" {
 		return nil
 	}
@@ -154,14 +156,3 @@ type unmarshalProxy struct {
 type generic[T any] struct {
 	Data T
 }
-
-// type G2[T any] uintptr
-
-// func (g G2[T]) MarshalJSON() ([]byte, error) {
-// 	if g == 0 {
-// 		return []byte("null"), nil
-// 	}
-// 	var s = 1
-// 	var ptr unsafe.Pointer = unsafe.Pointer(g)
-
-// }
