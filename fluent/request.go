@@ -90,6 +90,12 @@ type Context struct {
 func (r *request) Response() (*http.Response, error) {
 	var sendFn func() (*http.Response, error)
 	maxCount := MaxRetryTimes
+
+	var retryHandler RetryHandler
+	if r.RetryStrategy != nil {
+		retryHandler = r.RetryStrategy()
+	}
+
 	sendFn = func() (*http.Response, error) {
 		start := time.Now()
 		if request, err := r.Build(); err != nil {
@@ -107,16 +113,14 @@ func (r *request) Response() (*http.Response, error) {
 			}
 			if maxCount > 0 {
 				maxCount--
-				if r.RetryStrategy != nil {
-					if result, needRetry := r.RetryStrategy(r.ctx, resp, err); result != nil && needRetry {
+				if retryHandler != nil {
+					if result, needRetry := retryHandler(r.ctx, resp, err); result != nil && needRetry {
 						return sendFn()
 					} else {
 						err = result
 					}
-
 				}
 			}
-
 			return resp, err
 		}
 	}

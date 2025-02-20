@@ -5,7 +5,9 @@ import (
 	"net/http"
 )
 
-type RetryStrategy func(ctx context.Context, resp *http.Response, err error) (error, bool)
+type RetryHandler func(ctx context.Context, resp *http.Response, err error) (error, bool)
+
+type RetryStrategy func() RetryHandler
 
 type RequestOptions struct {
 	Headers       map[string]string
