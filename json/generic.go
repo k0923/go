@@ -6,6 +6,31 @@ import (
 	"reflect"
 )
 
+type CustomSerializer interface {
+	Marshal(tp string, data interface{}) ([]byte, error)
+	Unmarshal(data json.RawMessage) (string, []byte, error) // 输入一个原始的JSON数据，需要返回对应的类型域和数据域
+}
+
+var defaultS = defaultSerializer{}
+
+type defaultSerializer struct{}
+
+func (s defaultSerializer) Marshal(tp string, data interface{}) ([]byte, error) {
+	return json.Marshal(marshalProxy{
+		Type: tp,
+		Data: data,
+	})
+}
+
+func (s defaultSerializer) Unmarshal(data json.RawMessage) (string, []byte, error) {
+	var proxy unmarshalProxy
+	if err := json.Unmarshal(data, &proxy); err != nil {
+		return "", nil, err
+	}
+	return proxy.Type, proxy.Data, nil
+}
+
+var customSerializer = make(map[reflect.Type]CustomSerializer)
 var hub = make(map[reflect.Type]map[string]reflect.Type)
 var hubMap = make(map[reflect.Type]map[reflect.Type]string)
 
@@ -34,13 +59,14 @@ func (g G[T]) MarshalJSON() ([]byte, error) {
 		return []byte("null"), nil
 	}
 	typeofT := getInterfaceType[T]()
-
 	if subHub, exist := hubMap[typeofT]; exist {
 		if tpName, exist := subHub[tp]; exist {
-			return json.Marshal(marshalProxy{
-				Type: tpName,
-				Data: g[0],
-			})
+			s := customSerializer[typeofT]
+			if s == nil {
+				s = defaultS
+			}
+
+			return s.Marshal(tpName, g[0])
 		}
 	}
 	return nil, fmt.Errorf("type %T is not binding", g[0])
@@ -51,27 +77,31 @@ func (g *G[T]) UnmarshalJSON(data []byte) error {
 		return nil
 	}
 	typeofT := getInterfaceType[T]()
-	var proxy unmarshalProxy
-	if err := json.Unmarshal(data, &proxy); err != nil {
+	s := customSerializer[typeofT]
+	if s == nil {
+		s = defaultS
+	}
+	tpName, data, err := s.Unmarshal(data)
+	if err != nil {
 		return err
 	}
 	subMap := hub[typeofT]
 	if subMap == nil {
 		return fmt.Errorf("interface type:%T has no binding info,%v", typeofT, subMap)
 	}
-	tp := subMap[proxy.Type]
+	tp := subMap[tpName]
 	if tp == nil {
-		return fmt.Errorf("type:%s is not binding", proxy.Type)
+		return fmt.Errorf("type:%s is not binding", tpName)
 	}
-	if len(proxy.Data) == 0 {
+	if len(data) == 0 {
 		return nil
 	}
-	if len(proxy.Data) == 4 && string(proxy.Data) == "null" {
+	if len(data) == 4 && string(data) == "null" {
 		return nil
 	}
 
 	result := reflect.New(tp)
-	if err := json.Unmarshal(proxy.Data, result.Interface()); err != nil {
+	if err := json.Unmarshal(data, result.Interface()); err != nil {
 		return err
 	}
 
@@ -109,8 +139,11 @@ func getInterfaceType[T any]() reflect.Type {
 	return reflect.TypeOf(tp).Elem()
 }
 
-func Bind[T any](data map[string]T) {
+func Bind[T any](data map[string]T, options ...CustomSerializer) {
 	typeofT := getInterfaceType[T]()
+	if len(options) > 0 {
+		customSerializer[typeofT] = options[0]
+	}
 	for k, v := range data {
 		tp := reflect.TypeOf(v)
 		if tp == nil {

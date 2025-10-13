@@ -1,6 +1,7 @@
 package json
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"testing"
@@ -568,3 +569,35 @@ func TestHello(t *testing.T) {
 	fmt.Println('a' - 'A')
 	fmt.Println(('a' - 'A') | 'E')
 }
+
+type Runable interface {
+	Run(ctx context.Context) error
+}
+
+type Task struct {
+	Context Runable `json:"context,omitempty"`
+}
+
+type Man struct {
+	Name string `json:"name"`
+}
+
+func (man Man) Run(ctx context.Context) error {
+	return nil
+}
+
+// func TestRunable(t *testing.T) {
+// 	test := Task{
+// 		Context: Man{},
+// 	}
+// 	data, err := json.Marshal(test)
+// 	fmt.Println("data:", string(data))
+// 	if err != nil {
+// 		panic(err)
+// 	}
+// 	err = json.Unmarshal(data, &test)
+// 	if err != nil {
+// 		panic(err)
+// 	}
+
+// }

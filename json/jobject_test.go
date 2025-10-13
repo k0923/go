@@ -136,22 +136,22 @@ const testJsonData = `
 	"customers": [
       {
         "id": 3534,
-        "name": "冬瓜",
+        "name": "西瓜",
         "project_id": 321,
         "created": "2023-11-10T15:16:39+08:00",
         "app_id": 165622,
-        "app_cn_name": "冬瓜",
+        "app_cn_name": "西瓜",
         "app_name": "xigua",
         "internal": true,
         "disabled": false
       },
 	  {
         "id": 3535,
-        "name": "冬瓜1",
+        "name": "西瓜1",
         "project_id": 321,
         "created": "2023-11-10T15:16:39+08:00",
         "234": 165623,
-        "app_cn_name": "冬瓜1",
+        "app_cn_name": "西瓜1",
         "app_name": "xigua1",
         "internal": true,
         "disabled": false

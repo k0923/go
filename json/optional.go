@@ -77,3 +77,13 @@ func Null[T any]() Optional[T] {
 		nil,
 	}
 }
+
+// func Convert[T any, E any](source Optional[T], convert func(T) E) Optional[E] {
+// 	switch {
+// 	case source.IsNull():
+// 		return Null[E]()
+// 	case source.IsSet():
+// 		return N(convert(source.Value()))
+// 	}
+// 	return nil
+// }

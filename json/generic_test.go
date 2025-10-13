@@ -3,6 +3,7 @@ package json
 import (
 	"encoding/json"
 	"fmt"
+	"strconv"
 	"testing"
 
 	. "github.com/smartystreets/goconvey/convey"
@@ -212,5 +213,206 @@ func TestXxx1(t *testing.T) {
 }
 
 type PeopleV2 struct {
-	Data G[S1] `json:"data"`
+	Data G[Speeker] `json:"data"`
+}
+
+func TestXXX2(t *testing.T) {
+	var p PeopleV2
+	var data = `{"data":{"type":"s1"}}`
+	err := json.Unmarshal([]byte(data), &p)
+	if err != nil {
+		panic(err)
+	}
+
+	fmt.Println(p.Data.Value() == nil)
+
+}
+
+type ElementTyper interface {
+	Type() string
+}
+
+type TextElement string
+
+func (t TextElement) Type() string {
+	return "text"
+}
+
+type MensionUserElement string
+
+func (m MensionUserElement) Type() string {
+	return "mention_user"
+}
+
+type ElementSerializer struct{}
+
+func (s ElementSerializer) Marshal(tp string, data interface{}) ([]byte, error) {
+	return json.Marshal(map[string]interface{}{
+		"type": tp,
+		tp:     data,
+	})
+}
+func (s ElementSerializer) Unmarshal(data json.RawMessage) (string, []byte, error) {
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal(data, &m); err != nil {
+		return "", nil, err
+	}
+	tp := string(m["type"])
+	tp = tp[1 : len(tp)-1]
+	d := m[tp]
+	return tp, d, nil
+}
+
+func TestCustomSerializer(t *testing.T) {
+	Bind(map[string]ElementTyper{
+		"text":         TextElement(""),
+		"mention_user": MensionUserElement(""),
+	}, ElementSerializer{})
+
+	Convey("Test Custom Serializer", t, func() {
+		var data []G[ElementTyper] = []G[ElementTyper]{
+			NG[ElementTyper](TextElement("hello")),
+			NG[ElementTyper](MensionUserElement("world")),
+		}
+		d, err := json.Marshal(data)
+		So(err, ShouldBeNil)
+
+		var d1 []G[ElementTyper]
+		err = json.Unmarshal(d, &d1)
+		So(err, ShouldBeNil)
+		_, ok := d1[0].Value().(TextElement)
+		So(ok, ShouldBeTrue)
+		_, ok = d1[1].Value().(MensionUserElement)
+		So(ok, ShouldBeTrue)
+
+	})
+
+}
+
+type BlockInfo struct {
+	ID       string   `json:"block_id,omitempty"`
+	Type     int      `json:"block_type"`
+	Children []string `json:"children,omitempty"`
+	ParentID string   `json:"parent_id,omitempty"`
+}
+
+func (b *BlockInfo) SetType(t int) {
+	b.Type = t
+}
+
+func (b *BlockInfo) SetID(id string) {
+	b.ID = id
+}
+
+func (b *BlockInfo) GetID() string {
+	return b.ID
+}
+
+func (b *BlockInfo) GetType() int {
+	return b.Type
+}
+
+type Blocker interface {
+	SetID(string)
+	GetID() string
+	SetType(int)
+	GetType() int
+}
+
+type TextBlock struct {
+	BlockInfo
+	Text TextElements `json:"text"`
+}
+
+type TextElements struct {
+	Elements []TextRunElement `json:"elements,omitempty"`
+}
+
+type TextRunElement struct {
+	TextRun `json:"text_run,omitempty"`
+}
+
+type TextRun struct {
+	Content string `json:"content,omitempty"`
+}
+
+type ImageBlock struct {
+	BlockInfo
+	Image ImageProp `json:"image,omitempty"`
+}
+
+type ImageProp struct {
+	Align  int    `json:"align,omitempty"`
+	Height int    `json:"height,omitempty"`
+	Token  string `json:"token,omitempty"`
+	Width  int    `json:"width,omitempty"`
+}
+
+type BlockSerializer struct{}
+
+func (s BlockSerializer) Marshal(tp string, data interface{}) ([]byte, error) {
+	if block, ok := data.(Blocker); ok {
+		tpID, err := strconv.Atoi(tp)
+		if err != nil {
+			return nil, err
+		}
+		block.SetType(tpID)
+	}
+	return json.Marshal(data)
+}
+func (s BlockSerializer) Unmarshal(data json.RawMessage) (string, []byte, error) {
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal(data, &m); err != nil {
+		return "", nil, err
+	}
+	tp := string(m["block_type"])
+	return tp, data, nil
+}
+
+func TestCustomSerializerV2(t *testing.T) {
+	Bind(map[string]Blocker{
+		"2":  &TextBlock{},
+		"27": &ImageBlock{},
+	}, BlockSerializer{})
+
+	var textBlock = TextBlock{
+		BlockInfo: BlockInfo{
+			ID: "HEllo",
+		},
+		Text: TextElements{
+			Elements: []TextRunElement{
+				{
+					TextRun: TextRun{
+						Content: "hello",
+					},
+				},
+			},
+		},
+	}
+
+	Convey("Test Block Serializer", t, func() {
+		var data []G[Blocker] = []G[Blocker]{
+			NG[Blocker](&textBlock),
+			NG[Blocker](&ImageBlock{
+				BlockInfo: BlockInfo{
+					ID: "IMG_HELWO",
+				},
+				Image: ImageProp{
+					Height: 512,
+					Width:  512,
+				},
+			}),
+		}
+
+		d, err := json.Marshal(data)
+		So(err, ShouldBeNil)
+		var d2 []G[Blocker]
+		err = json.Unmarshal(d, &d2)
+		So(err, ShouldBeNil)
+		So(d2[0].Value().GetID(), ShouldEqual, "HEllo")
+		So(d2[1].Value().GetID(), ShouldEqual, "IMG_HELWO")
+		So(d2[0].Value().GetType(), ShouldEqual, 2)
+		So(d2[1].Value().GetType(), ShouldEqual, 27)
+	})
+
 }
