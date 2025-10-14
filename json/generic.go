@@ -6,33 +6,30 @@ import (
 	"reflect"
 )
 
-type CustomSerializer interface {
-	Marshal(tp string, data interface{}) ([]byte, error)
-	Unmarshal(data json.RawMessage) (string, []byte, error) // 输入一个原始的JSON数据，需要返回对应的类型域和数据域
+var bindConfigs = make(map[reflect.Type]*bindConfig)
+
+type bindConfig struct {
+	Option           BindOption
+	MarshalMapping   map[reflect.Type]string
+	UnMarshalMapping map[string]reflect.Type
 }
 
-var defaultS = defaultSerializer{}
-
-type defaultSerializer struct{}
-
-func (s defaultSerializer) Marshal(tp string, data interface{}) ([]byte, error) {
-	return json.Marshal(marshalProxy{
-		Type: tp,
-		Data: data,
-	})
+type BindOption struct {
+	TypeKey  string
+	ValueKey string
 }
 
-func (s defaultSerializer) Unmarshal(data json.RawMessage) (string, []byte, error) {
-	var proxy unmarshalProxy
-	if err := json.Unmarshal(data, &proxy); err != nil {
-		return "", nil, err
+func WithTypeKey(typeKey string) func(opt *BindOption) {
+	return func(opt *BindOption) {
+		opt.TypeKey = typeKey
 	}
-	return proxy.Type, proxy.Data, nil
 }
 
-var customSerializer = make(map[reflect.Type]CustomSerializer)
-var hub = make(map[reflect.Type]map[string]reflect.Type)
-var hubMap = make(map[reflect.Type]map[reflect.Type]string)
+func WithValueKey(valueKey string) func(opt *BindOption) {
+	return func(opt *BindOption) {
+		opt.ValueKey = valueKey
+	}
+}
 
 type G[T any] []T
 
@@ -48,144 +45,99 @@ func (g G[T]) MarshalJSON() ([]byte, error) {
 	if len(g) == 0 {
 		return []byte("null"), nil
 	}
-
-	value := reflect.ValueOf(g[0])
-	if !value.IsValid() {
+	if any(g[0]) == nil {
 		return []byte("null"), nil
 	}
-
-	tp := value.Type()
-	if tp.Kind() == reflect.Ptr && value.IsNil() {
-		return []byte("null"), nil
+	iType := reflect.TypeFor[T]()
+	config := bindConfigs[iType]
+	if config == nil {
+		return nil, fmt.Errorf("type %T is not binding", iType)
 	}
-	typeofT := getInterfaceType[T]()
-	if subHub, exist := hubMap[typeofT]; exist {
-		if tpName, exist := subHub[tp]; exist {
-			s := customSerializer[typeofT]
-			if s == nil {
-				s = defaultS
-			}
-
-			return s.Marshal(tpName, g[0])
-		}
+	typeName := config.MarshalMapping[reflect.TypeOf(g[0])]
+	if typeName == "" {
+		return nil, fmt.Errorf("type %T is not binding", g[0])
 	}
-	return nil, fmt.Errorf("type %T is not binding", g[0])
+
+	result := map[string]interface{}{
+		config.Option.TypeKey:  typeName,
+		config.Option.ValueKey: g[0],
+	}
+
+	return json.Marshal(result)
 }
 
 func (g *G[T]) UnmarshalJSON(data []byte) error {
 	if len(data) == 4 && string(data) == "null" {
 		return nil
 	}
-	typeofT := getInterfaceType[T]()
-	s := customSerializer[typeofT]
-	if s == nil {
-		s = defaultS
+	iType := reflect.TypeFor[T]()
+	config := bindConfigs[iType]
+	if config == nil {
+		return fmt.Errorf("type %T is not binding", iType)
 	}
-	tpName, data, err := s.Unmarshal(data)
-	if err != nil {
-		return err
-	}
-	subMap := hub[typeofT]
-	if subMap == nil {
-		return fmt.Errorf("interface type:%T has no binding info,%v", typeofT, subMap)
-	}
-	tp := subMap[tpName]
-	if tp == nil {
-		return fmt.Errorf("type:%s is not binding", tpName)
-	}
-	if len(data) == 0 {
-		return nil
-	}
-	if len(data) == 4 && string(data) == "null" {
-		return nil
-	}
-
-	result := reflect.New(tp)
-	if err := json.Unmarshal(data, result.Interface()); err != nil {
+	var result map[string]json.RawMessage
+	if err := json.Unmarshal(data, &result); err != nil {
 		return err
 	}
 
-	switch data := result.Elem().Interface().(type) {
-	case T:
-		gen := NG(data)
-		*g = gen
+	valueData := result[config.Option.ValueKey]
+	if len(valueData) == 0 {
 		return nil
-	case *T:
-		gen := NG(*data)
-		*g = gen
-		return nil
-	default:
-		return fmt.Errorf("type is not valid")
 	}
+	if len(valueData) == 4 && string(valueData) == "null" {
+		return nil
+	}
+
+	typeData := result[config.Option.TypeKey]
+	if len(typeData) < 2 {
+		return fmt.Errorf("invalid json %s", data)
+	}
+	typeName := string(typeData[1 : len(typeData)-1])
+
+	detailType := config.UnMarshalMapping[typeName]
+	if detailType == nil {
+		return fmt.Errorf("type:%s is not binding", typeName)
+	}
+
+	impValue := reflect.New(detailType)
+	if err := json.Unmarshal([]byte(valueData), impValue.Interface()); err != nil {
+		return err
+	}
+	v, ok := impValue.Elem().Interface().(T)
+	if !ok {
+		return fmt.Errorf("can not convert %v to %T", impValue, v)
+	}
+
+	gen := NG(v)
+	*g = gen
+	return nil
 }
 
 func NG[T any](data T) G[T] {
 	return G[T]{data}
 }
 
-func getType(tp reflect.Type) reflect.Type {
-	if tp == nil {
-		return nil
+func Bind[T any](data map[string]T, opts ...func(opt *BindOption)) {
+	opt := BindOption{
+		TypeKey:  "type",
+		ValueKey: "data",
+	}
+	for _, f := range opts {
+		f(&opt)
+	}
+	tp := reflect.TypeFor[T]()
+	if _, exist := bindConfigs[tp]; exist {
+		panic(fmt.Sprintf("duplicate bind config for type %s", tp.String()))
+	}
+	bindConfigs[tp] = &bindConfig{
+		Option:           opt,
+		MarshalMapping:   make(map[reflect.Type]string),
+		UnMarshalMapping: make(map[string]reflect.Type),
 	}
 
-	if tp.Kind() == reflect.Ptr {
-		return tp
-	}
-	return reflect.PointerTo(tp)
-}
-
-func getInterfaceType[T any]() reflect.Type {
-	tp := new(T)
-	return reflect.TypeOf(tp).Elem()
-}
-
-func Bind[T any](data map[string]T, options ...CustomSerializer) {
-	typeofT := getInterfaceType[T]()
-	if len(options) > 0 {
-		customSerializer[typeofT] = options[0]
-	}
 	for k, v := range data {
-		tp := reflect.TypeOf(v)
-		if tp == nil {
-			panic(fmt.Errorf("type:%s is not valid", k))
-		}
-		if subHub, exist := hub[typeofT]; exist {
-			if _, exist := subHub[k]; exist {
-				panic(fmt.Errorf("duplicate type:%s binding1", k))
-			} else {
-				subHub[k] = tp
-			}
-		} else {
-			hub[typeofT] = map[string]reflect.Type{k: tp}
-		}
-		if _, exist := hubMap[tp]; exist {
-			panic(fmt.Errorf("duplicate type:%s binding2", k))
-		}
-
-		if subHub, exist := hubMap[typeofT]; exist {
-			if _, exist := subHub[tp]; exist {
-				panic(fmt.Errorf("duplicate type:%s binding3", k))
-			} else {
-				subHub[tp] = k
-			}
-		} else {
-			hubMap[typeofT] = map[reflect.Type]string{
-				tp: k,
-			}
-		}
+		valueType := reflect.TypeOf(v)
+		bindConfigs[tp].MarshalMapping[valueType] = k
+		bindConfigs[tp].UnMarshalMapping[k] = valueType
 	}
-}
-
-type marshalProxy struct {
-	Type string      `json:"type,omitempty"`
-	Data interface{} `json:"data,omitempty"`
-}
-
-type unmarshalProxy struct {
-	Type string          `json:"type,omitempty"`
-	Data json.RawMessage `json:"data,omitempty"`
-}
-
-type generic[T any] struct {
-	Data T
 }

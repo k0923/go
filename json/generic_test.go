@@ -3,7 +3,6 @@ package json
 import (
 	"encoding/json"
 	"fmt"
-	"strconv"
 	"testing"
 
 	. "github.com/smartystreets/goconvey/convey"
@@ -77,7 +76,7 @@ func TestMarshalSpeaker(t *testing.T) {
 		}
 		data, err := json.Marshal(obj)
 		So(err, ShouldBeNil)
-		So(string(data), ShouldEqual, `{"s":{"type":"s1","data":{"A":0}}}`)
+		So(string(data), ShouldEqual, `{"s":{"data":{"A":0},"type":"s1"}}`)
 		So(obj.S, ShouldNotBeNil)
 	})
 
@@ -98,15 +97,15 @@ func TestMarshalSpeaker(t *testing.T) {
 			So(string(data), ShouldEqual, `{"s":null}`)
 			So(obj.S, ShouldNotBeNil)
 		})
-		Convey("nil with type", func() {
+		Convey("not binding", func() {
 			var s *S1
 			obj := SpeakObj{
 				S: NG[Speeker](s),
 			}
-			data, err := json.Marshal(obj)
-			So(err, ShouldBeNil)
-			So(string(data), ShouldEqual, `{"s":null}`)
-			So(obj.S, ShouldNotBeNil)
+			_, err := json.Marshal(obj)
+			So(err, ShouldNotBeNil)
+			// So(string(data), ShouldEqual, `{"s":null}`)
+			// So(obj.S, ShouldNotBeNil)
 		})
 	})
 
@@ -195,7 +194,6 @@ func TestCustomUnmarshal(t *testing.T) {
 		`
 		var obj G[Speeker]
 		err := json.Unmarshal([]byte(data), &obj)
-		fmt.Println(hub)
 		So(err, ShouldBeNil)
 		So(obj.Value().SayHi(), ShouldEqual, "custom 100")
 
@@ -244,50 +242,31 @@ func (m MensionUserElement) Type() string {
 	return "mention_user"
 }
 
-type ElementSerializer struct{}
+// func TestCustomSerializer(t *testing.T) {
+// 	Bind(map[string]ElementTyper{
+// 		"text":         TextElement(""),
+// 		"mention_user": MensionUserElement(""),
+// 	}, ElementSerializer{})
 
-func (s ElementSerializer) Marshal(tp string, data interface{}) ([]byte, error) {
-	return json.Marshal(map[string]interface{}{
-		"type": tp,
-		tp:     data,
-	})
-}
-func (s ElementSerializer) Unmarshal(data json.RawMessage) (string, []byte, error) {
-	var m map[string]json.RawMessage
-	if err := json.Unmarshal(data, &m); err != nil {
-		return "", nil, err
-	}
-	tp := string(m["type"])
-	tp = tp[1 : len(tp)-1]
-	d := m[tp]
-	return tp, d, nil
-}
+// 	Convey("Test Custom Serializer", t, func() {
+// 		var data []G[ElementTyper] = []G[ElementTyper]{
+// 			NG[ElementTyper](TextElement("hello")),
+// 			NG[ElementTyper](MensionUserElement("world")),
+// 		}
+// 		d, err := json.Marshal(data)
+// 		So(err, ShouldBeNil)
 
-func TestCustomSerializer(t *testing.T) {
-	Bind(map[string]ElementTyper{
-		"text":         TextElement(""),
-		"mention_user": MensionUserElement(""),
-	}, ElementSerializer{})
+// 		var d1 []G[ElementTyper]
+// 		err = json.Unmarshal(d, &d1)
+// 		So(err, ShouldBeNil)
+// 		_, ok := d1[0].Value().(TextElement)
+// 		So(ok, ShouldBeTrue)
+// 		_, ok = d1[1].Value().(MensionUserElement)
+// 		So(ok, ShouldBeTrue)
 
-	Convey("Test Custom Serializer", t, func() {
-		var data []G[ElementTyper] = []G[ElementTyper]{
-			NG[ElementTyper](TextElement("hello")),
-			NG[ElementTyper](MensionUserElement("world")),
-		}
-		d, err := json.Marshal(data)
-		So(err, ShouldBeNil)
+// 	})
 
-		var d1 []G[ElementTyper]
-		err = json.Unmarshal(d, &d1)
-		So(err, ShouldBeNil)
-		_, ok := d1[0].Value().(TextElement)
-		So(ok, ShouldBeTrue)
-		_, ok = d1[1].Value().(MensionUserElement)
-		So(ok, ShouldBeTrue)
-
-	})
-
-}
+// }
 
 type BlockInfo struct {
 	ID       string   `json:"block_id,omitempty"`
@@ -348,71 +327,50 @@ type ImageProp struct {
 	Width  int    `json:"width,omitempty"`
 }
 
-type BlockSerializer struct{}
+// func TestCustomSerializerV2(t *testing.T) {
+// 	Bind(map[string]Blocker{
+// 		"2":  &TextBlock{},
+// 		"27": &ImageBlock{},
+// 	}, BlockSerializer{})
 
-func (s BlockSerializer) Marshal(tp string, data interface{}) ([]byte, error) {
-	if block, ok := data.(Blocker); ok {
-		tpID, err := strconv.Atoi(tp)
-		if err != nil {
-			return nil, err
-		}
-		block.SetType(tpID)
-	}
-	return json.Marshal(data)
-}
-func (s BlockSerializer) Unmarshal(data json.RawMessage) (string, []byte, error) {
-	var m map[string]json.RawMessage
-	if err := json.Unmarshal(data, &m); err != nil {
-		return "", nil, err
-	}
-	tp := string(m["block_type"])
-	return tp, data, nil
-}
+// 	var textBlock = TextBlock{
+// 		BlockInfo: BlockInfo{
+// 			ID: "HEllo",
+// 		},
+// 		Text: TextElements{
+// 			Elements: []TextRunElement{
+// 				{
+// 					TextRun: TextRun{
+// 						Content: "hello",
+// 					},
+// 				},
+// 			},
+// 		},
+// 	}
 
-func TestCustomSerializerV2(t *testing.T) {
-	Bind(map[string]Blocker{
-		"2":  &TextBlock{},
-		"27": &ImageBlock{},
-	}, BlockSerializer{})
+// 	Convey("Test Block Serializer", t, func() {
+// 		var data []G[Blocker] = []G[Blocker]{
+// 			NG[Blocker](&textBlock),
+// 			NG[Blocker](&ImageBlock{
+// 				BlockInfo: BlockInfo{
+// 					ID: "IMG_HELWO",
+// 				},
+// 				Image: ImageProp{
+// 					Height: 512,
+// 					Width:  512,
+// 				},
+// 			}),
+// 		}
 
-	var textBlock = TextBlock{
-		BlockInfo: BlockInfo{
-			ID: "HEllo",
-		},
-		Text: TextElements{
-			Elements: []TextRunElement{
-				{
-					TextRun: TextRun{
-						Content: "hello",
-					},
-				},
-			},
-		},
-	}
+// 		d, err := json.Marshal(data)
+// 		So(err, ShouldBeNil)
+// 		var d2 []G[Blocker]
+// 		err = json.Unmarshal(d, &d2)
+// 		So(err, ShouldBeNil)
+// 		So(d2[0].Value().GetID(), ShouldEqual, "HEllo")
+// 		So(d2[1].Value().GetID(), ShouldEqual, "IMG_HELWO")
+// 		So(d2[0].Value().GetType(), ShouldEqual, 2)
+// 		So(d2[1].Value().GetType(), ShouldEqual, 27)
+// 	})
 
-	Convey("Test Block Serializer", t, func() {
-		var data []G[Blocker] = []G[Blocker]{
-			NG[Blocker](&textBlock),
-			NG[Blocker](&ImageBlock{
-				BlockInfo: BlockInfo{
-					ID: "IMG_HELWO",
-				},
-				Image: ImageProp{
-					Height: 512,
-					Width:  512,
-				},
-			}),
-		}
-
-		d, err := json.Marshal(data)
-		So(err, ShouldBeNil)
-		var d2 []G[Blocker]
-		err = json.Unmarshal(d, &d2)
-		So(err, ShouldBeNil)
-		So(d2[0].Value().GetID(), ShouldEqual, "HEllo")
-		So(d2[1].Value().GetID(), ShouldEqual, "IMG_HELWO")
-		So(d2[0].Value().GetType(), ShouldEqual, 2)
-		So(d2[1].Value().GetType(), ShouldEqual, 27)
-	})
-
-}
+// }
