@@ -39,10 +39,8 @@ func (s *pathScanner) Scan() (pos Pos, tok token.Token, lit string) {
 	switch ch := s.ch; {
 	case isLetter(ch):
 		tok, lit = s.scanString()
-		break
 	case isDecimal(ch):
 		tok, lit = s.scanNumber()
-		break
 	default:
 		s.next()
 		switch ch {
@@ -118,7 +116,6 @@ func buildJsonPath(path string) ([]jsonPath, error) {
 			} else {
 				result = append(result, propertyPath(lit))
 			}
-			break
 		case token.LBRACK:
 			path, err := scanIndexedPath(scanner)
 			if err != nil {
@@ -127,7 +124,6 @@ func buildJsonPath(path string) ([]jsonPath, error) {
 			result = append(result, path)
 		case token.MUL:
 			result = append(result, wildcardPath("*"))
-			break
 		case token.PERIOD:
 			if preToken == token.PERIOD {
 				preToken = token.ELLIPSIS
@@ -157,16 +153,13 @@ func scanIndexedPath(scanner *pathScanner) (jsonPath, error) {
 			} else {
 				slice.AddNum(index)
 			}
-			break
+
 		case token.COLON:
 			slice.AddColon()
-			break
 		case token.RBRACK:
 			// todo 这边还需要更精细的判定
 			return slice.build(), nil
 		case token.SUB:
-			break
-
 		default:
 			return nil, fmt.Errorf("invalid indexed path:%s", path.String())
 		}

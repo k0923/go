@@ -1,30 +1,29 @@
 package condition
 
 import (
-	"context"
 	. "github.com/k0923/go/json"
 )
 
-const (
-	And GroupOpt = "and"
-	Or  GroupOpt = "or"
-)
+var _ Condition[any] = (*GroupCondition[any])(nil)
 
-type GroupCondition struct {
-	Opt        GroupOpt       `json:"opt"`
-	Conditions []G[Condition] `json:"conditions"`
+type GroupCondition[T any] struct {
+	Opt        string
+	Conditions []G[Condition[T]]
 }
 
-func (c GroupCondition) IsMatch(ctx context.Context) (bool, error) {
-	if len(c.Conditions) == 0 {
+func (g *GroupCondition[T]) Match(data T) (bool, error) {
+	if len(g.Conditions) == 0 {
 		return true, nil
 	}
-	for _, condition := range c.Conditions {
-		result, err := condition.Value().IsMatch(ctx)
+	for _, condition := range g.Conditions {
+		if condition.Value() == nil {
+			continue
+		}
+		result, err := condition.Value().Match(data)
 		if err != nil {
 			return false, err
 		}
-		if c.Opt == And {
+		if g.Opt == "and" {
 			if !result {
 				return false, nil
 			}
@@ -34,8 +33,5 @@ func (c GroupCondition) IsMatch(ctx context.Context) (bool, error) {
 			}
 		}
 	}
-	if c.Opt == And {
-		return true, nil
-	}
-	return false, nil
+	return true, nil
 }
