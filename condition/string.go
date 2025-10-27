@@ -35,9 +35,11 @@ func (n *StringCondition[T]) Match(data T) (bool, error) {
 	switch n.Opt {
 	case "contains":
 		return strings.Contains(x, y), nil
-	case "startswith":
+	case "not_contains":
+		return !strings.Contains(x, y), nil
+	case "starts_with":
 		return strings.HasPrefix(x, y), nil
-	case "endswith":
+	case "ends_with":
 		return strings.HasSuffix(x, y), nil
 	default:
 		return false, fmt.Errorf("invalid operator: %v", n.Opt)
