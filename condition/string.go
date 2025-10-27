@@ -7,7 +7,6 @@ import (
 	. "github.com/k0923/go/json"
 )
 
-var _ Picker[any, string] = (*ConstStringPicker[any])(nil)
 var _ Condition[any] = (*StringCondition[any])(nil)
 
 type StringCondition[T any] struct {
@@ -33,21 +32,19 @@ func (n *StringCondition[T]) Match(data T) (bool, error) {
 		}
 	}
 	switch n.Opt {
-	case "contains":
+	case "eq":
+		return x == y, nil
+	case "ne":
+		return x != y, nil
+	case "include":
 		return strings.Contains(x, y), nil
-	case "not_contains":
+	case "exclude":
 		return !strings.Contains(x, y), nil
-	case "starts_with":
+	case "start_with":
 		return strings.HasPrefix(x, y), nil
-	case "ends_with":
+	case "end_with":
 		return strings.HasSuffix(x, y), nil
 	default:
 		return false, fmt.Errorf("invalid operator: %v", n.Opt)
 	}
-}
-
-type ConstStringPicker[T any] string
-
-func (c ConstStringPicker[T]) Pick(from T) (string, error) {
-	return string(c), nil
 }

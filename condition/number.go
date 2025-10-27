@@ -6,7 +6,6 @@ import (
 	. "github.com/k0923/go/json"
 )
 
-var _ Picker[any, float64] = (*ConstNumberPicker[any])(nil)
 var _ Condition[any] = (*NumberCondition[any, float64])(nil)
 
 type NumberCondition[T any, E float64 | int] struct {
@@ -49,8 +48,4 @@ func (n *NumberCondition[T, E]) Match(data T) (bool, error) {
 	}
 }
 
-type ConstNumberPicker[T any] float64
 
-func (c ConstNumberPicker[T]) Pick(from T) (float64, error) {
-	return float64(c), nil
-}

@@ -7,7 +7,6 @@ import (
 )
 
 var _ Condition[any] = (*ArrayCondition[any])(nil)
-var _ Condition[any] = (*CountCondition[any])(nil)
 
 type ArrayCondition[T any] struct {
 	X   G[Picker[T, []T]] `json:"x"`
@@ -55,8 +54,4 @@ func (cond *ArrayCondition[T]) Match(data T) (bool, error) {
 		return false, fmt.Errorf("invalid operator: %v", cond.Opt)
 	}
 
-}
-
-type CountCondition[T any] struct {
-	NumberCondition[T, int]
 }
