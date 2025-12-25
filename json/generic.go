@@ -41,6 +41,19 @@ func (g G[T]) Value() T {
 	return g[0]
 }
 
+func (g G[T]) TypeName() string {
+	if len(g) == 0 {
+		return ""
+	}
+	iType := reflect.TypeFor[T]()
+	config := bindConfigs[iType]
+	if config == nil {
+		return ""
+	}
+	valueType := reflect.TypeOf(g[0])
+	return config.MarshalMapping[valueType]
+}
+
 func (g G[T]) MarshalJSON() ([]byte, error) {
 	if len(g) == 0 {
 		return []byte("null"), nil
@@ -140,4 +153,28 @@ func Bind[T any](data map[string]T, opts ...func(opt *BindOption)) {
 		bindConfigs[tp].MarshalMapping[valueType] = k
 		bindConfigs[tp].UnMarshalMapping[k] = valueType
 	}
+}
+
+func ParseFromJSON[T any](typeName string, data []byte) (G[T], error) {
+	iType := reflect.TypeFor[T]()
+	config := bindConfigs[iType]
+	if config == nil {
+		return nil, fmt.Errorf("type %T is not binding", iType)
+	}
+
+	detailType := config.UnMarshalMapping[typeName]
+	if detailType == nil {
+		return nil, fmt.Errorf("type:%s is not binding", typeName)
+	}
+
+	impValue := reflect.New(detailType)
+	if err := json.Unmarshal(data, impValue.Interface()); err != nil {
+		return nil, err
+	}
+	v, ok := impValue.Elem().Interface().(T)
+	if !ok {
+		return nil, fmt.Errorf("can not convert %v to %T", impValue, v)
+	}
+
+	return NG(v), nil
 }

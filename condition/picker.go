@@ -9,6 +9,7 @@ import (
 var _ Picker[any, string] = (*ConstStringPicker[any])(nil)
 var _ Picker[any, float64] = (*ConstFloatPicker[any])(nil)
 var _ Picker[any, int] = (*ConstIntPicker[any])(nil)
+var _ Picker[any, float64] = (*CalculatePicker[any])(nil)
 
 type ConstStringPicker[T any] string
 

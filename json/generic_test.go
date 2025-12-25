@@ -1,6 +1,7 @@
 package json
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"testing"
@@ -30,6 +31,29 @@ func (s S2) SayHi() string {
 
 type SpeakObj struct {
 	S G[Speeker] `json:"s"`
+}
+
+func init() {
+	Bind[Task1](map[string]Task1{
+		"vod": &VodTask{},
+	})
+}
+
+type TaskDto struct {
+	ID   string   `json:"id"`
+	Task G[Task1] `json:"task"`
+}
+
+type Task1 interface {
+	Run(ctx context.Context) error
+}
+
+type VodTask struct {
+	Url string `json:"url"`
+}
+
+func (v *VodTask) Run(ctx context.Context) error {
+	return nil
 }
 
 func init() {
@@ -268,6 +292,96 @@ func (m MensionUserElement) Type() string {
 
 // }
 
+func TestGFrom(t *testing.T) {
+	Convey("Test GFrom function", t, func() {
+		Convey("success create G from type name and data", func() {
+			typeName := "s1"
+			data := []byte(`{"A":42}`)
+
+			result, err := ParseFromJSON[Speeker](typeName, data)
+			So(err, ShouldBeNil)
+			So(result, ShouldNotBeNil)
+			So(len(result), ShouldEqual, 1)
+			So(result.TypeName(), ShouldEqual, typeName)
+
+			s1, ok := result.Value().(S1)
+			So(ok, ShouldBeTrue)
+			So(s1.A, ShouldEqual, 42)
+			So(s1.SayHi(), ShouldEqual, "Hello no.:42")
+		})
+
+		Convey("success create G for s2 type", func() {
+			typeName := "s2"
+			data := []byte(`{"B":"world"}`)
+
+			result, err := ParseFromJSON[Speeker](typeName, data)
+			So(err, ShouldBeNil)
+			So(result, ShouldNotBeNil)
+			So(result.TypeName(), ShouldEqual, typeName)
+			s2, ok := result.Value().(S2)
+			So(ok, ShouldBeTrue)
+			So(s2.B, ShouldEqual, "world")
+			So(s2.SayHi(), ShouldEqual, "Hello world")
+		})
+
+		Convey("type not binding", func() {
+			typeName := "unknown_type"
+			data := []byte(`{"A":1}`)
+
+			result, err := ParseFromJSON[Speeker](typeName, data)
+			So(err, ShouldNotBeNil)
+			So(err.Error(), ShouldContainSubstring, "type:unknown_type is not binding")
+			So(result, ShouldBeNil)
+		})
+
+		Convey("interface type not binding", func() {
+			typeName := "s1"
+			data := []byte(`{"A":1}`)
+
+			result, err := ParseFromJSON[int](typeName, data)
+			So(err, ShouldNotBeNil)
+			So(err.Error(), ShouldContainSubstring, "is not binding")
+			So(result, ShouldBeNil)
+		})
+
+		Convey("invalid json data", func() {
+			typeName := "s1"
+			data := []byte(`invalid json`)
+
+			result, err := ParseFromJSON[Speeker](typeName, data)
+
+			So(err, ShouldNotBeNil)
+			So(result, ShouldBeNil)
+		})
+
+		Convey("empty data", func() {
+			typeName := "s1"
+			data := []byte(`{}`)
+
+			result, err := ParseFromJSON[Speeker](typeName, data)
+			So(err, ShouldBeNil)
+			So(result, ShouldNotBeNil)
+
+			s1, ok := result.Value().(S1)
+			So(ok, ShouldBeTrue)
+			So(s1.A, ShouldEqual, 0)
+		})
+
+		Convey("GFrom for Task1 interface", func() {
+			typeName := "vod"
+			data := []byte(`{"url":"http://example.com/video.mp4"}`)
+
+			result, err := ParseFromJSON[Task1](typeName, data)
+			So(err, ShouldBeNil)
+			So(result, ShouldNotBeNil)
+			So(result.TypeName(), ShouldEqual, typeName)
+			vodTask, ok := result.Value().(*VodTask)
+			So(ok, ShouldBeTrue)
+			So(vodTask.Url, ShouldEqual, "http://example.com/video.mp4")
+		})
+	})
+}
+
 type BlockInfo struct {
 	ID       string   `json:"block_id,omitempty"`
 	Type     int      `json:"block_type"`
@@ -374,6 +488,3 @@ type ImageProp struct {
 // 	})
 
 // }
-
-
-

@@ -37,5 +37,3 @@ func (n *EnumCondition[T, E]) Match(data T) (bool, error) {
 		return false, fmt.Errorf("invalid operator: %v", n.Opt)
 	}
 }
-
-type StringEnumPicker []string
