@@ -1,4 +1,4 @@
-package json
+package xjson
 
 import (
 	"context"
@@ -11,6 +11,26 @@ import (
 
 type Speeker interface {
 	SayHi() string
+}
+
+type Animal interface {
+	SayHi() string
+}
+
+type Dog struct {
+	Name string
+}
+
+func (d Dog) SayHi() string {
+	return "woof"
+}
+
+type Cat struct {
+	Name string
+}
+
+func (c Cat) SayHi() string {
+	return "meow"
 }
 
 type S1 struct {
@@ -292,6 +312,321 @@ func (m MensionUserElement) Type() string {
 
 // }
 
+func TestWithInitializer(t *testing.T) {
+	Convey("Test WithInitializer", t, func() {
+		Convey("basic type initialization", func() {
+			Convey("int with default value", func() {
+				Bind(map[string]int{
+					"int": 0,
+				}, WithInitializer(func(v int) int {
+					if v == 0 {
+						return 100
+					}
+					return v
+				}))
+
+				result := NG(0)
+				So(result.Value(), ShouldEqual, 100)
+
+				result2 := NG(50)
+				So(result2.Value(), ShouldEqual, 50)
+			})
+
+			Convey("string with default value", func() {
+				Bind(map[string]string{
+					"str": "",
+				}, WithInitializer(func(v string) string {
+					if v == "" {
+						return "default"
+					}
+					return v
+				}))
+
+				result := NG("")
+				So(result.Value(), ShouldEqual, "default")
+
+				result2 := NG("hello")
+				So(result2.Value(), ShouldEqual, "hello")
+			})
+		})
+
+		Convey("struct initialization with default values", func() {
+			type User struct {
+				Name  string
+				Age   int
+				Email string
+			}
+
+			Bind(map[string]User{
+				"user": {},
+			}, WithInitializer(func(v User) User {
+				if v.Name == "" {
+					v.Name = "anonymous"
+				}
+				if v.Age == 0 {
+					v.Age = 18
+				}
+				if v.Email == "" {
+					v.Email = "default@example.com"
+				}
+				return v
+			}))
+
+			result := NG(User{})
+			So(result.Value().Name, ShouldEqual, "anonymous")
+			So(result.Value().Age, ShouldEqual, 18)
+			So(result.Value().Email, ShouldEqual, "default@example.com")
+
+			result2 := NG(User{Name: "John", Age: 25})
+			So(result2.Value().Name, ShouldEqual, "John")
+			So(result2.Value().Age, ShouldEqual, 25)
+			So(result2.Value().Email, ShouldEqual, "default@example.com")
+		})
+
+		Convey("pointer type initialization", func() {
+			type Config struct {
+				Enabled bool
+				Timeout int
+			}
+
+			Bind(map[string]*Config{
+				"config": nil,
+			}, WithInitializer(func(v *Config) *Config {
+				if v == nil {
+					return &Config{Enabled: true, Timeout: 30}
+				}
+				if v.Timeout == 0 {
+					v.Timeout = 30
+				}
+				return v
+			}))
+
+			result := NG[*Config](nil)
+			So(result.Value(), ShouldNotBeNil)
+			So(result.Value().Enabled, ShouldBeTrue)
+			So(result.Value().Timeout, ShouldEqual, 30)
+
+			result2 := NG(&Config{Enabled: false})
+			So(result2.Value().Enabled, ShouldBeFalse)
+			So(result2.Value().Timeout, ShouldEqual, 30)
+		})
+
+		Convey("slice initialization with append", func() {
+			type Items struct {
+				List []int
+			}
+
+			Bind(map[string]Items{
+				"items": {},
+			}, WithInitializer(func(v Items) Items {
+				if len(v.List) == 0 {
+					v.List = []int{1, 2, 3}
+				}
+				return v
+			}))
+
+			result := NG(Items{})
+			So(len(result.Value().List), ShouldEqual, 3)
+			So(result.Value().List, ShouldResemble, []int{1, 2, 3})
+
+			result2 := NG(Items{List: []int{10, 20}})
+			So(len(result2.Value().List), ShouldEqual, 2)
+			So(result2.Value().List, ShouldResemble, []int{10, 20})
+		})
+
+		Convey("map initialization", func() {
+			type Metadata struct {
+				Tags map[string]string
+			}
+
+			Bind(map[string]Metadata{
+				"metadata": {},
+			}, WithInitializer(func(v Metadata) Metadata {
+				if v.Tags == nil {
+					v.Tags = make(map[string]string)
+					v.Tags["version"] = "1.0"
+					v.Tags["created"] = "now"
+				}
+				return v
+			}))
+
+			result := NG(Metadata{})
+			So(result.Value().Tags, ShouldNotBeNil)
+			So(result.Value().Tags["version"], ShouldEqual, "1.0")
+			So(result.Value().Tags["created"], ShouldEqual, "now")
+
+			result2 := NG(Metadata{Tags: map[string]string{"custom": "value"}})
+			So(result2.Value().Tags["custom"], ShouldEqual, "value")
+			So(result2.Value().Tags["version"], ShouldEqual, "")
+		})
+
+		Convey("interface type with initializer", func() {
+			Bind(map[string]Animal{
+				"dog": Dog{},
+				"cat": Cat{},
+			}, WithInitializer(func(v Animal) Animal {
+				if d, ok := v.(Dog); ok {
+					if d.Name == "" {
+						d.Name = "unnamed_dog"
+					}
+					return d
+				}
+				if c, ok := v.(Cat); ok {
+					if c.Name == "" {
+						c.Name = "unnamed_cat"
+					}
+					return c
+				}
+				return v
+			}))
+
+			result := NG[Animal](Dog{})
+			dog, ok := result.Value().(Dog)
+			So(ok, ShouldBeTrue)
+			So(dog.Name, ShouldEqual, "unnamed_dog")
+
+			result2 := NG[Animal](Cat{})
+			cat, ok := result2.Value().(Cat)
+			So(ok, ShouldBeTrue)
+			So(cat.Name, ShouldEqual, "unnamed_cat")
+
+			result3 := NG[Animal](Dog{Name: "Buddy"})
+			dog3, ok := result3.Value().(Dog)
+			So(ok, ShouldBeTrue)
+			So(dog3.Name, ShouldEqual, "Buddy")
+		})
+
+		Convey("initializer with JSON unmarshal", func() {
+			type Product struct {
+				ID    string
+				Name  string
+				Price float64
+			}
+
+			Bind(map[string]Product{
+				"product": {},
+			}, WithInitializer(func(v Product) Product {
+				if v.ID == "" {
+					v.ID = "auto-generated-id"
+				}
+				if v.Price == 0 {
+					v.Price = 9.99
+				}
+				return v
+			}))
+
+			var obj struct {
+				Product G[Product] `json:"product"`
+			}
+
+			data := `{"product":{"type":"product","data":{"Name":"Test Product"}}}`
+			err := json.Unmarshal([]byte(data), &obj)
+			So(err, ShouldBeNil)
+			So(obj.Product.Value().ID, ShouldEqual, "auto-generated-id")
+			So(obj.Product.Value().Name, ShouldEqual, "Test Product")
+			So(obj.Product.Value().Price, ShouldEqual, 9.99)
+
+			data2 := `{"product":{"type":"product","data":{"ID":"custom-id","Name":"Custom Product","Price":19.99}}}`
+			err = json.Unmarshal([]byte(data2), &obj)
+			So(err, ShouldBeNil)
+			So(obj.Product.Value().ID, ShouldEqual, "custom-id")
+			So(obj.Product.Value().Name, ShouldEqual, "Custom Product")
+			So(obj.Product.Value().Price, ShouldEqual, 19.99)
+		})
+
+		Convey("type assertion failure returns original value", func() {
+			type WrongType struct {
+				Value int
+			}
+
+			Bind(map[string]S1{
+				"s1": {},
+			}, WithInitializer(func(v S1) S1 {
+				v.A = 999
+				return v
+			}))
+
+			result := NG(S1{})
+			So(result.Value().A, ShouldEqual, 999)
+		})
+
+		Convey("complex nested struct initialization", func() {
+			type Address struct {
+				Street  string
+				City    string
+				Country string
+			}
+
+			type Person struct {
+				Name    string
+				Age     int
+				Address Address
+			}
+
+			Bind(map[string]Person{
+				"person": {},
+			}, WithInitializer(func(v Person) Person {
+				if v.Name == "" {
+					v.Name = "John Doe"
+				}
+				if v.Age == 0 {
+					v.Age = 30
+				}
+				if v.Address.City == "" {
+					v.Address.City = "Unknown"
+				}
+				if v.Address.Country == "" {
+					v.Address.Country = "USA"
+				}
+				return v
+			}))
+
+			result := NG(Person{})
+			So(result.Value().Name, ShouldEqual, "John Doe")
+			So(result.Value().Age, ShouldEqual, 30)
+			So(result.Value().Address.City, ShouldEqual, "Unknown")
+			So(result.Value().Address.Country, ShouldEqual, "USA")
+
+			result2 := NG(Person{
+				Name: "Jane",
+				Address: Address{
+					City:    "New York",
+					Country: "USA",
+				},
+			})
+			So(result2.Value().Name, ShouldEqual, "Jane")
+			So(result2.Value().Age, ShouldEqual, 30)
+			So(result2.Value().Address.City, ShouldEqual, "New York")
+			So(result2.Value().Address.Country, ShouldEqual, "USA")
+		})
+
+		Convey("slice append operation", func() {
+			type NumberList struct {
+				Numbers []int
+			}
+
+			Bind(map[string]NumberList{
+				"numbers": {},
+			}, WithInitializer(func(v NumberList) NumberList {
+				if len(v.Numbers) == 0 {
+					v.Numbers = []int{0}
+				} else {
+					v.Numbers = append(v.Numbers, 999)
+				}
+				return v
+			}))
+
+			result := NG(NumberList{})
+			So(len(result.Value().Numbers), ShouldEqual, 1)
+			So(result.Value().Numbers[0], ShouldEqual, 0)
+
+			result2 := NG(NumberList{Numbers: []int{1, 2, 3}})
+			So(len(result2.Value().Numbers), ShouldEqual, 4)
+			So(result2.Value().Numbers[3], ShouldEqual, 999)
+		})
+	})
+}
+
 func TestGFrom(t *testing.T) {
 	Convey("Test GFrom function", t, func() {
 		Convey("success create G from type name and data", func() {
@@ -330,7 +665,7 @@ func TestGFrom(t *testing.T) {
 
 			result, err := ParseFromJSON[Speeker](typeName, data)
 			So(err, ShouldNotBeNil)
-			So(err.Error(), ShouldContainSubstring, "type:unknown_type is not binding")
+			So(err.Error(), ShouldContainSubstring, "type alias 'unknown_type' is not registered")
 			So(result, ShouldBeNil)
 		})
 
@@ -340,7 +675,7 @@ func TestGFrom(t *testing.T) {
 
 			result, err := ParseFromJSON[int](typeName, data)
 			So(err, ShouldNotBeNil)
-			So(err.Error(), ShouldContainSubstring, "is not binding")
+			So(err.Error(), ShouldContainSubstring, "type alias 's1' is not registered")
 			So(result, ShouldBeNil)
 		})
 
