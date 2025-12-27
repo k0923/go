@@ -312,6 +312,336 @@ func (m MensionUserElement) Type() string {
 
 // }
 
+type MockJSONHandler struct {
+	MarshalCalled   bool
+	UnmarshalCalled bool
+	CustomPrefix    string
+}
+
+func (m *MockJSONHandler) Marshal(v any) ([]byte, error) {
+	m.MarshalCalled = true
+	data, err := json.Marshal(v)
+	if err != nil {
+		return nil, err
+	}
+	if m.CustomPrefix != "" {
+		return []byte(m.CustomPrefix + string(data)), nil
+	}
+	return data, nil
+}
+
+func (m *MockJSONHandler) Unmarshal(data []byte, v any) error {
+	m.UnmarshalCalled = true
+	if m.CustomPrefix != "" && len(data) > len(m.CustomPrefix) && string(data[:len(m.CustomPrefix)]) == m.CustomPrefix {
+		data = data[len(m.CustomPrefix):]
+	}
+	return json.Unmarshal(data, v)
+}
+
+func TestWithJSONHandler(t *testing.T) {
+	Convey("Test WithJSONHandler", t, func() {
+		Convey("custom JSON handler for marshal", func() {
+			mockHandler := &MockJSONHandler{}
+
+			Bind(map[string]S1{
+				"custom_s1": {},
+			}, WithJSONHandler(mockHandler.Marshal, mockHandler.Unmarshal))
+
+			obj := struct {
+				S G[S1] `json:"s"`
+			}{
+				S: NG[S1](S1{A: 42}),
+			}
+
+			data, err := json.Marshal(obj)
+			So(err, ShouldBeNil)
+			So(mockHandler.MarshalCalled, ShouldBeTrue)
+			So(string(data), ShouldContainSubstring, `"type":"custom_s1"`)
+			So(string(data), ShouldContainSubstring, `"A":42`)
+		})
+
+		Convey("custom JSON handler for unmarshal", func() {
+			mockHandler := &MockJSONHandler{}
+
+			Bind(map[string]S2{
+				"custom_s2": {},
+			}, WithJSONHandler(mockHandler.Marshal, mockHandler.Unmarshal))
+
+			var obj struct {
+				S G[S2] `json:"s"`
+			}
+
+			data := `{"s":{"type":"custom_s2","data":{"B":"test"}}}`
+			err := json.Unmarshal([]byte(data), &obj)
+			So(err, ShouldBeNil)
+			So(mockHandler.UnmarshalCalled, ShouldBeTrue)
+			So(obj.S.Value().B, ShouldEqual, "test")
+		})
+
+		Convey("custom JSON handler error handling", func() {
+			errorHandler := &MockJSONHandler{}
+
+			type ErrorStruct struct {
+				Val int `json:"val"`
+			}
+
+			Bind(map[string]ErrorStruct{
+				"error_struct": {},
+			}, WithJSONHandler(errorHandler.Marshal, errorHandler.Unmarshal))
+
+			var obj struct {
+				S G[ErrorStruct] `json:"s"`
+			}
+			invalidData := `{"s":{"type":"error_struct","data":invalid}}`
+			err := json.Unmarshal([]byte(invalidData), &obj)
+			So(err, ShouldNotBeNil)
+		})
+
+		Convey("custom JSON handler with array", func() {
+			mockHandler := &MockJSONHandler{}
+
+			type ArrayStruct struct {
+				Val int `json:"val"`
+			}
+
+			Bind(map[string]ArrayStruct{
+				"array_struct": {},
+			}, WithJSONHandler(mockHandler.Marshal, mockHandler.Unmarshal))
+
+			obj := struct {
+				Items []G[ArrayStruct] `json:"items"`
+			}{
+				Items: []G[ArrayStruct]{
+					NG[ArrayStruct](ArrayStruct{Val: 1}),
+					NG[ArrayStruct](ArrayStruct{Val: 2}),
+					NG[ArrayStruct](ArrayStruct{Val: 3}),
+				},
+			}
+
+			data, err := json.Marshal(obj)
+			So(err, ShouldBeNil)
+			So(mockHandler.MarshalCalled, ShouldBeTrue)
+
+			var obj2 struct {
+				Items []G[ArrayStruct] `json:"items"`
+			}
+			err = json.Unmarshal(data, &obj2)
+			So(err, ShouldBeNil)
+			So(mockHandler.UnmarshalCalled, ShouldBeTrue)
+			So(len(obj2.Items), ShouldEqual, 3)
+			So(obj2.Items[0].Value().Val, ShouldEqual, 1)
+			So(obj2.Items[1].Value().Val, ShouldEqual, 2)
+			So(obj2.Items[2].Value().Val, ShouldEqual, 3)
+		})
+
+		Convey("custom JSON handler with nested struct", func() {
+			type NestedStruct struct {
+				Inner S1 `json:"inner"`
+			}
+
+			mockHandler := &MockJSONHandler{}
+
+			Bind(map[string]NestedStruct{
+				"nested": {},
+			}, WithJSONHandler(mockHandler.Marshal, mockHandler.Unmarshal))
+
+			obj := struct {
+				Data G[NestedStruct] `json:"data"`
+			}{
+				Data: NG[NestedStruct](NestedStruct{
+					Inner: S1{A: 100},
+				}),
+			}
+
+			data, err := json.Marshal(obj)
+			So(err, ShouldBeNil)
+			So(mockHandler.MarshalCalled, ShouldBeTrue)
+			So(string(data), ShouldContainSubstring, `"type":"nested"`)
+
+			var obj2 struct {
+				Data G[NestedStruct] `json:"data"`
+			}
+			err = json.Unmarshal(data, &obj2)
+			So(err, ShouldBeNil)
+			So(mockHandler.UnmarshalCalled, ShouldBeTrue)
+			So(obj2.Data.Value().Inner.A, ShouldEqual, 100)
+		})
+
+		Convey("custom JSON handler with pointer type", func() {
+			mockHandler := &MockJSONHandler{}
+
+			type PtrStruct struct {
+				Val int `json:"val"`
+			}
+
+			Bind(map[string]*PtrStruct{
+				"ptr_struct": nil,
+			}, WithJSONHandler(mockHandler.Marshal, mockHandler.Unmarshal))
+
+			obj := struct {
+				S G[*PtrStruct] `json:"s"`
+			}{
+				S: NG[*PtrStruct](&PtrStruct{Val: 77}),
+			}
+
+			data, err := json.Marshal(obj)
+			So(err, ShouldBeNil)
+			So(mockHandler.MarshalCalled, ShouldBeTrue)
+
+			var obj2 struct {
+				S G[*PtrStruct] `json:"s"`
+			}
+			err = json.Unmarshal(data, &obj2)
+			So(err, ShouldBeNil)
+			So(mockHandler.UnmarshalCalled, ShouldBeTrue)
+			So(obj2.S.Value(), ShouldNotBeNil)
+			So(obj2.S.Value().Val, ShouldEqual, 77)
+		})
+
+		Convey("custom JSON handler with ParseFromJSON", func() {
+			mockHandler := &MockJSONHandler{}
+
+			type ParseStruct struct {
+				Val int `json:"val"`
+			}
+
+			Bind(map[string]ParseStruct{
+				"parse_struct": {},
+			}, WithJSONHandler(mockHandler.Marshal, mockHandler.Unmarshal))
+
+			typeName := "parse_struct"
+			data := []byte(`{"val":123}`)
+
+			result, err := ParseFromJSON[ParseStruct](typeName, data)
+			So(err, ShouldBeNil)
+			So(mockHandler.UnmarshalCalled, ShouldBeTrue)
+			So(result.Value().Val, ShouldEqual, 123)
+		})
+
+		Convey("custom JSON handler with omitempty", func() {
+			type OmitStruct struct {
+				Val int `json:"val"`
+			}
+
+			type OmitWrapper struct {
+				S G[OmitStruct] `json:"s,omitempty"`
+			}
+
+			mockHandler := &MockJSONHandler{}
+
+			Bind(map[string]OmitStruct{
+				"omit_struct": {},
+			}, WithJSONHandler(mockHandler.Marshal, mockHandler.Unmarshal))
+
+			var obj OmitWrapper
+			data, err := json.Marshal(obj)
+			So(err, ShouldBeNil)
+			So(mockHandler.MarshalCalled, ShouldBeFalse)
+			So(string(data), ShouldEqual, "{}")
+
+			obj.S = NG[OmitStruct](OmitStruct{Val: 55})
+			data, err = json.Marshal(obj)
+			So(err, ShouldBeNil)
+			So(mockHandler.MarshalCalled, ShouldBeTrue)
+			So(string(data), ShouldContainSubstring, `"type":"omit_struct"`)
+		})
+
+		Convey("custom JSON handler with null value", func() {
+			mockHandler := &MockJSONHandler{}
+
+			type NullStruct struct {
+				Val int `json:"val"`
+			}
+
+			Bind(map[string]NullStruct{
+				"null_struct": {},
+			}, WithJSONHandler(mockHandler.Marshal, mockHandler.Unmarshal))
+
+			var obj struct {
+				S G[NullStruct] `json:"s"`
+			}
+
+			data := `{"s":null}`
+			err := json.Unmarshal([]byte(data), &obj)
+			So(err, ShouldBeNil)
+			So(mockHandler.UnmarshalCalled, ShouldBeFalse)
+			So(len(obj.S), ShouldEqual, 0)
+		})
+
+		Convey("custom JSON handler with multiple bindings", func() {
+			mockHandler1 := &MockJSONHandler{}
+			mockHandler2 := &MockJSONHandler{}
+
+			type MultiStruct1 struct {
+				Val int `json:"val"`
+			}
+
+			type MultiStruct2 struct {
+				Str string `json:"str"`
+			}
+
+			Bind(map[string]MultiStruct1{
+				"multi_struct1": {},
+			}, WithJSONHandler(mockHandler1.Marshal, mockHandler1.Unmarshal))
+
+			Bind(map[string]MultiStruct2{
+				"multi_struct2": {},
+			}, WithJSONHandler(mockHandler2.Marshal, mockHandler2.Unmarshal))
+
+			obj1 := struct {
+				S G[MultiStruct1] `json:"s"`
+			}{
+				S: NG[MultiStruct1](MultiStruct1{Val: 1}),
+			}
+
+			obj2 := struct {
+				S G[MultiStruct2] `json:"s"`
+			}{
+				S: NG[MultiStruct2](MultiStruct2{Str: "test"}),
+			}
+
+			_, err := json.Marshal(obj1)
+			So(err, ShouldBeNil)
+			So(mockHandler1.MarshalCalled, ShouldBeTrue)
+
+			_, err = json.Marshal(obj2)
+			So(err, ShouldBeNil)
+			So(mockHandler2.MarshalCalled, ShouldBeTrue)
+		})
+
+		Convey("custom JSON handler tracks marshal and unmarshal calls", func() {
+			mockHandler := &MockJSONHandler{}
+
+			type TrackStruct struct {
+				Val int `json:"val"`
+			}
+
+			Bind(map[string]TrackStruct{
+				"track_struct": {},
+			}, WithJSONHandler(mockHandler.Marshal, mockHandler.Unmarshal))
+
+			obj := struct {
+				S G[TrackStruct] `json:"s"`
+			}{
+				S: NG[TrackStruct](TrackStruct{Val: 42}),
+			}
+
+			data, err := json.Marshal(obj)
+			So(err, ShouldBeNil)
+			So(mockHandler.MarshalCalled, ShouldBeTrue)
+			So(mockHandler.UnmarshalCalled, ShouldBeFalse)
+
+			var obj2 struct {
+				S G[TrackStruct] `json:"s"`
+			}
+			err = json.Unmarshal(data, &obj2)
+			So(err, ShouldBeNil)
+			So(mockHandler.UnmarshalCalled, ShouldBeTrue)
+			So(obj2.S.Value().Val, ShouldEqual, 42)
+		})
+	})
+}
+
 func TestWithInitializer(t *testing.T) {
 	Convey("Test WithInitializer", t, func() {
 		Convey("basic type initialization", func() {
@@ -535,18 +865,18 @@ func TestWithInitializer(t *testing.T) {
 		})
 
 		Convey("type assertion failure returns original value", func() {
-			type WrongType struct {
-				Value int
+			type TestStruct struct {
+				A int
 			}
 
-			Bind(map[string]S1{
-				"s1": {},
-			}, WithInitializer(func(v S1) S1 {
+			Bind(map[string]TestStruct{
+				"test_struct": {},
+			}, WithInitializer(func(v TestStruct) TestStruct {
 				v.A = 999
 				return v
 			}))
 
-			result := NG(S1{})
+			result := NG(TestStruct{})
 			So(result.Value().A, ShouldEqual, 999)
 		})
 

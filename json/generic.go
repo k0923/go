@@ -7,28 +7,34 @@ import (
 	"sync"
 )
 
-// 全局配置存储与并发锁
+// 定义通用的函数签名，兼容标准库和第三方库(jsoniter, sonic, etc)
+type MarshalFunc func(v any) ([]byte, error)
+type UnmarshalFunc func(data []byte, v any) error
+
 var (
 	bindConfigs = make(map[reflect.Type]*bindConfig)
 	mu          sync.RWMutex
 )
 
-// bindConfig 存储类型绑定的配置信息
 type bindConfig struct {
 	Option           BindOption
 	MarshalMapping   map[reflect.Type]string
 	UnMarshalMapping map[string]reflect.Type
 }
 
-// BindOption 定义 JSON 字段名和初始化钩子
 type BindOption struct {
 	TypeKey     string
 	ValueKey    string
-	Initializer func(interface{}) interface{} // 存储类型擦除后的初始化函数
+	Initializer func(interface{}) interface{}
+
+	// 自定义 JSON 引擎入口
+	MarshalAPI   MarshalFunc
+	UnmarshalAPI UnmarshalFunc
 }
 
-// Functional Option 定义
 type OptionFunc func(opt *BindOption)
+
+// ---------------- 配置函数 ----------------
 
 func WithTypeKey(typeKey string) OptionFunc {
 	return func(opt *BindOption) {
@@ -42,8 +48,7 @@ func WithValueKey(valueKey string) OptionFunc {
 	}
 }
 
-// WithInitializer 允许在对象创建/反序列化时注入自定义逻辑
-// 泛型函数 fn 接收原始对象，返回处理后的对象 (支持对 Slice 的 append 操作)
+// WithInitializer 保持之前的初始化钩子功能
 func WithInitializer[T any](fn func(T) T) OptionFunc {
 	return func(opt *BindOption) {
 		opt.Initializer = func(raw interface{}) interface{} {
@@ -55,11 +60,19 @@ func WithInitializer[T any](fn func(T) T) OptionFunc {
 	}
 }
 
-// G 是 Generic 的缩写，用于多态类型的 JSON 包装
-// 底层使用切片是为了方便处理 nil 值和更轻量的内存占用
+// WithJSONHandler 允许替换底层的 JSON 序列化/反序列化实现
+// 场景：使用性能更好的 json-iterator, sonic, go-json 等替代 encoding/json
+func WithJSONHandler(m MarshalFunc, u UnmarshalFunc) OptionFunc {
+	return func(opt *BindOption) {
+		opt.MarshalAPI = m
+		opt.UnmarshalAPI = u
+	}
+}
+
+// ---------------- 核心逻辑 ----------------
+
 type G[T any] []T
 
-// Value 获取原始值，如果为空则返回零值
 func (g G[T]) Value() T {
 	if len(g) == 0 {
 		var t T
@@ -68,40 +81,32 @@ func (g G[T]) Value() T {
 	return g[0]
 }
 
-// NG (New Generic) 是构建 G[T] 的入口
-// 所有的反序列化和手动构造都应经过此函数，以触发 Initializer
+// NG 构建入口，触发 Initializer
 func NG[T any](data T) G[T] {
-	// 获取类型配置
 	iType := reflect.TypeFor[T]()
-	
+
 	mu.RLock()
 	config := bindConfigs[iType]
 	mu.RUnlock()
 
 	finalData := data
-
-	// 如果存在配置且有初始化钩子，执行钩子
 	if config != nil && config.Option.Initializer != nil {
-		// 执行用户注入的逻辑 (例如依赖注入、默认值填充)
 		res := config.Option.Initializer(finalData)
-		// 如果钩子返回了新对象(主要针对 Slice/Map/基本类型)，更新它
 		if res != nil {
 			if v, ok := res.(T); ok {
 				finalData = v
 			}
 		}
 	}
-
 	return G[T]{finalData}
 }
 
-// TypeName 获取当前值的类型名称
+// TypeName 获取类型名
 func (g G[T]) TypeName() string {
 	if len(g) == 0 {
 		return ""
 	}
 	iType := reflect.TypeFor[T]()
-	
 	mu.RLock()
 	config := bindConfigs[iType]
 	mu.RUnlock()
@@ -109,20 +114,17 @@ func (g G[T]) TypeName() string {
 	if config == nil {
 		return ""
 	}
-	
-	// 处理接口持有的实际类型
 	valueType := reflect.TypeOf(g[0])
 	return config.MarshalMapping[valueType]
 }
 
-// MarshalJSON 实现序列化逻辑
+// MarshalJSON 序列化
 func (g G[T]) MarshalJSON() ([]byte, error) {
 	if len(g) == 0 || any(g[0]) == nil {
 		return []byte("null"), nil
 	}
 
 	iType := reflect.TypeFor[T]()
-	
 	mu.RLock()
 	config := bindConfigs[iType]
 	mu.RUnlock()
@@ -137,23 +139,28 @@ func (g G[T]) MarshalJSON() ([]byte, error) {
 		return nil, fmt.Errorf("concrete type %v is not registered for interface %v", valueType, iType)
 	}
 
-	// 构造 {type, data} 结构
+	// 确定使用哪个 Marshal 函数
+	marshalFn := json.Marshal
+	if config.Option.MarshalAPI != nil {
+		marshalFn = config.Option.MarshalAPI
+	}
+
+	// 构造包装结构
 	result := map[string]interface{}{
 		config.Option.TypeKey:  typeName,
 		config.Option.ValueKey: g[0],
 	}
 
-	return json.Marshal(result)
+	return marshalFn(result)
 }
 
-// UnmarshalJSON 实现反序列化逻辑
+// UnmarshalJSON 反序列化
 func (g *G[T]) UnmarshalJSON(data []byte) error {
 	if len(data) == 0 || (len(data) == 4 && string(data) == "null") {
 		return nil
 	}
 
 	iType := reflect.TypeFor[T]()
-	
 	mu.RLock()
 	config := bindConfigs[iType]
 	mu.RUnlock()
@@ -162,9 +169,16 @@ func (g *G[T]) UnmarshalJSON(data []byte) error {
 		return fmt.Errorf("type %v is not binding", iType)
 	}
 
-	// 第一次解析：解析外层 Map
+	// 确定使用哪个 Unmarshal 函数
+	unmarshalFn := json.Unmarshal
+	if config.Option.UnmarshalAPI != nil {
+		unmarshalFn = config.Option.UnmarshalAPI
+	}
+
+	// 第一次解析：解析外层结构
+	// 注意：这里仍然依赖 json.RawMessage，因为它是目前 Go 生态通用的“延迟解析”载体
 	var result map[string]json.RawMessage
-	if err := json.Unmarshal(data, &result); err != nil {
+	if err := unmarshalFn(data, &result); err != nil {
 		return err
 	}
 
@@ -179,7 +193,6 @@ func (g *G[T]) UnmarshalJSON(data []byte) error {
 	if len(typeData) < 2 {
 		return fmt.Errorf("invalid json format, missing type field: %s", data)
 	}
-	// 去除引号 "TypeName" -> TypeName
 	typeName := string(typeData[1 : len(typeData)-1])
 
 	detailType := config.UnMarshalMapping[typeName]
@@ -189,22 +202,22 @@ func (g *G[T]) UnmarshalJSON(data []byte) error {
 
 	// 创建具体类型的实例
 	impValue := reflect.New(detailType)
-	if err := json.Unmarshal(valueData, impValue.Interface()); err != nil {
+
+	// 第二次解析：将 RawMessage 解析为具体类型
+	// 这里同样使用用户配置的解析引擎
+	if err := unmarshalFn(valueData, impValue.Interface()); err != nil {
 		return err
 	}
 
-	// 类型断言回接口 T
 	v, ok := impValue.Elem().Interface().(T)
 	if !ok {
 		return fmt.Errorf("cannot convert instance of %v to interface %v", detailType, iType)
 	}
 
-	// 使用 NG 包装，这也将触发 Initializer
 	*g = NG(v)
 	return nil
 }
 
-// Bind 注册接口 T 的具体实现类型
 func Bind[T any](data map[string]T, opts ...OptionFunc) {
 	opt := BindOption{
 		TypeKey:  "type",
@@ -215,7 +228,6 @@ func Bind[T any](data map[string]T, opts ...OptionFunc) {
 	}
 
 	tp := reflect.TypeFor[T]()
-	
 	mu.Lock()
 	defer mu.Unlock()
 
@@ -236,10 +248,9 @@ func Bind[T any](data map[string]T, opts ...OptionFunc) {
 	}
 }
 
-// ParseFromJSON 手动从 JSON 解析为对象，适用于非标准 Unmarshal 场景
+// ParseFromJSON 辅助函数
 func ParseFromJSON[T any](typeName string, data []byte) (G[T], error) {
 	iType := reflect.TypeFor[T]()
-	
 	mu.RLock()
 	config := bindConfigs[iType]
 	mu.RUnlock()
@@ -248,13 +259,19 @@ func ParseFromJSON[T any](typeName string, data []byte) (G[T], error) {
 		return nil, fmt.Errorf("type %v is not binding", iType)
 	}
 
+	// 确定引擎
+	unmarshalFn := json.Unmarshal
+	if config.Option.UnmarshalAPI != nil {
+		unmarshalFn = config.Option.UnmarshalAPI
+	}
+
 	detailType := config.UnMarshalMapping[typeName]
 	if detailType == nil {
 		return nil, fmt.Errorf("type alias '%s' is not registered", typeName)
 	}
 
 	impValue := reflect.New(detailType)
-	if err := json.Unmarshal(data, impValue.Interface()); err != nil {
+	if err := unmarshalFn(data, impValue.Interface()); err != nil {
 		return nil, err
 	}
 
