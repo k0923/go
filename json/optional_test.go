@@ -38,8 +38,8 @@ func TestOptionalWithOutSet(t *testing.T) {
 func TestOptionalWithSet(t *testing.T) {
 	Convey("初始化属性值序列化测试", t, func() {
 		people := StructPeople{
-			Name: N("Young"),
-			Age:  N(12),
+			Name: NO("Young"),
+			Age:  NO(12),
 		}
 		data, err := Marshal(people)
 		So(err, ShouldBeNil)
@@ -54,8 +54,8 @@ func TestOptionalWithSet(t *testing.T) {
 
 	Convey("初始化属性值序列化测试", t, func() {
 		people := &StructPeople{
-			Name: N("Young"),
-			Age:  N(12),
+			Name: NO("Young"),
+			Age:  NO(12),
 		}
 		data, err := Marshal(people)
 		So(err, ShouldBeNil)
@@ -86,7 +86,7 @@ func TestUnmarshalWithNull(t *testing.T) {
 		So(people.Name.Value(), ShouldEqual, "")
 		So(people.Age.IsNull(), ShouldEqual, true)
 		So(people.Name.IsNull(), ShouldEqual, true)
-		So(people.Age.IsSet(), ShouldEqual, true)
+		So(people.Age.IsUndefined(), ShouldBeFalse)
 		// So(people.Age.Mode(), ShouldEqual, meta.Null)
 		// So(people.Name.Mode(), ShouldEqual, meta.Null)
 	})
@@ -124,8 +124,8 @@ func TestUnmarshalWithNull(t *testing.T) {
 		So(people.Age.Value(), ShouldEqual, 0)
 		So(people.Name.Value(), ShouldEqual, "")
 
-		So(people.Age.IsNotSet(), ShouldEqual, true)
-		So(people.Name.IsNotSet(), ShouldEqual, true)
+		So(people.Age.IsUndefined(), ShouldBeTrue)
+		So(people.Name.IsUndefined(), ShouldBeTrue)
 
 		// So(people.Age.Mode(), ShouldEqual, meta.Undefined)
 		// So(people.Name.Mode(), ShouldEqual, meta.Undefined)
@@ -144,8 +144,8 @@ func TestUnmarshalWithNull(t *testing.T) {
 		So(people.Age.Value(), ShouldEqual, 0)
 		So(people.Name.Value(), ShouldEqual, "")
 
-		So(people.Age.IsNotSet(), ShouldEqual, true)
-		So(people.Name.IsNotSet(), ShouldEqual, true)
+		So(people.Age.IsUndefined(), ShouldBeTrue)
+		So(people.Name.IsUndefined(), ShouldBeTrue)
 		// So(people.Age.Mode(), ShouldEqual, meta.Undefined)
 		// So(people.Name.Mode(), ShouldEqual, meta.Undefined)
 	})
@@ -165,8 +165,8 @@ func TestUnmarshalWithNull(t *testing.T) {
 		So(people.Age.Value(), ShouldEqual, 22)
 		So(people.Name.Value(), ShouldEqual, "young")
 
-		So(people.Age.IsSet(), ShouldEqual, true)
-		So(people.Name.IsSet(), ShouldEqual, true)
+		So(people.Age.IsUndefined(), ShouldBeFalse)
+		So(people.Name.IsUndefined(), ShouldBeFalse)
 
 		// So(people.Age.Mode(), ShouldEqual, meta.Default)
 		// So(people.Name.Mode(), ShouldEqual, meta.Default)
@@ -187,8 +187,8 @@ func TestUnmarshalWithNull(t *testing.T) {
 		So(people.Age.Value(), ShouldEqual, 22)
 		So(people.Name.Value(), ShouldEqual, "young")
 
-		So(people.Age.IsSet(), ShouldEqual, true)
-		So(people.Name.IsSet(), ShouldEqual, true)
+		So(people.Age.IsUndefined(), ShouldBeFalse)
+		So(people.Name.IsUndefined(), ShouldBeFalse)
 		// So(people.Age.Mode(), ShouldEqual, meta.Default)
 		// So(people.Name.Mode(), ShouldEqual, meta.Default)
 	})
@@ -217,8 +217,8 @@ func TestMarshalStructWithOutOmit(t *testing.T) {
 
 	Convey("正常序列化不受影响测试", t, func() {
 		p := StructPeopleNoOmit{
-			Name: N("TEST"),
-			Age:  N(88),
+			Name: NO("TEST"),
+			Age:  NO(88),
 		}
 		data, err := Marshal(p)
 		So(err, ShouldBeNil)
@@ -227,8 +227,8 @@ func TestMarshalStructWithOutOmit(t *testing.T) {
 
 	Convey("正常序列化不受影响测试", t, func() {
 		p := &StructPeopleNoOmit{
-			Name: N("TEST"),
-			Age:  N(88),
+			Name: NO("TEST"),
+			Age:  NO(88),
 		}
 		data, err := Marshal(p)
 		So(err, ShouldBeNil)
@@ -291,8 +291,8 @@ func TestUnmarshalWithOutOmit(t *testing.T) {
 		So(people.Age.Value(), ShouldEqual, 0)
 		So(people.Name.Value(), ShouldEqual, "")
 
-		So(people.Age.IsNotSet(), ShouldEqual, true)
-		So(people.Name.IsNotSet(), ShouldEqual, true)
+		So(people.Age.IsUndefined(), ShouldBeTrue)
+		So(people.Name.IsUndefined(), ShouldBeTrue)
 
 		// So(people.Age.Mode(), ShouldEqual, meta.Undefined)
 		// So(people.Name.Mode(), ShouldEqual, meta.Undefined)
@@ -311,8 +311,8 @@ func TestUnmarshalWithOutOmit(t *testing.T) {
 		So(people.Age.Value(), ShouldEqual, 0)
 		So(people.Name.Value(), ShouldEqual, "")
 
-		So(people.Age.IsNotSet(), ShouldEqual, true)
-		So(people.Name.IsNotSet(), ShouldEqual, true)
+		So(people.Age.IsUndefined(), ShouldBeTrue)
+		So(people.Name.IsUndefined(), ShouldBeTrue)
 
 		// So(people.Age.Mode(), ShouldEqual, meta.Undefined)
 		// So(people.Name.Mode(), ShouldEqual, meta.Undefined)
@@ -333,8 +333,8 @@ func TestUnmarshalWithOutOmit(t *testing.T) {
 		So(people.Age.Value(), ShouldEqual, 22)
 		So(people.Name.Value(), ShouldEqual, "young")
 
-		So(people.Age.IsSet(), ShouldEqual, true)
-		So(people.Name.IsSet(), ShouldEqual, true)
+		So(people.Age.IsUndefined(), ShouldBeFalse)
+		So(people.Name.IsUndefined(), ShouldBeFalse)
 
 		// So(people.Age.Mode(), ShouldEqual, meta.Default)
 		// So(people.Name.Mode(), ShouldEqual, meta.Default)
@@ -355,8 +355,8 @@ func TestUnmarshalWithOutOmit(t *testing.T) {
 		So(people.Age.Value(), ShouldEqual, 22)
 		So(people.Name.Value(), ShouldEqual, "young")
 
-		So(people.Age.IsSet(), ShouldEqual, true)
-		So(people.Name.IsSet(), ShouldEqual, true)
+		So(people.Age.IsUndefined(), ShouldBeFalse)
+		So(people.Name.IsUndefined(), ShouldBeFalse)
 
 		// So(people.Age.Mode(), ShouldEqual, meta.Default)
 		// So(people.Name.Mode(), ShouldEqual, meta.Default)
@@ -377,8 +377,8 @@ func TestNormalMarshalPointer(t *testing.T) {
 
 	Convey("正常序列化测试", t, func() {
 		people := PointerPeople{
-			Name: Ref(N("Hello")),
-			Age:  Ref(N(12)),
+			Name: Ref(NO("Hello")),
+			Age:  Ref(NO(12)),
 		}
 
 		data, err := Marshal(people)
@@ -412,8 +412,8 @@ func TestUnMarshalPointer(t *testing.T) {
 		So(people.Age.Value(), ShouldEqual, 22)
 		So(people.Name.Value(), ShouldEqual, "young")
 
-		So(people.Age.IsSet(), ShouldEqual, true)
-		So(people.Name.IsSet(), ShouldEqual, true)
+		So(people.Age.IsUndefined(), ShouldBeFalse)
+		So(people.Name.IsUndefined(), ShouldBeFalse)
 		// So(people.Age.Mode(), ShouldEqual, meta.Default)
 		// So(people.Name.Mode(), ShouldEqual, meta.Default)
 	})
@@ -449,10 +449,12 @@ func TestUnMarshalPointer(t *testing.T) {
 
 	Convey("Clear测试", t, func() {
 		p := StructPeople{
-			Name: N("TEST"),
-			Age:  N(88),
+			Name: NO("TEST"),
+			Age:  NO(88),
 		}
-		p.Name.Clear()
+		// p.Name.Clear() // Clear not implemented in Optional
+		p.Name = Undefined[string]()
+
 		d, err := json.Marshal(p)
 		So(err, ShouldEqual, nil)
 		var m map[string]interface{}
@@ -553,10 +555,11 @@ func TestHello(t *testing.T) {
 	}
 
 	s := MyStu{
-		Name: N("Hello"),
+		Name: NO("Hello"),
 	}
 	fmt.Println("name:", s.Name.Value())
-	s.Name.Clear()
+	// s.Name.Clear()
+	s.Name = Undefined[string]()
 
 	fmt.Println("name:", s.Name.Value())
 
@@ -599,5 +602,56 @@ func (man Man) Run(ctx context.Context) error {
 // 	if err != nil {
 // 		panic(err)
 // 	}
-
+//
 // }
+
+func TestOmitEmptyBehavior(t *testing.T) {
+	type OmitStruct struct {
+		Name Optional[string] `json:"name,omitempty"`
+	}
+
+	Convey("omitempty测试：结构体值类型（Undefined）", t, func() {
+		// Optional[T] 现改为切片类型，零值为 nil。
+		// Go json 库对 nil 切片会应用 omitempty，因此字段会被忽略。
+		s := OmitStruct{Name: Undefined[string]()}
+		data, err := json.Marshal(s)
+		So(err, ShouldBeNil)
+		So(string(data), ShouldEqual, `{}`)
+	})
+
+	Convey("omitempty测试：有值但值为零值（空字符串）", t, func() {
+		s := OmitStruct{Name: NO("")}
+		data, err := json.Marshal(s)
+		So(err, ShouldBeNil)
+		// status=StatusValue, val="" -> json.Marshal("") -> ""
+		So(string(data), ShouldEqual, `{"name":""}`)
+	})
+
+	Convey("omitempty测试：显式 Null", t, func() {
+		s := OmitStruct{Name: Null[string]()}
+		data, err := json.Marshal(s)
+		So(err, ShouldBeNil)
+		So(string(data), ShouldEqual, `{"name":null}`)
+	})
+
+	type OmitPointerStruct struct {
+		Name *Optional[string] `json:"name,omitempty"`
+	}
+
+	Convey("omitempty测试：nil 指针", t, func() {
+		s := OmitPointerStruct{Name: nil}
+		data, err := json.Marshal(s)
+		So(err, ShouldBeNil)
+		So(string(data), ShouldEqual, `{}`)
+	})
+
+	Convey("omitempty测试：指向 Undefined 的指针", t, func() {
+		// 指针不为 nil，指向一个 Undefined 的 Optional
+		// MarshalJSON 会被调用，返回 "null"
+		opt := Undefined[string]()
+		s := OmitPointerStruct{Name: &opt}
+		data, err := json.Marshal(s)
+		So(err, ShouldBeNil)
+		So(string(data), ShouldEqual, `{"name":null}`)
+	})
+}

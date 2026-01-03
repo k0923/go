@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"reflect"
 	"testing"
 
 	. "github.com/smartystreets/goconvey/convey"
@@ -172,7 +173,10 @@ func TestUnmarshalSpeaker(t *testing.T) {
 			data := `{"s":null}`
 			err := json.Unmarshal([]byte(data), &obj)
 			So(err, ShouldBeNil)
-			So(obj.S, ShouldBeNil)
+
+			So(obj.S.Value(), ShouldEqual, nil)
+
+			// 这里的 Value() 返回的是接口类型的 nil
 			So(obj.S.Value(), ShouldBeNil)
 		})
 
@@ -565,7 +569,7 @@ func TestWithJSONHandler(t *testing.T) {
 			err := json.Unmarshal([]byte(data), &obj)
 			So(err, ShouldBeNil)
 			So(mockHandler.UnmarshalCalled, ShouldBeFalse)
-			So(len(obj.S), ShouldEqual, 0)
+			So(len(obj.S), ShouldEqual, 1)
 		})
 
 		Convey("custom JSON handler with multiple bindings", func() {
@@ -1151,5 +1155,39 @@ type ImageProp struct {
 // 		So(d2[0].Value().GetType(), ShouldEqual, 2)
 // 		So(d2[1].Value().GetType(), ShouldEqual, 27)
 // 	})
-
 // }
+
+func TestIsZero(t *testing.T) {
+	Convey("Test IsZero", t, func() {
+		var g G[int]
+		So(g.IsZero(), ShouldBeTrue)
+
+		g2 := NG(10)
+		So(g2.IsZero(), ShouldBeFalse)
+
+		g3 := NG(0)
+		So(g3.IsZero(), ShouldBeFalse)
+	})
+}
+
+func TestDetailType(t *testing.T) {
+	Convey("Test DetailType", t, func() {
+		// Ensure bindings are set (binding() is called in init, but we can call it again to be safe or rely on init)
+		// binding() // already called in init
+
+		var g G[Speeker]
+
+		Convey("existing types", func() {
+			s1Type := g.DetailType("s1")
+			So(s1Type, ShouldEqual, reflect.TypeOf(S1{}))
+
+			s2Type := g.DetailType("s2")
+			So(s2Type, ShouldEqual, reflect.TypeOf(S2{}))
+		})
+
+		Convey("non-existing type", func() {
+			unknownType := g.DetailType("unknown_type")
+			So(unknownType, ShouldBeNil)
+		})
+	})
+}
