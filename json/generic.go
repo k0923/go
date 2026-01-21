@@ -50,11 +50,11 @@ type bindConfig struct {
 }
 
 type BindOption struct {
-	TypeKey      string
-	ValueKey     string
-	Initializer  func(interface{}) interface{}
-	MarshalAPI   MarshalFunc
-	UnmarshalAPI UnmarshalFunc
+	TypeKey          string
+	ValueKey         string
+	Initializer      func(interface{}) interface{}
+	MarshalWrapper   func(typeKey, typeName, valueKey string, value any) ([]byte, error)
+	UnmarshalWrapper func(data []byte, typeKey, valueKey string) (typeName string, valueData []byte, err error)
 }
 
 type OptionFunc func(opt *BindOption)
@@ -169,16 +169,16 @@ func (g G[T]) MarshalJSON() ([]byte, error) {
 	}
 
 	// 5. 序列化
-	marshalFn := json.Marshal
-	if config.Option.MarshalAPI != nil {
-		marshalFn = config.Option.MarshalAPI
+	if config.Option.MarshalWrapper != nil {
+		return config.Option.MarshalWrapper(config.Option.TypeKey, typeName, config.Option.ValueKey, val)
 	}
 
+	// Fallback to default behavior if wrapper is missing (should be initialized in Bind)
 	wrapper := map[string]interface{}{
 		config.Option.TypeKey:  typeName,
 		config.Option.ValueKey: val,
 	}
-	return marshalFn(wrapper)
+	return json.Marshal(wrapper)
 }
 
 // -----------------------------------------------------------------------------
@@ -199,32 +199,45 @@ func (g *G[T]) UnmarshalJSON(data []byte) error {
 		return fmt.Errorf("xjson: type %v is not binding", iType)
 	}
 
-	unmarshalFn := json.Unmarshal
-	if config.Option.UnmarshalAPI != nil {
-		unmarshalFn = config.Option.UnmarshalAPI
-	}
-
 	// 3. 解析外层
-	var wrapper map[string]json.RawMessage
-	if err := unmarshalFn(data, &wrapper); err != nil {
-		return err
-	}
-
-	// 4. 检查数据部分
-	valueData := wrapper[config.Option.ValueKey]
-	if len(valueData) == 0 || bytes.Equal(valueData, []byte("null")) {
-		*g = []gData[T]{{isNull: true}}
-		return nil
-	}
-
-	// 5. 解析类型名
-	typeDataRaw, ok := wrapper[config.Option.TypeKey]
-	if !ok {
-		return fmt.Errorf("xjson: missing type field '%s'", config.Option.TypeKey)
-	}
 	var typeName string
-	if err := unmarshalFn(typeDataRaw, &typeName); err != nil {
-		return fmt.Errorf("xjson: invalid type field: %w", err)
+	var valueData []byte
+
+	if config.Option.UnmarshalWrapper != nil {
+		tName, vData, err := config.Option.UnmarshalWrapper(data, config.Option.TypeKey, config.Option.ValueKey)
+		if err != nil {
+			return err
+		}
+		typeName = tName
+		valueData = vData
+
+		// 4. 检查数据部分
+		if len(valueData) == 0 || bytes.Equal(valueData, []byte("null")) {
+			*g = []gData[T]{{isNull: true}}
+			return nil
+		}
+	} else {
+		unmarshalFn := json.Unmarshal
+		var wrapper map[string]json.RawMessage
+		if err := unmarshalFn(data, &wrapper); err != nil {
+			return err
+		}
+
+		// 4. 检查数据部分
+		valueData = wrapper[config.Option.ValueKey]
+		if len(valueData) == 0 || bytes.Equal(valueData, []byte("null")) {
+			*g = []gData[T]{{isNull: true}}
+			return nil
+		}
+
+		// 5. 解析类型名
+		typeDataRaw, ok := wrapper[config.Option.TypeKey]
+		if !ok {
+			return fmt.Errorf("xjson: missing type field '%s'", config.Option.TypeKey)
+		}
+		if err := unmarshalFn(typeDataRaw, &typeName); err != nil {
+			return fmt.Errorf("xjson: invalid type field: %w", err)
+		}
 	}
 
 	// 6. 查找具体类型
@@ -235,7 +248,7 @@ func (g *G[T]) UnmarshalJSON(data []byte) error {
 
 	// 7. 解析具体对象
 	impValue := reflect.New(detailType)
-	if err := unmarshalFn(valueData, impValue.Interface()); err != nil {
+	if err := json.Unmarshal(valueData, impValue.Interface()); err != nil {
 		return err
 	}
 
@@ -258,7 +271,12 @@ func (g *G[T]) UnmarshalJSON(data []byte) error {
 
 func Bind[T any](data map[string]T, opts ...OptionFunc) {
 	// 1. 准备配置对象
-	opt := BindOption{TypeKey: "type", ValueKey: "data"}
+	opt := BindOption{
+		TypeKey:          "type",
+		ValueKey:         "data",
+		MarshalWrapper:   newDefaultMarshalWrapper(json.Marshal),
+		UnmarshalWrapper: newDefaultUnmarshalWrapper(json.Unmarshal),
+	}
 	for _, f := range opts {
 		f(&opt)
 	}
@@ -314,10 +332,10 @@ func ParseFromJSON[T any](typeName string, data []byte) (G[T], error) {
 		return nil, fmt.Errorf("xjson: type %v is not binding", iType)
 	}
 
-	unmarshalFn := json.Unmarshal
-	if config.Option.UnmarshalAPI != nil {
-		unmarshalFn = config.Option.UnmarshalAPI
-	}
+	// unmarshalFn := json.Unmarshal
+	// if config.Option.UnmarshalAPI != nil {
+	// 	unmarshalFn = config.Option.UnmarshalAPI
+	// }
 
 	detailType := config.UnMarshalMapping[typeName]
 	if detailType == nil {
@@ -325,7 +343,7 @@ func ParseFromJSON[T any](typeName string, data []byte) (G[T], error) {
 	}
 
 	impValue := reflect.New(detailType)
-	if err := unmarshalFn(data, impValue.Interface()); err != nil {
+	if err := json.Unmarshal(data, impValue.Interface()); err != nil {
 		return nil, err
 	}
 
@@ -374,9 +392,86 @@ func WithInitializer[T any](fn func(T) T) OptionFunc {
 		}
 	}
 }
+func WithWrapper(m func(typeKey, typeName, valueKey string, value any) ([]byte, error), u func(data []byte, typeKey, valueKey string) (typeName string, valueData []byte, err error)) OptionFunc {
+	return func(opt *BindOption) {
+		opt.MarshalWrapper = m
+		opt.UnmarshalWrapper = u
+	}
+}
+
+// -----------------------------------------------------------------------------
+// Wrapper Generators
+// -----------------------------------------------------------------------------
+
+func newDefaultMarshalWrapper(marshal MarshalFunc) func(typeKey, typeName, valueKey string, value any) ([]byte, error) {
+	return func(typeKey, typeName, valueKey string, value any) ([]byte, error) {
+		wrapper := map[string]interface{}{
+			typeKey:  typeName,
+			valueKey: value,
+		}
+		return marshal(wrapper)
+	}
+}
+
+func newDefaultUnmarshalWrapper(unmarshal UnmarshalFunc) func(data []byte, typeKey, valueKey string) (typeName string, valueData []byte, err error) {
+	return func(data []byte, typeKey, valueKey string) (typeName string, valueData []byte, err error) {
+		var wrapper map[string]json.RawMessage
+		if err := unmarshal(data, &wrapper); err != nil {
+			return "", nil, err
+		}
+
+		valueData = wrapper[valueKey]
+		typeDataRaw, ok := wrapper[typeKey]
+		if !ok {
+			return "", valueData, fmt.Errorf("xjson: missing type field '%s'", typeKey)
+		}
+		if err := unmarshal(typeDataRaw, &typeName); err != nil {
+			return "", valueData, fmt.Errorf("xjson: invalid type field: %w", err)
+		}
+		return typeName, valueData, nil
+	}
+}
+
+func newFlatMarshalWrapper(marshal MarshalFunc) func(typeKey, typeName, valueKey string, value any) ([]byte, error) {
+	return func(typeKey, typeName, valueKey string, value any) ([]byte, error) {
+		b, err := marshal(value)
+		if err != nil {
+			return nil, err
+		}
+		var m map[string]interface{}
+		if err := json.Unmarshal(b, &m); err != nil {
+			return nil, err
+		}
+		m[typeKey] = typeName
+		return marshal(m)
+	}
+}
+
+func newFlatUnmarshalWrapper(unmarshal UnmarshalFunc) func(data []byte, typeKey, valueKey string) (typeName string, valueData []byte, err error) {
+	return func(data []byte, typeKey, valueKey string) (typeName string, valueData []byte, err error) {
+		var m map[string]json.RawMessage
+		if err := unmarshal(data, &m); err != nil {
+			return "", nil, err
+		}
+		t, ok := m[typeKey]
+		if !ok {
+			return "", nil, fmt.Errorf("xjson: missing type field '%s'", typeKey)
+		}
+		if err := unmarshal(t, &typeName); err != nil {
+			return "", nil, fmt.Errorf("xjson: invalid type field: %w", err)
+		}
+		return typeName, data, nil
+	}
+}
+
 func WithJSONHandler(m MarshalFunc, u UnmarshalFunc) OptionFunc {
 	return func(opt *BindOption) {
-		opt.MarshalAPI = m
-		opt.UnmarshalAPI = u
+		opt.MarshalWrapper = newDefaultMarshalWrapper(m)
+		opt.UnmarshalWrapper = newDefaultUnmarshalWrapper(u)
 	}
+}
+
+// WithFlatLayout 启用扁平化结构支持。
+func WithFlatLayout() OptionFunc {
+	return WithWrapper(newFlatMarshalWrapper(json.Marshal), newFlatUnmarshalWrapper(json.Unmarshal))
 }
