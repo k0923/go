@@ -11,33 +11,33 @@ type optData[T any] struct {
 	IsNull bool
 }
 
-// Optional 定义为结构体切片
+// O 定义为结构体切片
 // 1. Undefined: nil (len==0) -> omitempty 生效
 // 2. Null:      [{IsNull: true}]
 // 3. Value:     [{Value: v, IsNull: false}]
-type Optional[T any] []optData[T]
+type O[T any] []optData[T]
 
 // -----------------------------------------------------------------------------
 // 构造函数
 // -----------------------------------------------------------------------------
 
-// N 创建一个有值的 Optional
+// NO 创建一个有值的 O
 // 优化：相比 []*T，这里少了一次 T 的堆分配，直接存入 slice 底层数组
-func NO[T any](v T) Optional[T] {
+func NO[T any](v T) O[T] {
 	return []optData[T]{
 		{Value: v, IsNull: false},
 	}
 }
 
-// Null 创建一个显式 null 的 Optional
-func Null[T any]() Optional[T] {
+// Null 创建一个显式 null 的 O
+func Null[T any]() O[T] {
 	return []optData[T]{
 		{IsNull: true},
 	}
 }
 
-// Undefined 创建一个未定义的 Optional (nil)
-func Undefined[T any]() Optional[T] {
+// Undefined 创建一个未定义的 O (nil)
+func Undefined[T any]() O[T] {
 	return nil
 }
 
@@ -45,19 +45,19 @@ func Undefined[T any]() Optional[T] {
 // 方法定义 (现在接收器是合法的 Slice 类型)
 // -----------------------------------------------------------------------------
 
-func (o Optional[T]) IsUndefined() bool {
+func (o O[T]) IsUndefined() bool {
 	return len(o) == 0
 }
 
-func (o Optional[T]) IsNull() bool {
+func (o O[T]) IsNull() bool {
 	return len(o) > 0 && o[0].IsNull
 }
 
-func (o Optional[T]) HasValue() bool {
+func (o O[T]) HasValue() bool {
 	return len(o) > 0 && !o[0].IsNull
 }
 
-func (o Optional[T]) Value() T {
+func (o O[T]) Value() T {
 	if o.HasValue() {
 		return o[0].Value
 	}
@@ -69,7 +69,7 @@ func (o Optional[T]) Value() T {
 // JSON 接口实现
 // -----------------------------------------------------------------------------
 
-func (o Optional[T]) MarshalJSON() ([]byte, error) {
+func (o O[T]) MarshalJSON() ([]byte, error) {
 	// 1. Undefined (nil slice)
 	// 如果字段配置了 omitempty，json 库不会调用此方法。
 	// 如果没配置 omitempty，通常输出 null。
@@ -86,7 +86,7 @@ func (o Optional[T]) MarshalJSON() ([]byte, error) {
 	return json.Marshal(o[0].Value)
 }
 
-func (o *Optional[T]) UnmarshalJSON(data []byte) error {
+func (o *O[T]) UnmarshalJSON(data []byte) error {
 	// 1. 处理 JSON null
 	if len(data) == 0 || bytes.Equal(data, []byte("null")) {
 		*o = []optData[T]{{IsNull: true}}

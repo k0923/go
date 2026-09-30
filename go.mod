@@ -1,6 +1,6 @@
 module github.com/k0923/go
 
-go 1.25
+go 1.27.1
 
 require (
 	github.com/gin-gonic/gin v1.10.0

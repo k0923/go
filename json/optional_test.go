@@ -11,14 +11,14 @@ import (
 )
 
 type StructPeople struct {
-	Name Optional[string] `json:"name,omitempty"`
-	Age  Optional[int]    `json:"age,omitempty"`
+	Name O[string] `json:"name,omitempty"`
+	Age  O[int]    `json:"age,omitempty"`
 }
 
 var Marshal = json.Marshal
 var Unmarshal = json.Unmarshal
 
-func TestOptionalWithOutSet(t *testing.T) {
+func TestOWithOutSet(t *testing.T) {
 
 	Convey("没有设置过字段值序列化", t, func() {
 		people := StructPeople{}
@@ -35,7 +35,7 @@ func TestOptionalWithOutSet(t *testing.T) {
 	})
 }
 
-func TestOptionalWithSet(t *testing.T) {
+func TestOWithSet(t *testing.T) {
 	Convey("初始化属性值序列化测试", t, func() {
 		people := StructPeople{
 			Name: NO("Young"),
@@ -196,8 +196,8 @@ func TestUnmarshalWithNull(t *testing.T) {
 }
 
 type StructPeopleNoOmit struct {
-	Name Optional[string] `json:"name"`
-	Age  Optional[int]    `json:"age"`
+	Name O[string] `json:"name"`
+	Age  O[int]    `json:"age"`
 }
 
 func TestMarshalStructWithOutOmit(t *testing.T) {
@@ -365,8 +365,8 @@ func TestUnmarshalWithOutOmit(t *testing.T) {
 }
 
 type PointerPeople struct {
-	Name *Optional[string] `json:"name,omitempty"`
-	Age  *Optional[int]    `json:"age,omitempty"`
+	Name *O[string] `json:"name,omitempty"`
+	Age  *O[int]    `json:"age,omitempty"`
 }
 
 func Ref[T any](data T) *T {
@@ -452,7 +452,7 @@ func TestUnMarshalPointer(t *testing.T) {
 			Name: NO("TEST"),
 			Age:  NO(88),
 		}
-		// p.Name.Clear() // Clear not implemented in Optional
+		// p.Name.Clear() // Clear not implemented in O
 		p.Name = Undefined[string]()
 
 		d, err := json.Marshal(p)
@@ -551,7 +551,7 @@ func DistinctBy[T any, C comparable](items []T, fn func(T) C, selector func(pre 
 func TestHello(t *testing.T) {
 
 	type MyStu struct {
-		Name Optional[string] `json:"name,omitempty"`
+		Name O[string] `json:"name,omitempty"`
 	}
 
 	s := MyStu{
@@ -607,11 +607,11 @@ func (man Man) Run(ctx context.Context) error {
 
 func TestOmitEmptyBehavior(t *testing.T) {
 	type OmitStruct struct {
-		Name Optional[string] `json:"name,omitempty"`
+		Name O[string] `json:"name,omitempty"`
 	}
 
 	Convey("omitempty测试：结构体值类型（Undefined）", t, func() {
-		// Optional[T] 现改为切片类型，零值为 nil。
+		// O[T] 现改为切片类型，零值为 nil。
 		// Go json 库对 nil 切片会应用 omitempty，因此字段会被忽略。
 		s := OmitStruct{Name: Undefined[string]()}
 		data, err := json.Marshal(s)
@@ -635,7 +635,7 @@ func TestOmitEmptyBehavior(t *testing.T) {
 	})
 
 	type OmitPointerStruct struct {
-		Name *Optional[string] `json:"name,omitempty"`
+		Name *O[string] `json:"name,omitempty"`
 	}
 
 	Convey("omitempty测试：nil 指针", t, func() {
@@ -646,7 +646,7 @@ func TestOmitEmptyBehavior(t *testing.T) {
 	})
 
 	Convey("omitempty测试：指向 Undefined 的指针", t, func() {
-		// 指针不为 nil，指向一个 Undefined 的 Optional
+		// 指针不为 nil，指向一个 Undefined 的 O
 		// MarshalJSON 会被调用，返回 "null"
 		opt := Undefined[string]()
 		s := OmitPointerStruct{Name: &opt}

@@ -1,11 +1,11 @@
 # xjson: Go 语言增强型 JSON 库
 
-`xjson` 是一个轻量级的 Go 语言 JSON 扩展库，旨在解决标准库 `encoding/json` 在处理 **多态（Polymorphism）** 和 **可选字段（Optional Fields）** 时的痛点。
+`xjson` 是一个轻量级的 Go 语言 JSON 扩展库，旨在解决标准库 `encoding/json` 在处理 **多态（Polymorphism）** 和 **可选字段** 时的痛点。
 
 ## 主要特性
 
 1.  **多态类型绑定 (`G[T]`)**: 支持将接口类型或抽象基类反序列化为具体的实现类型，支持默认布局和扁平化布局。
-2.  **可选字段支持 (`Optional[T]`)**: 能够精确区分 JSON 中的 `null`、`undefined`（未设置）和 `value`（有值）。
+2.  **可选字段支持 (`O[T]`)**: 能够精确区分 JSON 中的 `null`、`undefined`（未设置）和 `value`（有值）。
 3.  **高度可配置**: 支持自定义类型键名、值键名、初始化钩子以及底层 JSON 序列化库（如 `sonic` 或 `json-iterator`）。
 
 ---
@@ -149,9 +149,9 @@ if err == nil {
 
 ---
 
-## 2. 可选字段支持 (`Optional[T]`)
+## 2. 可选字段支持 (`O[T]`)
 
-`Optional[T]` 用于处理 JSON 中的 "零值" 问题，能够区分字段是**不存在**、**为 null** 还是**零值**。
+`O[T]` 用于处理 JSON 中的 "零值" 问题，能够区分字段是**不存在**、**为 null** 还是**零值**。
 
 ### 三种状态
 
@@ -164,12 +164,12 @@ if err == nil {
 ```go
 type People struct {
     // 必须配合 omitempty 使用，以便在 Undefined 时不输出字段
-    Name xjson.Optional[string] `json:"name,omitempty"`
-    Age  xjson.Optional[int]    `json:"age,omitempty"`
+    Name xjson.O[string] `json:"name,omitempty"`
+    Age  xjson.O[int]    `json:"age,omitempty"`
 }
 
 func main() {
-    // 1. 创建有值的 Optional
+    // 1. 创建有值的 O
     p1 := People{
         Name: xjson.NO("Alice"),
         Age:  xjson.NO(25),
@@ -190,16 +190,16 @@ func main() {
 
 ### 注意事项
 
-1.  **不要使用指针**: 字段定义请直接使用 `Optional[T]`，不要使用 `*Optional[T]`。`Optional` 内部已经是引用类型（切片），直接使用即可。
+1.  **不要使用指针**: 字段定义请直接使用 `O[T]`，不要使用 `*O[T]`。`O` 内部已经是引用类型（切片），直接使用即可。
 2.  **omitempty**: 务必在 JSON tag 中添加 `omitempty`，否则 `Undefined` 状态可能会被序列化为 `null`。
 
 ```go
 // ✅ 正确
-Name xjson.Optional[string] `json:"name,omitempty"`
+Name xjson.O[string] `json:"name,omitempty"`
 
 // ❌ 错误 (无法区分 Undefined 和 Null)
-Name *xjson.Optional[string] `json:"name,omitempty"`
+Name *xjson.O[string] `json:"name,omitempty"`
 
 // ❌ 错误 (Undefined 会变成 null)
-Name xjson.Optional[string] `json:"name"`
+Name xjson.O[string] `json:"name"`
 ```
