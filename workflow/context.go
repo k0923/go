@@ -118,7 +118,7 @@ func (ctx *WorkflowContext[Input, Output]) Step[Result any](
 	if name == "" {
 		return resultValue, ErrStepNameRequired
 	}
-	if err := ctx.runtime.claimStepName(name, ctx.branchIds); err != nil {
+	if err := ctx.runtime.ClaimStepName(name, ctx.branchIds); err != nil {
 		return resultValue, err
 	}
 	handler := option.Handler
@@ -436,7 +436,7 @@ func (ctx *WorkflowContext[Input, Output]) Parallel(
 			branchesToRun = append(branchesToRun, branch)
 			continue
 		}
-		if ctx.runtime.targetsChild(ctx.branchIds, branch.BranchID) {
+		if ctx.runtime.TargetsChild(ctx.branchIds, branch.BranchID) {
 			branchesToRun = append(branchesToRun, branch)
 		}
 	}
@@ -450,7 +450,7 @@ func (ctx *WorkflowContext[Input, Output]) Parallel(
 		if lease, exists := branchLeases[branch.BranchID]; exists {
 			leaseCopy := lease
 			branchLease = &leaseCopy
-		} else if ctx.runtime.initialLeaseTargets(ctx.branchIds, branch.BranchID) {
+		} else if ctx.runtime.InitialLeaseTargets(ctx.branchIds, branch.BranchID) {
 			leaseCopy := ctx.runtime.initialLease
 			branchLease = &leaseCopy
 		}

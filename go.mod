@@ -4,6 +4,7 @@ go 1.27.1
 
 require (
 	github.com/gin-gonic/gin v1.10.0
+	github.com/google/uuid v1.6.0
 	github.com/smartystreets/goconvey v1.8.1
 )
 

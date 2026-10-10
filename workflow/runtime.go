@@ -103,7 +103,8 @@ func resumeRuntime[Input any, Output any](
 	return runtime, nil
 }
 
-func (runtime *workflowRuntime[Input, Output]) claimStepName(
+// ClaimStepName 为当前执行声明一个步骤名，避免同一运行中跨分支重复使用。
+func (runtime *workflowRuntime[Input, Output]) ClaimStepName(
 	name string,
 	branchIDs []string,
 ) error {
@@ -275,8 +276,8 @@ func (runtime *workflowRuntime[Input, Output]) CompleteRun(
 	return nil
 }
 
-// targetsChild 判断恢复执行时，当前父路径是否应该继续进入指定子分支。
-func (runtime *workflowRuntime[Input, Output]) targetsChild(
+// TargetsChild 判断恢复执行时，当前父路径是否应该继续进入指定子分支。
+func (runtime *workflowRuntime[Input, Output]) TargetsChild(
 	parentBranchIDs []string,
 	branchID string,
 ) bool {
@@ -291,8 +292,8 @@ func (runtime *workflowRuntime[Input, Output]) targetsChild(
 	return runtime.targetBranchIDs[len(parentBranchIDs)] == branchID
 }
 
-// initialLeaseTargets 判断某个子分支是否正是本次恢复执行抢占到的分支。
-func (runtime *workflowRuntime[Input, Output]) initialLeaseTargets(
+// InitialLeaseTargets 判断某个子分支是否正是本次恢复执行抢占到的分支。
+func (runtime *workflowRuntime[Input, Output]) InitialLeaseTargets(
 	parentBranchIDs []string,
 	branchID string,
 ) bool {
