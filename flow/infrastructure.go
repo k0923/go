@@ -8,9 +8,10 @@ import (
 type FlowStatus string
 
 const (
-	FlowStatusRunning  FlowStatus = "RUNNING"
-	FlowStatusFinished FlowStatus = "FINISHED"
-	FlowStatusFailed   FlowStatus = "FAILED"
+	FlowStatusRunning   FlowStatus = "RUNNING"
+	FlowStatusCompleted FlowStatus = "COMPLETED"
+	FlowStatusFailed    FlowStatus = "FAILED"
+	FlowStatusSuspended FlowStatus = "SUSPENDED"
 )
 
 type State struct {
@@ -22,7 +23,7 @@ type State struct {
 
 type Infrastructure interface {
 	AddEvent(ctx context.Context, event Event) (Event, error)
-	GetEvent(ctx context.Context, branches []string, key string) (Event, error)
+	GetEvent(ctx context.Context, key string) (Event, error)
 	UpdateEvent(ctx context.Context, event Event) (Event, error)
 	RaiseSignal(ctx context.Context, signal Signal) error
 	ResolveSignal(ctx context.Context, signal Signal) (bool, error)

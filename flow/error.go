@@ -2,7 +2,6 @@ package flow
 
 import (
 	"errors"
-	"fmt"
 )
 
 var (
@@ -113,64 +112,6 @@ func NewInfrastructureError(message string, causes ...error) *InfrastructureErro
 	}
 }
 
-func NewEventNotFoundError(branches []string, key string) *EventNotFoundError {
-	return &EventNotFoundError{
-		Branches: branches,
-		Key:      key,
-	}
-}
-
-type EventNotFoundError struct {
-	Branches []string
-	Key      string
-}
-
-func (err *EventNotFoundError) Error() string {
-	if err == nil {
-		return ""
-	}
-	message := fmt.Sprintf("event %s not found in branches %s", err.Key, err.Branches)
-	return message
-}
-
-type ContextDoneError struct {
-	Operation string
-	Name      string
-	Cause     error
-}
-
-func (err *ContextDoneError) Error() string {
-	if err == nil {
-		return ""
-	}
-	message := "flow context done"
-	if err.Operation != "" {
-		message = fmt.Sprintf("flow %s context done", err.Operation)
-	}
-	if err.Name != "" {
-		message = fmt.Sprintf("%s: %s", message, err.Name)
-	}
-	if err.Cause != nil {
-		message = fmt.Sprintf("%s: %s", message, err.Cause)
-	}
-	return message
-}
-
-func (err *ContextDoneError) Is(target error) bool {
-	return target == ErrContextDone
-}
-
-func (err *ContextDoneError) Unwrap() error {
-	if err == nil {
-		return nil
-	}
-	return err.Cause
-}
-
-func NewContextDoneError(operation string, name string, cause error) *ContextDoneError {
-	return &ContextDoneError{
-		Operation: operation,
-		Name:      name,
-		Cause:     cause,
-	}
+type commonValue[Value any] struct {
+	Value Value
 }

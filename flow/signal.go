@@ -14,22 +14,20 @@ type Signal interface {
 	GetVersion() int
 }
 
-func NewWaitForSignal(key string, branches []string, request json.RawMessage, response json.RawMessage, version int) Signal {
+func NewWaitForSignal(key string, request json.RawMessage, response json.RawMessage, version int) Signal {
 	return &WaitForSignal{
 		Key:      key,
-		Branches: branches,
 		Version:  version,
 		Request:  request,
 		Response: response,
 	}
 }
 
-func NewSleepSignal(key string, until time.Time, branches []string, version int) Signal {
+func NewSleepSignal(key string, until time.Time, version int) Signal {
 	return &SleepSignal{
-		Key:      key,
-		Until:    until,
-		Branches: branches,
-		Version:  version,
+		Key:     key,
+		Until:   until,
+		Version: version,
 	}
 }
 

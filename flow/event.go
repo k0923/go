@@ -14,7 +14,6 @@ var _ Event = (*SleepEvent)(nil)
 type Event interface {
 	GetEventType() string
 	GetKey() string
-	GetBranches() []string
 	GetStatus() FlowStatus
 	GetVersion() int
 }
@@ -25,7 +24,7 @@ type BaseEvent struct {
 	EndedAt   time.Time
 	Status    FlowStatus
 	Version   int
-	Branches  []string
+	Error     string
 }
 
 func (e *BaseEvent) GetStatus() FlowStatus {
@@ -40,10 +39,6 @@ func (e *BaseEvent) GetKey() string {
 	return e.Key
 }
 
-func (e *BaseEvent) GetBranches() []string {
-	return e.Branches
-}
-
 func (e *BaseEvent) GetStartedAt() time.Time {
 	return e.StartedAt
 }
@@ -55,7 +50,6 @@ func (e *BaseEvent) GetEndedAt() time.Time {
 type StepResultEvent struct {
 	BaseEvent
 	Result json.RawMessage
-	Error  string
 }
 
 func (e *StepResultEvent) GetEventType() string {
@@ -81,7 +75,7 @@ func (e *WaitForSignalEvent) GetEventType() string {
 }
 
 func (e *WaitForSignalEvent) BuildSignal() Signal {
-	return NewWaitForSignal(e.Key, e.Branches, e.Request, e.Response, e.Version)
+	return NewWaitForSignal(e.Key, e.Request, e.Response, e.Version)
 }
 
 type CheckpointEvent struct {
@@ -103,5 +97,5 @@ func (e *SleepEvent) GetEventType() string {
 }
 
 func (e *SleepEvent) BuildSignal() Signal {
-	return NewSleepSignal(e.Key, e.Until, e.Branches, e.Version)
+	return NewSleepSignal(e.Key, e.Until, e.Version)
 }

@@ -10,22 +10,17 @@ import (
 
 var _ Infrastructure = (*InMemoryInfrastructure)(nil)
 
-type inMemoryEventKey struct {
-	branches string
-	key      string
-}
-
 type InMemoryInfrastructure struct {
 	lock    sync.RWMutex
 	state   State
-	events  map[inMemoryEventKey]Event
+	events  map[string]Event
 	signals []Signal
 	errors  []error
 }
 
 func NewInMemoryInfrastructure() *InMemoryInfrastructure {
 	return &InMemoryInfrastructure{
-		events: make(map[inMemoryEventKey]Event),
+		events: make(map[string]Event),
 	}
 }
 
@@ -38,7 +33,7 @@ func (infrastructure *InMemoryInfrastructure) AddEvent(ctx context.Context, even
 		return nil, err
 	}
 	setEventVersion(stored, 1)
-	key := newInMemoryEventKey(event.GetBranches(), event.GetKey())
+	key := event.GetKey()
 
 	infrastructure.lock.Lock()
 	defer infrastructure.lock.Unlock()
@@ -50,25 +45,24 @@ func (infrastructure *InMemoryInfrastructure) AddEvent(ctx context.Context, even
 	return cloneEvent(stored)
 }
 
-func (infrastructure *InMemoryInfrastructure) GetEvent(ctx context.Context, branches []string, key string) (Event, error) {
+func (infrastructure *InMemoryInfrastructure) GetEvent(ctx context.Context, key string) (Event, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	eventKey := newInMemoryEventKey(branches, key)
 
 	infrastructure.lock.RLock()
 	defer infrastructure.lock.RUnlock()
-	if infrastructure.events == nil || infrastructure.events[eventKey] == nil {
+	if infrastructure.events == nil || infrastructure.events[key] == nil {
 		return nil, nil
 	}
-	return cloneEvent(infrastructure.events[eventKey])
+	return cloneEvent(infrastructure.events[key])
 }
 
 func (infrastructure *InMemoryInfrastructure) UpdateEvent(ctx context.Context, event Event) (Event, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	key := newInMemoryEventKey(event.GetBranches(), event.GetKey())
+	key := event.GetKey()
 
 	infrastructure.lock.Lock()
 	defer infrastructure.lock.Unlock()
@@ -105,11 +99,7 @@ func (infrastructure *InMemoryInfrastructure) ResolveSignal(ctx context.Context,
 	if err := ctx.Err(); err != nil {
 		return false, err
 	}
-	branches, ok := signalBranches(signal)
-	if !ok {
-		return false, nil
-	}
-	key := newInMemoryEventKey(branches, signal.GetKey())
+	key := signal.GetKey()
 
 	infrastructure.lock.Lock()
 	defer infrastructure.lock.Unlock()
@@ -133,13 +123,13 @@ func (infrastructure *InMemoryInfrastructure) ResolveSignal(ctx context.Context,
 		}
 		result := resolved.(*WaitForSignalEvent)
 		result.Response = cloneRawMessage(value.Response)
-		result.Status = FlowStatusFinished
+		result.Status = FlowStatusCompleted
 		result.EndedAt = time.Now()
 		result.Version++
 		infrastructure.events[key] = result
 	case *SleepSignal:
 		sleep, ok := event.(*SleepEvent)
-		if !ok || time.Now().Before(value.Until) {
+		if !ok || time.Now().Before(sleep.Until) {
 			return false, nil
 		}
 		resolved, err := cloneEvent(sleep)
@@ -147,7 +137,7 @@ func (infrastructure *InMemoryInfrastructure) ResolveSignal(ctx context.Context,
 			return false, err
 		}
 		result := resolved.(*SleepEvent)
-		result.Status = FlowStatusFinished
+		result.Status = FlowStatusCompleted
 		result.EndedAt = time.Now()
 		result.Version++
 		infrastructure.events[key] = result
@@ -206,15 +196,7 @@ func (infrastructure *InMemoryInfrastructure) Errors() []error {
 
 func (infrastructure *InMemoryInfrastructure) initialize() {
 	if infrastructure.events == nil {
-		infrastructure.events = make(map[inMemoryEventKey]Event)
-	}
-}
-
-func newInMemoryEventKey(branches []string, key string) inMemoryEventKey {
-	data, _ := json.Marshal(branches)
-	return inMemoryEventKey{
-		branches: string(data),
-		key:      key,
+		infrastructure.events = make(map[string]Event)
 	}
 }
 
@@ -225,36 +207,26 @@ func cloneState(state State) State {
 	return state
 }
 
-func cloneBaseEvent(event BaseEvent) BaseEvent {
-	event.Branches = append([]string(nil), event.Branches...)
-	return event
-}
-
 func cloneEvent(event Event) (Event, error) {
 	switch value := event.(type) {
 	case *StepResultEvent:
 		result := *value
-		result.BaseEvent = cloneBaseEvent(value.BaseEvent)
 		result.Result = cloneRawMessage(value.Result)
 		return &result, nil
 	case *BranchResultEvent:
 		result := *value
-		result.BaseEvent = cloneBaseEvent(value.BaseEvent)
 		return &result, nil
 	case *WaitForSignalEvent:
 		result := *value
-		result.BaseEvent = cloneBaseEvent(value.BaseEvent)
 		result.Request = cloneRawMessage(value.Request)
 		result.Response = cloneRawMessage(value.Response)
 		return &result, nil
 	case *CheckpointEvent:
 		result := *value
-		result.BaseEvent = cloneBaseEvent(value.BaseEvent)
 		result.Data = cloneRawMessage(value.Data)
 		return &result, nil
 	case *SleepEvent:
 		result := *value
-		result.BaseEvent = cloneBaseEvent(value.BaseEvent)
 		return &result, nil
 	default:
 		return nil, fmt.Errorf("unsupported event type %T", event)
@@ -296,17 +268,6 @@ func cloneSignal(signal Signal) (Signal, error) {
 		return result, nil
 	default:
 		return nil, fmt.Errorf("unsupported signal type %T", signal)
-	}
-}
-
-func signalBranches(signal Signal) ([]string, bool) {
-	switch value := signal.(type) {
-	case *WaitForSignal:
-		return value.Branches, true
-	case *SleepSignal:
-		return value.Branches, true
-	default:
-		return nil, false
 	}
 }
 

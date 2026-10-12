@@ -8,7 +8,7 @@ import (
 
 type Flow[Input any, Output any] struct {
 	// Handler must not recover panics from flow runtime APIs.
-	Handler func(ctx *FlowContext[Input, Output]) Output
+	Handler func(ctx *runtime[Input]) Output
 }
 
 type flowCompleted struct {
@@ -22,7 +22,7 @@ func (flow *Flow[Input, Output]) StartRun(ctx context.Context, input Input, infr
 		return
 	}
 
-	if state.Status == FlowStatusFinished || state.Status == FlowStatusFailed {
+	if state.Status == FlowStatusCompleted || state.Status == FlowStatusFailed {
 		return
 	}
 
@@ -84,7 +84,7 @@ func (flow *Flow[Input, Output]) ResumeRun(ctx context.Context, infrastructure I
 }
 
 func (flow *Flow[Input, Output]) run(ctx context.Context, input Input, infrastructure Infrastructure) {
-	runtime := &runtime[Input, Output]{infrastructure: infrastructure}
+	runtime := &runtime[Input]{Context: ctx, infrastructure: infrastructure}
 	setState := func(output json.RawMessage, status FlowStatus, errors []string) {
 		inputData, err := json.Marshal(input)
 		if err != nil {
@@ -114,12 +114,22 @@ func (flow *Flow[Input, Output]) run(ctx context.Context, input Input, infrastru
 				setState(nil, FlowStatusFailed, []string{err.Error()})
 				return
 			}
-			setState(json.RawMessage(outputData), FlowStatusFinished, nil)
+			setState(json.RawMessage(outputData), FlowStatusCompleted, nil)
 			return
 		case BranchSignal:
 			errors := make([]string, 0)
 			for _, branchResult := range output {
-				if err, ok := branchResult.(error); ok {
+				if branchResult == nil {
+					continue
+				}
+				switch result := branchResult.(type) {
+				case Signal:
+					continue
+				case error:
+					infrastructure.OnError(result)
+					errors = append(errors, result.Error())
+				default:
+					err := NewSystemError(fmt.Sprintf("flow panic: %v", result))
 					infrastructure.OnError(err)
 					errors = append(errors, err.Error())
 				}
@@ -146,6 +156,5 @@ func (flow *Flow[Input, Output]) run(ctx context.Context, input Input, infrastru
 		}
 	}()
 
-	flowCtx := newBranchContext(ctx, input, runtime, nil)
-	panic(flowCompleted{output: flow.Handler(flowCtx)})
+	panic(flowCompleted{output: flow.Handler(runtime)})
 }
