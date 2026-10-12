@@ -5,68 +5,83 @@ import (
 	"time"
 )
 
+var _ Event = (*StepResultEvent)(nil)
+var _ Event = (*BranchResultEvent)(nil)
+var _ Event = (*WaitForSignalEvent)(nil)
+var _ Event = (*CheckpointEvent)(nil)
+var _ Event = (*SleepEvent)(nil)
+
 type Event interface {
 	GetEventType() string
-	GetName() string
+	GetKey() string
 	GetBranches() []string
+	GetStatus() FlowStatus
+	GetVersion() int
 }
 
 type BaseEvent struct {
-	Name     string
-	Ts       time.Time
-	Branches []string
+	Key       string
+	StartedAt time.Time
+	EndedAt   time.Time
+	Status    FlowStatus
+	Version   int
+	Branches  []string
 }
 
-func (e *BaseEvent) GetName() string {
-	return e.Name
+func (e *BaseEvent) GetStatus() FlowStatus {
+	return e.Status
+}
+
+func (e *BaseEvent) GetVersion() int {
+	return e.Version
+}
+
+func (e *BaseEvent) GetKey() string {
+	return e.Key
 }
 
 func (e *BaseEvent) GetBranches() []string {
 	return e.Branches
 }
 
-type StepStartEvent struct {
-	BaseEvent
+func (e *BaseEvent) GetStartedAt() time.Time {
+	return e.StartedAt
 }
 
-func (e *StepStartEvent) GetEventType() string {
-	return "STEP_START"
+func (e *BaseEvent) GetEndedAt() time.Time {
+	return e.EndedAt
 }
 
-type StepEndEvent struct {
+type StepResultEvent struct {
 	BaseEvent
 	Result json.RawMessage
+	Error  string
 }
 
-func (e *StepEndEvent) GetEventType() string {
-	return "STEP_END"
+func (e *StepResultEvent) GetEventType() string {
+	return "STEP_RESULT"
 }
 
-type StepFailedEvent struct {
+type BranchResultEvent struct {
 	BaseEvent
-	Error string
 }
 
-func (e *StepFailedEvent) GetEventType() string {
-	return "STEP_FAILED"
+func (e *BranchResultEvent) GetEventType() string {
+	return "BRANCH_RESULT"
 }
 
-type WaitForEvent struct {
+type WaitForSignalEvent struct {
 	BaseEvent
-	Request json.RawMessage
-}
-
-func (e *WaitForEvent) GetEventType() string {
-	return "WAIT_FOR"
-}
-
-type WaitForResultEvent struct {
-	BaseEvent
+	Request  json.RawMessage
 	Response json.RawMessage
 }
 
-func (e *WaitForResultEvent) GetEventType() string {
-	return "WAIT_FOR_RESULT"
+func (e *WaitForSignalEvent) GetEventType() string {
+	return "WAIT_FOR_SIGNAL"
+}
+
+func (e *WaitForSignalEvent) BuildSignal() Signal {
+	return NewWaitForSignal(e.Key, e.Branches, e.Request, e.Response, e.Version)
 }
 
 type CheckpointEvent struct {
@@ -85,4 +100,8 @@ type SleepEvent struct {
 
 func (e *SleepEvent) GetEventType() string {
 	return "SLEEP"
+}
+
+func (e *SleepEvent) BuildSignal() Signal {
+	return NewSleepSignal(e.Key, e.Until, e.Branches, e.Version)
 }

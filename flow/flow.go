@@ -4,132 +4,148 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"sync"
-	"time"
 )
 
 type Flow[Input any, Output any] struct {
+	// Handler must not recover panics from flow runtime APIs.
 	Handler func(ctx *FlowContext[Input, Output]) Output
 }
 
-func (flow *Flow[Input, Output]) StartRun(ctx context.Context, input Input, infrastructure Infrastructure) error {
-	events := make([]Event, 0)
-	runtime, err := newRuntime[Input, Output](infrastructure, events)
+type flowCompleted struct {
+	output any
+}
+
+func (flow *Flow[Input, Output]) StartRun(ctx context.Context, input Input, infrastructure Infrastructure) {
+	state, err := infrastructure.GetState(ctx)
 	if err != nil {
-		return err
+		infrastructure.OnError(err)
+		return
 	}
+
+	if state.Status == FlowStatusFinished || state.Status == FlowStatusFailed {
+		return
+	}
+
+	if state.Status == FlowStatusRunning {
+		var input Input
+		if err := json.Unmarshal(state.Input, &input); err != nil {
+			infrastructure.OnError(err)
+			return
+		}
+		flow.run(ctx, input, infrastructure)
+		return
+	}
+
 	inputData, err := json.Marshal(input)
 	if err != nil {
-		return err
+		infrastructure.OnError(err)
+		return
 	}
-	state := State{
+
+	state = State{
 		Input:  json.RawMessage(inputData),
 		Status: FlowStatusRunning,
 	}
+
 	if err := infrastructure.SetState(ctx, state); err != nil {
-		return err
+		infrastructure.OnError(err)
+		return
 	}
 
-	return flow.run(ctx, input, json.RawMessage(inputData), runtime, infrastructure)
+	flow.run(ctx, input, infrastructure)
 }
 
-func (flow *Flow[Input, Output]) ResumeRun(ctx context.Context, infrastructure Infrastructure, signal Signal) error {
+func (flow *Flow[Input, Output]) ResumeRun(ctx context.Context, infrastructure Infrastructure, signal Signal) {
 	state, err := infrastructure.GetState(ctx)
 	if err != nil {
-		return err
+		infrastructure.OnError(err)
+		return
 	}
 	var input Input
-	if err = json.Unmarshal(state.Input, &input); err != nil {
-		return err
-	}
-	if state.Status != FlowStatusRunning {
-		return fmt.Errorf("flow is not running")
-	}
-	events, err := infrastructure.GetEvents(ctx)
-	if err != nil {
-		return err
+	if err := json.Unmarshal(state.Input, &input); err != nil {
+		infrastructure.OnError(err)
+		return
 	}
 
-	runtime, err := newRuntime[Input, Output](infrastructure, events)
+	if state.Status != FlowStatusRunning {
+		return
+	}
+	resolved, err := infrastructure.ResolveSignal(ctx, signal)
 	if err != nil {
-		return err
+		infrastructure.OnError(err)
+		return
 	}
-	switch s := signal.(type) {
-	case conflictEventSignal:
-		return fmt.Errorf("conflict event signal")
-	case WaitForSignal:
-		waitForEvent := runtime.getEvent[*WaitForEvent](s.Branches, s.Name)
-		if waitForEvent == nil {
-			return NewBizError(
-				fmt.Sprintf("wait for event %s not found", s.Name),
-				ErrWaitForEventNotFound,
-			)
-		}
-		if runtime.getEvent[*WaitForResultEvent](s.Branches, s.Name) != nil {
-			return nil
-		}
-		event := &WaitForResultEvent{
-			Branches: append([]string(nil), waitForEvent.Branches...),
-			Name:     s.Name,
-			Response: s.Response,
-			Ts:       time.Now(),
-		}
-		if accepted, err := runtime.AppendEvent(ctx, event); err != nil {
-			return err
-		} else if !accepted {
-			return nil
-		}
-	case SleepSignal:
+	if !resolved {
+		// 信号冲突，忽略
+		return
 	}
-	return flow.run(ctx, input, json.RawMessage(state.Input), runtime, infrastructure)
+	flow.run(ctx, input, infrastructure)
+
 }
 
-func (flow *Flow[Input, Output]) run(ctx context.Context, input Input, inputData json.RawMessage, runtime *runtime[Input, Output], infrastructure Infrastructure) (err error) {
-	var signalWaitGroup sync.WaitGroup
-	defer func() {
-		runtime.Close()
-		signalWaitGroup.Wait()
-		if result := recover(); result != nil {
-			if _, ok := result.(Signal); ok {
-				return
-			}
-			state := State{
-				Status: FlowStatusFailed,
-				Input:  inputData,
-			}
-			if stateErr := infrastructure.SetState(ctx, state); stateErr != nil {
-				err = NewInfrastructureError("fail to set failed flow state", stateErr)
-				return
-			}
-			if resultErr, ok := result.(error); ok {
-				err = resultErr
-				return
-			}
-			err = NewSystemError(fmt.Sprintf("flow panic: %v", result))
+func (flow *Flow[Input, Output]) run(ctx context.Context, input Input, infrastructure Infrastructure) {
+	runtime := &runtime[Input, Output]{infrastructure: infrastructure}
+	setState := func(output json.RawMessage, status FlowStatus, errors []string) {
+		inputData, err := json.Marshal(input)
+		if err != nil {
+			infrastructure.OnError(err)
+			return
 		}
-	}()
-	signalWaitGroup.Go(func() {
-		for signal := range runtime.GetSignal() {
-			if signal.innerSignal() {
-				continue
-			}
-			infrastructure.ProcessSignal(ctx, signal)
+		if err := infrastructure.SetState(ctx, State{
+			Input:  inputData,
+			Output: output,
+			Status: status,
+			Errors: errors,
+		}); err != nil {
+			infrastructure.OnError(err)
 		}
-	})
-	flowCtx := newBranchContext(ctx, input, runtime, nil)
-	output := flow.Handler(flowCtx)
-	outputData, err := json.Marshal(output)
-	if err != nil {
-		return err
-	}
-	state := State{
-		Input:  inputData,
-		Output: json.RawMessage(outputData),
-		Status: FlowStatusFinished,
-	}
-	if err := infrastructure.SetState(ctx, state); err != nil {
-		return err
 	}
 
-	return nil
+	defer func() {
+		result := recover()
+		if result == nil {
+			return
+		}
+		switch output := result.(type) {
+		case flowCompleted:
+			outputData, err := json.Marshal(output.output)
+			if err != nil {
+				infrastructure.OnError(err)
+				setState(nil, FlowStatusFailed, []string{err.Error()})
+				return
+			}
+			setState(json.RawMessage(outputData), FlowStatusFinished, nil)
+			return
+		case BranchSignal:
+			errors := make([]string, 0)
+			for _, branchResult := range output {
+				if err, ok := branchResult.(error); ok {
+					infrastructure.OnError(err)
+					errors = append(errors, err.Error())
+				}
+			}
+			if len(errors) > 0 {
+				setState(nil, FlowStatusFailed, errors)
+				return
+			}
+			return
+		case error:
+			if IsConflictError(output) {
+				return
+			}
+			infrastructure.OnError(output)
+			setState(nil, FlowStatusFailed, []string{output.Error()})
+			return
+		case Signal:
+			return
+		default:
+			err := NewSystemError(fmt.Sprintf("flow panic: %v", output))
+			infrastructure.OnError(err)
+			setState(nil, FlowStatusFailed, []string{err.Error()})
+			return
+		}
+	}()
+
+	flowCtx := newBranchContext(ctx, input, runtime, nil)
+	panic(flowCompleted{output: flow.Handler(flowCtx)})
 }

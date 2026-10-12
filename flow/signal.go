@@ -5,35 +5,71 @@ import (
 	"time"
 )
 
+var _ Signal = (*WaitForSignal)(nil)
+var _ Signal = (*SleepSignal)(nil)
+var _ Signal = (*BranchSignal)(nil)
+
 type Signal interface {
-	innerSignal() bool
+	GetKey() string
+	GetVersion() int
+}
+
+func NewWaitForSignal(key string, branches []string, request json.RawMessage, response json.RawMessage, version int) Signal {
+	return &WaitForSignal{
+		Key:      key,
+		Branches: branches,
+		Version:  version,
+		Request:  request,
+		Response: response,
+	}
+}
+
+func NewSleepSignal(key string, until time.Time, branches []string, version int) Signal {
+	return &SleepSignal{
+		Key:      key,
+		Until:    until,
+		Branches: branches,
+		Version:  version,
+	}
 }
 
 type WaitForSignal struct {
-	Name     string
+	Key      string
 	Branches []string
+	Version  int
 	Request  json.RawMessage
 	Response json.RawMessage
 }
 
-func (s WaitForSignal) innerSignal() bool {
-	return false
+func (s *WaitForSignal) GetKey() string {
+	return s.Key
+}
+
+func (s *WaitForSignal) GetVersion() int {
+	return s.Version
 }
 
 type SleepSignal struct {
-	Name     string
-	Duration time.Duration
+	Key      string
+	Until    time.Time
 	Branches []string
+	Version  int
 }
 
-func (s SleepSignal) innerSignal() bool {
-	return false
+func (s *SleepSignal) GetKey() string {
+	return s.Key
 }
 
-type conflictEventSignal struct {
-	Event Event
+func (s *SleepSignal) GetVersion() int {
+	return s.Version
 }
 
-func (s conflictEventSignal) innerSignal() bool {
-	return true
+type BranchSignal map[string]any
+
+func (s BranchSignal) GetKey() string {
+	return "branch"
+}
+
+func (s BranchSignal) GetVersion() int {
+	return 0
 }

@@ -17,16 +17,16 @@ type State struct {
 	Input  json.RawMessage
 	Output json.RawMessage
 	Status FlowStatus
-}
-
-type eventAppender interface {
-	AppendEvent(ctx context.Context, event Event, expectedIndex int) (bool, error)
+	Errors []string
 }
 
 type Infrastructure interface {
-	eventAppender
+	AddEvent(ctx context.Context, event Event) (Event, error)
+	GetEvent(ctx context.Context, branches []string, key string) (Event, error)
+	UpdateEvent(ctx context.Context, event Event) (Event, error)
+	RaiseSignal(ctx context.Context, signal Signal) error
+	ResolveSignal(ctx context.Context, signal Signal) (bool, error)
 	GetState(ctx context.Context) (State, error)
 	SetState(ctx context.Context, state State) error
-	GetEvents(ctx context.Context) ([]Event, error)
-	ProcessSignal(ctx context.Context, signal Signal)
+	OnError(err error)
 }

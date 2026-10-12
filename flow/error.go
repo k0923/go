@@ -10,7 +10,12 @@ var (
 	ErrWaitForEventNotFound = errors.New("wait for event not found")
 	ErrBranchKeyRequired    = errors.New("parallel branch key is required")
 	ErrDuplicateBranchKey   = errors.New("parallel branch key must be unique")
+	ErrConflict             = errors.New("conflict")
 )
+
+func IsConflictError(err error) bool {
+	return errors.Is(err, ErrConflict)
+}
 
 type BizError struct {
 	Message string
@@ -106,6 +111,26 @@ func NewInfrastructureError(message string, causes ...error) *InfrastructureErro
 		Message: message,
 		Cause:   errors.Join(causes...),
 	}
+}
+
+func NewEventNotFoundError(branches []string, key string) *EventNotFoundError {
+	return &EventNotFoundError{
+		Branches: branches,
+		Key:      key,
+	}
+}
+
+type EventNotFoundError struct {
+	Branches []string
+	Key      string
+}
+
+func (err *EventNotFoundError) Error() string {
+	if err == nil {
+		return ""
+	}
+	message := fmt.Sprintf("event %s not found in branches %s", err.Key, err.Branches)
+	return message
 }
 
 type ContextDoneError struct {
