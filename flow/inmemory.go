@@ -5,26 +5,25 @@ import (
 	"encoding/json"
 	"fmt"
 	"sync"
-	"time"
 )
 
-var _ Infrastructure = (*InMemoryInfrastructure)(nil)
+var _ Infrastructure[any, any] = (*InMemoryInfrastructure[any, any])(nil)
 
-type InMemoryInfrastructure struct {
+type InMemoryInfrastructure[Input any, Output any] struct {
 	lock    sync.RWMutex
-	state   State
+	state   State[Input, Output]
 	events  map[string]Event
 	signals []Signal
 	errors  []error
 }
 
-func NewInMemoryInfrastructure() *InMemoryInfrastructure {
-	return &InMemoryInfrastructure{
+func NewInMemoryInfrastructure[Input any, Output any]() *InMemoryInfrastructure[Input, Output] {
+	return &InMemoryInfrastructure[Input, Output]{
 		events: make(map[string]Event),
 	}
 }
 
-func (infrastructure *InMemoryInfrastructure) AddEvent(ctx context.Context, event Event) (Event, error) {
+func (infrastructure *InMemoryInfrastructure[Input, Output]) AddEvent(ctx context.Context, event Event) (Event, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -42,10 +41,13 @@ func (infrastructure *InMemoryInfrastructure) AddEvent(ctx context.Context, even
 		return nil, nil
 	}
 	infrastructure.events[key] = stored
+	if signal, ok := stored.(Signal); ok {
+		infrastructure.signals = append(infrastructure.signals, signal)
+	}
 	return cloneEvent(stored)
 }
 
-func (infrastructure *InMemoryInfrastructure) GetEvent(ctx context.Context, key string) (Event, error) {
+func (infrastructure *InMemoryInfrastructure[Input, Output]) GetEvent(ctx context.Context, key string) (Event, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -58,7 +60,7 @@ func (infrastructure *InMemoryInfrastructure) GetEvent(ctx context.Context, key 
 	return cloneEvent(infrastructure.events[key])
 }
 
-func (infrastructure *InMemoryInfrastructure) UpdateEvent(ctx context.Context, event Event) (Event, error) {
+func (infrastructure *InMemoryInfrastructure[Input, Output]) UpdateEvent(ctx context.Context, event Event) (Event, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -80,83 +82,16 @@ func (infrastructure *InMemoryInfrastructure) UpdateEvent(ctx context.Context, e
 	return cloneEvent(stored)
 }
 
-func (infrastructure *InMemoryInfrastructure) RaiseSignal(ctx context.Context, signal Signal) error {
+func (infrastructure *InMemoryInfrastructure[Input, Output]) GetState(ctx context.Context) (State[Input, Output], error) {
 	if err := ctx.Err(); err != nil {
-		return err
-	}
-	stored, err := cloneSignal(signal)
-	if err != nil {
-		return err
-	}
-
-	infrastructure.lock.Lock()
-	defer infrastructure.lock.Unlock()
-	infrastructure.signals = append(infrastructure.signals, stored)
-	return nil
-}
-
-func (infrastructure *InMemoryInfrastructure) ResolveSignal(ctx context.Context, signal Signal) (bool, error) {
-	if err := ctx.Err(); err != nil {
-		return false, err
-	}
-	key := signal.GetKey()
-
-	infrastructure.lock.Lock()
-	defer infrastructure.lock.Unlock()
-	infrastructure.initialize()
-	event := infrastructure.events[key]
-	if event == nil ||
-		event.GetStatus() != FlowStatusRunning ||
-		event.GetVersion() != signal.GetVersion() {
-		return false, nil
-	}
-
-	switch value := signal.(type) {
-	case *WaitForSignal:
-		awaited, ok := event.(*WaitForSignalEvent)
-		if !ok {
-			return false, nil
-		}
-		resolved, err := cloneEvent(awaited)
-		if err != nil {
-			return false, err
-		}
-		result := resolved.(*WaitForSignalEvent)
-		result.Response = cloneRawMessage(value.Response)
-		result.Status = FlowStatusCompleted
-		result.EndedAt = time.Now()
-		result.Version++
-		infrastructure.events[key] = result
-	case *SleepSignal:
-		sleep, ok := event.(*SleepEvent)
-		if !ok || time.Now().Before(sleep.Until) {
-			return false, nil
-		}
-		resolved, err := cloneEvent(sleep)
-		if err != nil {
-			return false, err
-		}
-		result := resolved.(*SleepEvent)
-		result.Status = FlowStatusCompleted
-		result.EndedAt = time.Now()
-		result.Version++
-		infrastructure.events[key] = result
-	default:
-		return false, nil
-	}
-	return true, nil
-}
-
-func (infrastructure *InMemoryInfrastructure) GetState(ctx context.Context) (State, error) {
-	if err := ctx.Err(); err != nil {
-		return State{}, err
+		return State[Input, Output]{}, err
 	}
 	infrastructure.lock.RLock()
 	defer infrastructure.lock.RUnlock()
 	return cloneState(infrastructure.state), nil
 }
 
-func (infrastructure *InMemoryInfrastructure) SetState(ctx context.Context, state State) error {
+func (infrastructure *InMemoryInfrastructure[Input, Output]) SetState(ctx context.Context, state State[Input, Output]) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -166,7 +101,7 @@ func (infrastructure *InMemoryInfrastructure) SetState(ctx context.Context, stat
 	return nil
 }
 
-func (infrastructure *InMemoryInfrastructure) OnError(err error) {
+func (infrastructure *InMemoryInfrastructure[Input, Output]) OnError(err error) {
 	if err == nil {
 		return
 	}
@@ -175,7 +110,7 @@ func (infrastructure *InMemoryInfrastructure) OnError(err error) {
 	infrastructure.errors = append(infrastructure.errors, err)
 }
 
-func (infrastructure *InMemoryInfrastructure) Signals() []Signal {
+func (infrastructure *InMemoryInfrastructure[Input, Output]) Signals() []Signal {
 	infrastructure.lock.RLock()
 	defer infrastructure.lock.RUnlock()
 	signals := make([]Signal, 0, len(infrastructure.signals))
@@ -188,21 +123,25 @@ func (infrastructure *InMemoryInfrastructure) Signals() []Signal {
 	return signals
 }
 
-func (infrastructure *InMemoryInfrastructure) Errors() []error {
+func (infrastructure *InMemoryInfrastructure[Input, Output]) Errors() []error {
 	infrastructure.lock.RLock()
 	defer infrastructure.lock.RUnlock()
 	return append([]error(nil), infrastructure.errors...)
 }
 
-func (infrastructure *InMemoryInfrastructure) initialize() {
+func (infrastructure *InMemoryInfrastructure[Input, Output]) initialize() {
 	if infrastructure.events == nil {
 		infrastructure.events = make(map[string]Event)
 	}
 }
 
-func cloneState(state State) State {
-	state.Input = cloneRawMessage(state.Input)
-	state.Output = cloneRawMessage(state.Output)
+func cloneState[Input any, Output any](state State[Input, Output]) State[Input, Output] {
+	if value, ok := any(state.Input).(json.RawMessage); ok {
+		state.Input = any(cloneRawMessage(value)).(Input)
+	}
+	if value, ok := any(state.Output).(json.RawMessage); ok {
+		state.Output = any(cloneRawMessage(value)).(Output)
+	}
 	state.Errors = append([]string(nil), state.Errors...)
 	return state
 }
@@ -213,8 +152,9 @@ func cloneEvent(event Event) (Event, error) {
 		result := *value
 		result.Result = cloneRawMessage(value.Result)
 		return &result, nil
-	case *BranchResultEvent:
+	case *AsyncEvent:
 		result := *value
+		result.Result = cloneRawMessage(value.Result)
 		return &result, nil
 	case *WaitForSignalEvent:
 		result := *value
@@ -225,7 +165,7 @@ func cloneEvent(event Event) (Event, error) {
 		result := *value
 		result.Data = cloneRawMessage(value.Data)
 		return &result, nil
-	case *SleepEvent:
+	case *SleepSignalEvent:
 		result := *value
 		return &result, nil
 	default:
@@ -237,38 +177,27 @@ func setEventVersion(event Event, version int) {
 	switch value := event.(type) {
 	case *StepResultEvent:
 		value.Version = version
-	case *BranchResultEvent:
+	case *AsyncEvent:
 		value.Version = version
 	case *WaitForSignalEvent:
 		value.Version = version
 	case *CheckpointEvent:
 		value.Version = version
-	case *SleepEvent:
+	case *SleepSignalEvent:
 		value.Version = version
 	}
 }
 
 func cloneSignal(signal Signal) (Signal, error) {
-	switch value := signal.(type) {
-	case *WaitForSignal:
-		result := *value
-		result.Branches = append([]string(nil), value.Branches...)
-		result.Request = cloneRawMessage(value.Request)
-		result.Response = cloneRawMessage(value.Response)
-		return &result, nil
-	case *SleepSignal:
-		result := *value
-		result.Branches = append([]string(nil), value.Branches...)
-		return &result, nil
-	case BranchSignal:
-		result := make(BranchSignal, len(value))
-		for key, branchResult := range value {
-			result[key] = branchResult
-		}
-		return result, nil
-	default:
-		return nil, fmt.Errorf("unsupported signal type %T", signal)
+	event, err := cloneEvent(signal)
+	if err != nil {
+		return nil, err
 	}
+	result, ok := event.(Signal)
+	if !ok {
+		return nil, fmt.Errorf("event %T does not implement Signal", event)
+	}
+	return result, nil
 }
 
 func cloneRawMessage(message json.RawMessage) json.RawMessage {

@@ -2,7 +2,6 @@ package flow
 
 import (
 	"context"
-	"encoding/json"
 )
 
 type FlowStatus string
@@ -14,20 +13,18 @@ const (
 	FlowStatusSuspended FlowStatus = "SUSPENDED"
 )
 
-type State struct {
-	Input  json.RawMessage
-	Output json.RawMessage
+type State[Input any, Output any] struct {
+	Input  Input
+	Output Output
 	Status FlowStatus
 	Errors []string
 }
 
-type Infrastructure interface {
+type Infrastructure[Input any, Output any] interface {
 	AddEvent(ctx context.Context, event Event) (Event, error)
 	GetEvent(ctx context.Context, key string) (Event, error)
 	UpdateEvent(ctx context.Context, event Event) (Event, error)
-	RaiseSignal(ctx context.Context, signal Signal) error
-	ResolveSignal(ctx context.Context, signal Signal) (bool, error)
-	GetState(ctx context.Context) (State, error)
-	SetState(ctx context.Context, state State) error
+	GetState(ctx context.Context) (State[Input, Output], error)
+	SetState(ctx context.Context, state State[Input, Output]) error
 	OnError(err error)
 }

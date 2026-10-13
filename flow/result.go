@@ -4,57 +4,40 @@ type IResult[Output any] interface {
 	Wait() Output
 }
 
-func newFixedResult[Output any](resultHandler func() any) *fixedResult[Output] {
-	return &fixedResult[Output]{resultHandler: resultHandler}
-}
-
 type fixedResult[Output any] struct {
-	resultHandler func() any
+	value  Output
+	err    error
+	signal Signal
 }
 
-func (fr *fixedResult[Output]) Wait() Output {
-	output := fr.resultHandler()
-	switch result := output.(type) {
-	case commonValue[Output]:
-		return result.Value
-	case Output:
-		return result
-	default:
-		panic(output)
+func (r *fixedResult[Output]) Wait() Output {
+	if r.err != nil {
+		panic(r.err)
 	}
+	if r.signal != nil {
+		panic(r.signal)
+	}
+	return r.value
 }
 
-func newWaitedResult[Output any](handler func() Output) *waitedResult[Output] {
-	resultChan := make(chan any, 1)
+func newWaitedResult[Output any](handler func() *fixedResult[Output]) *waitedResult[Output] {
+	resultChan := make(chan *fixedResult[Output], 1)
 	waitedResult := &waitedResult[Output]{resultChan: resultChan}
 	go func() {
-		defer func() {
-			resultChan <- recover()
-			close(resultChan)
-		}()
-		output := handler()
-		panic(commonValue[Output]{Value: output})
+		resultChan <- handler()
 	}()
 	return waitedResult
 }
 
 type waitedResult[Output any] struct {
-	resultChan  chan any
-	result      Output
-	isCompleted bool
+	resultChan chan *fixedResult[Output]
+	result     *fixedResult[Output]
 }
 
 func (wr *waitedResult[Output]) Wait() Output {
-	if wr.isCompleted {
-		return wr.result
+	if wr.result != nil {
+		return wr.result.Wait()
 	}
-	output := <-wr.resultChan
-	switch result := output.(type) {
-	case commonValue[Output]:
-		wr.result = result.Value
-		wr.isCompleted = true
-		return wr.result
-	default:
-		panic(result)
-	}
+	wr.result = <-wr.resultChan
+	return wr.result.Wait()
 }

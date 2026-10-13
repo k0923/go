@@ -18,21 +18,8 @@ func (event *unsupportedEvent) GetEventType() string {
 	return "UNSUPPORTED"
 }
 
-type unsupportedSignal struct {
-	key     string
-	version int
-}
-
-func (signal *unsupportedSignal) GetKey() string {
-	return signal.key
-}
-
-func (signal *unsupportedSignal) GetVersion() int {
-	return signal.version
-}
-
 func TestInMemoryInfrastructureEventCAS_BitsUT(t *testing.T) {
-	var infrastructure InMemoryInfrastructure
+	var infrastructure InMemoryInfrastructure[struct{}, struct{}]
 	ctx := context.Background()
 	event := &StepResultEvent{
 		BaseEvent: BaseEvent{
@@ -80,7 +67,7 @@ func TestInMemoryInfrastructureEventCAS_BitsUT(t *testing.T) {
 		t.Fatalf("stored event was mutated through returned value: %s", stored.(*StepResultEvent).Result)
 	}
 
-	duplicate, err := infrastructure.AddEvent(ctx, &SleepEvent{
+	duplicate, err := infrastructure.AddEvent(ctx, &SleepSignalEvent{
 		BaseEvent: BaseEvent{Key: "step", Status: FlowStatusRunning},
 	})
 	if err != nil {
@@ -91,13 +78,37 @@ func TestInMemoryInfrastructureEventCAS_BitsUT(t *testing.T) {
 	}
 }
 
-func TestInMemoryInfrastructureResolvesSignals_BitsUT(t *testing.T) {
-	infrastructure := NewInMemoryInfrastructure()
+func TestInMemoryInfrastructureClonesAsyncEvent_BitsUT(t *testing.T) {
+	infrastructure := NewInMemoryInfrastructure[struct{}, struct{}]()
+	added, err := infrastructure.AddEvent(context.Background(), &AsyncEvent{
+		BaseEvent: BaseEvent{
+			Key:    "async",
+			Status: FlowStatusCompleted,
+		},
+		Result: json.RawMessage(`"done"`),
+	})
+	if err != nil {
+		t.Fatalf("add async event failed: %v", err)
+	}
+
+	asyncEvent := added.(*AsyncEvent)
+	asyncEvent.Result[1] = 'X'
+	stored, err := infrastructure.GetEvent(context.Background(), "async")
+	if err != nil {
+		t.Fatalf("get async event failed: %v", err)
+	}
+	if result := string(stored.(*AsyncEvent).Result); result != `"done"` {
+		t.Fatalf("stored async event was mutated through returned value: %s", result)
+	}
+}
+
+func TestInMemoryInfrastructureCapturesSignalEvents_BitsUT(t *testing.T) {
+	infrastructure := NewInMemoryInfrastructure[struct{}, struct{}]()
 	ctx := context.Background()
 	added, err := infrastructure.AddEvent(ctx, &WaitForSignalEvent{
 		BaseEvent: BaseEvent{
 			Key:    "approval",
-			Status: FlowStatusRunning,
+			Status: FlowStatusSuspended,
 		},
 		Request: json.RawMessage(`"request"`),
 	})
@@ -105,108 +116,74 @@ func TestInMemoryInfrastructureResolvesSignals_BitsUT(t *testing.T) {
 		t.Fatalf("add wait event failed: %v", err)
 	}
 	wait := added.(*WaitForSignalEvent)
-	signal := NewWaitForSignal(
-		wait.Key,
-		wait.Request,
-		json.RawMessage(`"approved"`),
-		wait.Version,
-	)
-
-	resolved, err := infrastructure.ResolveSignal(ctx, signal)
-	if err != nil {
-		t.Fatalf("resolve signal failed: %v", err)
+	signals := infrastructure.Signals()
+	if len(signals) != 1 {
+		t.Fatalf("expected one captured signal, got %d", len(signals))
 	}
-	if !resolved {
-		t.Fatal("expected signal to resolve")
-	}
-	resolvedAgain, err := infrastructure.ResolveSignal(ctx, signal)
-	if err != nil {
-		t.Fatalf("resolve duplicate signal failed: %v", err)
-	}
-	if resolvedAgain {
-		t.Fatal("expected duplicate signal to be rejected")
+	signal := signals[0].(*WaitForSignalEvent)
+	if signal.Key != wait.Key ||
+		signal.Version != wait.Version ||
+		signal.Status != FlowStatusSuspended ||
+		string(signal.Request) != `"request"` {
+		t.Fatalf("unexpected signal snapshot: %+v", signal)
 	}
 
-	stored, err := infrastructure.GetEvent(ctx, wait.Key)
-	if err != nil {
-		t.Fatalf("get resolved event failed: %v", err)
-	}
-	result := stored.(*WaitForSignalEvent)
-	if result.Status != FlowStatusCompleted ||
-		result.Version != wait.Version+1 ||
-		string(result.Response) != `"approved"` {
-		t.Fatalf("unexpected resolved event: %+v", result)
+	signal.Request[1] = 'X'
+	if got := infrastructure.Signals(); string(got[0].(*WaitForSignalEvent).Request) != `"request"` {
+		t.Fatalf("stored signal was mutated through snapshot: %+v", got[0])
 	}
 
-	signal.(*WaitForSignal).Response[1] = 'X'
-	stored, err = infrastructure.GetEvent(ctx, wait.Key)
+	duplicate, err := infrastructure.AddEvent(ctx, &WaitForSignalEvent{
+		BaseEvent: BaseEvent{Key: "approval", Status: FlowStatusSuspended},
+	})
 	if err != nil {
-		t.Fatalf("get resolved event after signal mutation failed: %v", err)
+		t.Fatalf("add duplicate signal failed: %v", err)
 	}
-	if string(stored.(*WaitForSignalEvent).Response) != `"approved"` {
-		t.Fatalf("stored response was mutated through signal: %s", stored.(*WaitForSignalEvent).Response)
+	if duplicate != nil || len(infrastructure.Signals()) != 1 {
+		t.Fatal("duplicate event must not emit another signal")
+	}
+
+	if _, err := infrastructure.AddEvent(ctx, &CheckpointEvent{
+		BaseEvent: BaseEvent{Key: "checkpoint", Status: FlowStatusCompleted},
+	}); err != nil {
+		t.Fatalf("add checkpoint failed: %v", err)
+	}
+	if len(infrastructure.Signals()) != 1 {
+		t.Fatal("non-signal event must not be captured as a signal")
 	}
 }
 
-func TestInMemoryInfrastructureUsesStoredSleepDeadline_BitsUT(t *testing.T) {
-	infrastructure := NewInMemoryInfrastructure()
+func TestInMemoryInfrastructureCapturesSleepSignal_BitsUT(t *testing.T) {
+	infrastructure := NewInMemoryInfrastructure[struct{}, struct{}]()
 	ctx := context.Background()
 
-	future, err := infrastructure.AddEvent(ctx, &SleepEvent{
+	until := time.Now().Add(time.Hour)
+	added, err := infrastructure.AddEvent(ctx, &SleepSignalEvent{
 		BaseEvent: BaseEvent{
-			Key:    "future-sleep",
-			Status: FlowStatusRunning,
+			Key:    "sleep",
+			Status: FlowStatusSuspended,
 		},
-		Until: time.Now().Add(time.Hour),
+		Until: until,
 	})
 	if err != nil {
-		t.Fatalf("add future sleep event failed: %v", err)
+		t.Fatalf("add sleep signal failed: %v", err)
 	}
-	futureSleep := future.(*SleepEvent)
-	resolved, err := infrastructure.ResolveSignal(
-		ctx,
-		NewSleepSignal(futureSleep.Key, time.Now().Add(-time.Hour), futureSleep.Version),
-	)
-	if err != nil {
-		t.Fatalf("resolve future sleep failed: %v", err)
+	sleep := added.(*SleepSignalEvent)
+	signals := infrastructure.Signals()
+	if len(signals) != 1 {
+		t.Fatalf("expected one sleep signal, got %d", len(signals))
 	}
-	if resolved {
-		t.Fatal("expected persisted future deadline to prevent early resolution")
-	}
-
-	due, err := infrastructure.AddEvent(ctx, &SleepEvent{
-		BaseEvent: BaseEvent{
-			Key:    "due-sleep",
-			Status: FlowStatusRunning,
-		},
-		Until: time.Now().Add(-time.Hour),
-	})
-	if err != nil {
-		t.Fatalf("add due sleep event failed: %v", err)
-	}
-	dueSleep := due.(*SleepEvent)
-	resolved, err = infrastructure.ResolveSignal(
-		ctx,
-		NewSleepSignal(dueSleep.Key, time.Now().Add(time.Hour), dueSleep.Version),
-	)
-	if err != nil {
-		t.Fatalf("resolve sleep failed: %v", err)
-	}
-	if !resolved {
-		t.Fatal("expected due sleep to resolve")
-	}
-	stored, err := infrastructure.GetEvent(ctx, dueSleep.Key)
-	if err != nil {
-		t.Fatalf("get sleep event failed: %v", err)
-	}
-	if stored.GetStatus() != FlowStatusCompleted ||
-		stored.GetVersion() != dueSleep.Version+1 {
-		t.Fatalf("unexpected sleep event: %+v", stored)
+	signal := signals[0].(*SleepSignalEvent)
+	if signal.Key != sleep.Key ||
+		signal.Version != sleep.Version ||
+		signal.Status != FlowStatusSuspended ||
+		!signal.Until.Equal(until) {
+		t.Fatalf("unexpected sleep signal: %+v", signal)
 	}
 }
 
 func TestInMemoryInfrastructureAddsEventAtomically_BitsUT(t *testing.T) {
-	var infrastructure InMemoryInfrastructure
+	var infrastructure InMemoryInfrastructure[struct{}, struct{}]
 	ctx := context.Background()
 	const workers = 32
 	var accepted atomic.Int64
@@ -244,7 +221,7 @@ func TestInMemoryInfrastructureAddsEventAtomically_BitsUT(t *testing.T) {
 }
 
 func TestInMemoryInfrastructureUpdatesEventAtomically_BitsUT(t *testing.T) {
-	infrastructure := NewInMemoryInfrastructure()
+	infrastructure := NewInMemoryInfrastructure[struct{}, struct{}]()
 	ctx := context.Background()
 	added, err := infrastructure.AddEvent(ctx, &CheckpointEvent{
 		BaseEvent: BaseEvent{
@@ -286,10 +263,10 @@ func TestInMemoryInfrastructureUpdatesEventAtomically_BitsUT(t *testing.T) {
 	}
 }
 
-func TestInMemoryInfrastructureSnapshotsStateSignalsAndErrors_BitsUT(t *testing.T) {
-	var infrastructure InMemoryInfrastructure
+func TestInMemoryInfrastructureSnapshotsStateAndErrors_BitsUT(t *testing.T) {
+	var infrastructure InMemoryInfrastructure[json.RawMessage, json.RawMessage]
 	ctx := context.Background()
-	state := State{
+	state := State[json.RawMessage, json.RawMessage]{
 		Input:  json.RawMessage(`{"value":1}`),
 		Output: json.RawMessage(`"done"`),
 		Status: FlowStatusCompleted,
@@ -307,26 +284,6 @@ func TestInMemoryInfrastructureSnapshotsStateSignalsAndErrors_BitsUT(t *testing.
 		t.Fatalf("stored state was mutated through input: %s", stored.Input)
 	}
 
-	signal := NewWaitForSignal(
-		"approval",
-		json.RawMessage(`"request"`),
-		json.RawMessage(`"response"`),
-		1,
-	)
-	if err := infrastructure.RaiseSignal(ctx, signal); err != nil {
-		t.Fatalf("raise signal failed: %v", err)
-	}
-	signal.(*WaitForSignal).Request[1] = 'X'
-	signals := infrastructure.Signals()
-	if len(signals) != 1 ||
-		string(signals[0].(*WaitForSignal).Request) != `"request"` {
-		t.Fatalf("unexpected signal snapshot: %+v", signals)
-	}
-	signals[0].(*WaitForSignal).Response[1] = 'X'
-	if got := infrastructure.Signals(); string(got[0].(*WaitForSignal).Response) != `"response"` {
-		t.Fatalf("stored signal was mutated through snapshot: %+v", got[0])
-	}
-
 	infrastructure.OnError(context.Canceled)
 	infrastructure.OnError(nil)
 	errs := infrastructure.Errors()
@@ -336,7 +293,7 @@ func TestInMemoryInfrastructureSnapshotsStateSignalsAndErrors_BitsUT(t *testing.
 }
 
 func TestInMemoryInfrastructureRejectsCanceledContextAndUnsupportedTypes_BitsUT(t *testing.T) {
-	infrastructure := NewInMemoryInfrastructure()
+	infrastructure := NewInMemoryInfrastructure[struct{}, struct{}]()
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
@@ -349,27 +306,15 @@ func TestInMemoryInfrastructureRejectsCanceledContextAndUnsupportedTypes_BitsUT(
 	if _, err := infrastructure.UpdateEvent(ctx, &CheckpointEvent{}); !errors.Is(err, context.Canceled) {
 		t.Fatalf("expected canceled update, got %v", err)
 	}
-	if err := infrastructure.RaiseSignal(ctx, NewSleepSignal("sleep", time.Now(), 1)); !errors.Is(err, context.Canceled) {
-		t.Fatalf("expected canceled raise, got %v", err)
-	}
-	if _, err := infrastructure.ResolveSignal(ctx, NewSleepSignal("sleep", time.Now(), 1)); !errors.Is(err, context.Canceled) {
-		t.Fatalf("expected canceled resolve, got %v", err)
-	}
 	if _, err := infrastructure.GetState(ctx); !errors.Is(err, context.Canceled) {
 		t.Fatalf("expected canceled get state, got %v", err)
 	}
-	if err := infrastructure.SetState(ctx, State{}); !errors.Is(err, context.Canceled) {
+	if err := infrastructure.SetState(ctx, State[struct{}, struct{}]{}); !errors.Is(err, context.Canceled) {
 		t.Fatalf("expected canceled set state, got %v", err)
 	}
 
 	background := context.Background()
 	if _, err := infrastructure.AddEvent(background, &unsupportedEvent{}); err == nil {
 		t.Fatal("expected unsupported event add to fail")
-	}
-	if err := infrastructure.RaiseSignal(background, &unsupportedSignal{}); err == nil {
-		t.Fatal("expected unsupported signal raise to fail")
-	}
-	if resolved, err := infrastructure.ResolveSignal(background, &unsupportedSignal{}); err != nil || resolved {
-		t.Fatalf("expected unsupported signal resolution to be ignored, got resolved=%v err=%v", resolved, err)
 	}
 }

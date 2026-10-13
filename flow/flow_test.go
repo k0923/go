@@ -9,6 +9,22 @@ import (
 	"time"
 )
 
+type blockingGetEventInfrastructure struct {
+	*InMemoryInfrastructure[struct{}, string]
+	started chan struct{}
+	release chan struct{}
+}
+
+func (infrastructure *blockingGetEventInfrastructure) GetEvent(ctx context.Context, key string) (Event, error) {
+	close(infrastructure.started)
+	select {
+	case <-infrastructure.release:
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+	return infrastructure.InMemoryInfrastructure.GetEvent(ctx, key)
+}
+
 func TestFlowStatusSuspendedValue_BitsUT(t *testing.T) {
 	if FlowStatusSuspended != "SUSPENDED" {
 		t.Fatalf("expected SUSPENDED status value, got %q", FlowStatusSuspended)
@@ -16,11 +32,11 @@ func TestFlowStatusSuspendedValue_BitsUT(t *testing.T) {
 }
 
 func TestFlowRunsStepAndReusesCompletedState_BitsUT(t *testing.T) {
-	infrastructure := NewInMemoryInfrastructure()
+	infrastructure := NewInMemoryInfrastructure[string, string]()
 	var handlerCalls atomic.Int64
 	var stepCalls atomic.Int64
 	target := Flow[string, string]{
-		Handler: func(runtime *runtime[string]) string {
+		Handler: func(runtime *Runtime[string, string]) string {
 			handlerCalls.Add(1)
 			return runtime.Step(
 				runtime.Context,
@@ -40,7 +56,7 @@ func TestFlowRunsStepAndReusesCompletedState_BitsUT(t *testing.T) {
 	if err != nil {
 		t.Fatalf("get state failed: %v", err)
 	}
-	if state.Status != FlowStatusCompleted || string(state.Output) != `"echo-output"` {
+	if state.Status != FlowStatusCompleted || state.Output != "echo-output" {
 		t.Fatalf("unexpected final state: %+v", state)
 	}
 	if handlerCalls.Load() != 1 || stepCalls.Load() != 1 {
@@ -60,10 +76,10 @@ func TestFlowRunsStepAndReusesCompletedState_BitsUT(t *testing.T) {
 }
 
 func TestFlowResumesWaitForAndReusesCompletedStep_BitsUT(t *testing.T) {
-	infrastructure := NewInMemoryInfrastructure()
+	infrastructure := NewInMemoryInfrastructure[struct{}, string]()
 	var stepCalls atomic.Int64
 	target := Flow[struct{}, string]{
-		Handler: func(runtime *runtime[struct{}]) string {
+		Handler: func(runtime *Runtime[struct{}, string]) string {
 			prepared := runtime.Step(
 				runtime.Context,
 				"prepare",
@@ -93,7 +109,7 @@ func TestFlowResumesWaitForAndReusesCompletedStep_BitsUT(t *testing.T) {
 	if len(signals) != 1 {
 		t.Fatalf("expected one signal, got %d", len(signals))
 	}
-	awaited := signals[0].(*WaitForSignal)
+	awaited := signals[0].(*WaitForSignalEvent)
 	callback := *awaited
 	callback.Response = json.RawMessage(`"approved"`)
 
@@ -104,7 +120,7 @@ func TestFlowResumesWaitForAndReusesCompletedStep_BitsUT(t *testing.T) {
 		t.Fatalf("get resumed state failed: %v", err)
 	}
 	if state.Status != FlowStatusCompleted ||
-		string(state.Output) != `"prepared:approved"` {
+		state.Output != "prepared:approved" {
 		t.Fatalf("unexpected resumed state: %+v", state)
 	}
 	if stepCalls.Load() != 1 {
@@ -113,10 +129,10 @@ func TestFlowResumesWaitForAndReusesCompletedStep_BitsUT(t *testing.T) {
 }
 
 func TestFlowResumesSleepAfterDeadline_BitsUT(t *testing.T) {
-	infrastructure := NewInMemoryInfrastructure()
+	infrastructure := NewInMemoryInfrastructure[struct{}, string]()
 	var handlerCalls atomic.Int64
 	target := Flow[struct{}, string]{
-		Handler: func(runtime *runtime[struct{}]) string {
+		Handler: func(runtime *Runtime[struct{}, string]) string {
 			handlerCalls.Add(1)
 			runtime.Sleep(runtime.Context, "short-sleep", 15*time.Millisecond)
 			return "completed"
@@ -128,7 +144,7 @@ func TestFlowResumesSleepAfterDeadline_BitsUT(t *testing.T) {
 	if len(signals) != 1 {
 		t.Fatalf("expected one sleep signal, got %d", len(signals))
 	}
-	sleep := signals[0].(*SleepSignal)
+	sleep := signals[0].(*SleepSignalEvent)
 	time.Sleep(time.Until(sleep.Until) + 5*time.Millisecond)
 	target.ResumeRun(context.Background(), infrastructure, sleep)
 
@@ -136,7 +152,7 @@ func TestFlowResumesSleepAfterDeadline_BitsUT(t *testing.T) {
 	if err != nil {
 		t.Fatalf("get resumed state failed: %v", err)
 	}
-	if state.Status != FlowStatusCompleted || string(state.Output) != `"completed"` {
+	if state.Status != FlowStatusCompleted || state.Output != "completed" {
 		t.Fatalf("unexpected sleep state: %+v", state)
 	}
 	if handlerCalls.Load() != 2 {
@@ -145,11 +161,11 @@ func TestFlowResumesSleepAfterDeadline_BitsUT(t *testing.T) {
 }
 
 func TestFlowWaitsForAsyncResult_BitsUT(t *testing.T) {
-	infrastructure := NewInMemoryInfrastructure()
+	infrastructure := NewInMemoryInfrastructure[struct{}, string]()
 	var asyncCalls atomic.Int64
 	target := Flow[struct{}, string]{
-		Handler: func(flowRuntime *runtime[struct{}]) string {
-			result := flowRuntime.Go("async", func(*runtime[struct{}]) string {
+		Handler: func(flowRuntime *Runtime[struct{}, string]) string {
+			result := flowRuntime.Go("async", func(*Runtime[struct{}, string]) string {
 				asyncCalls.Add(1)
 				return "async-output"
 			})
@@ -163,7 +179,7 @@ func TestFlowWaitsForAsyncResult_BitsUT(t *testing.T) {
 	if err != nil {
 		t.Fatalf("get state failed: %v", err)
 	}
-	if state.Status != FlowStatusCompleted || string(state.Output) != `"async-output"` {
+	if state.Status != FlowStatusCompleted || state.Output != "async-output" {
 		t.Fatalf("unexpected async state: %+v", state)
 	}
 	if asyncCalls.Load() != 1 {
@@ -171,18 +187,134 @@ func TestFlowWaitsForAsyncResult_BitsUT(t *testing.T) {
 	}
 	event, err := infrastructure.GetEvent(context.Background(), "async")
 	if err != nil {
-		t.Fatalf("get checkpoint event failed: %v", err)
+		t.Fatalf("get async event failed: %v", err)
 	}
 	if event.GetStatus() != FlowStatusCompleted || event.GetVersion() != 2 {
-		t.Fatalf("unexpected checkpoint event: %+v", event)
+		t.Fatalf("unexpected async event: %+v", event)
+	}
+	if _, ok := event.(*AsyncEvent); !ok || event.GetEventType() != "ASYNC" {
+		t.Fatalf("expected ASYNC event, got %T (%s)", event, event.GetEventType())
+	}
+}
+
+func TestFlowResumesSignalInsideAsyncResult_BitsUT(t *testing.T) {
+	infrastructure := NewInMemoryInfrastructure[struct{}, string]()
+	var asyncCalls atomic.Int64
+	target := Flow[struct{}, string]{
+		Handler: func(runtime *Runtime[struct{}, string]) string {
+			return runtime.Go("async", func(runtime *Runtime[struct{}, string]) string {
+				asyncCalls.Add(1)
+				response := runtime.WaitFor[string, string](
+					runtime.Context,
+					"approval",
+					WaitForOption[string]{Request: "review"},
+				)
+				return "async-" + response
+			}).Wait()
+		},
+	}
+
+	ctx := context.Background()
+	target.StartRun(ctx, struct{}{}, infrastructure)
+
+	event, err := infrastructure.GetEvent(ctx, "async")
+	if err != nil {
+		t.Fatalf("get suspended async event failed: %v", err)
+	}
+	if event.GetStatus() != FlowStatusSuspended || event.GetVersion() != 2 {
+		t.Fatalf("unexpected suspended async event: %+v", event)
+	}
+
+	signals := infrastructure.Signals()
+	if len(signals) != 1 {
+		t.Fatalf("expected one approval signal, got %d", len(signals))
+	}
+	callback := *(signals[0].(*WaitForSignalEvent))
+	callback.Response = json.RawMessage(`"approved"`)
+	target.ResumeRun(ctx, infrastructure, &callback)
+
+	state, err := infrastructure.GetState(ctx)
+	if err != nil {
+		t.Fatalf("get resumed state failed: %v", err)
+	}
+	if state.Status != FlowStatusCompleted || state.Output != "async-approved" {
+		t.Fatalf("unexpected resumed state: %+v", state)
+	}
+	event, err = infrastructure.GetEvent(ctx, "async")
+	if err != nil {
+		t.Fatalf("get completed async event failed: %v", err)
+	}
+	if event.GetStatus() != FlowStatusCompleted || event.GetVersion() != 4 {
+		t.Fatalf("unexpected completed async event: %+v", event)
+	}
+	if asyncCalls.Load() != 2 {
+		t.Fatalf("expected async handler to be replayed once, got %d calls", asyncCalls.Load())
+	}
+}
+
+func TestRuntimeGoLoadsCompletedAsyncEventAsynchronously_BitsUT(t *testing.T) {
+	storage := NewInMemoryInfrastructure[struct{}, string]()
+	_, err := storage.AddEvent(context.Background(), &AsyncEvent{
+		BaseEvent: BaseEvent{
+			Key:    "async",
+			Status: FlowStatusCompleted,
+		},
+		Result: json.RawMessage(`"cached-output"`),
+	})
+	if err != nil {
+		t.Fatalf("add async event failed: %v", err)
+	}
+
+	infrastructure := &blockingGetEventInfrastructure{
+		InMemoryInfrastructure: storage,
+		started:                make(chan struct{}),
+		release:                make(chan struct{}),
+	}
+	defer func() {
+		select {
+		case <-infrastructure.release:
+		default:
+			close(infrastructure.release)
+		}
+	}()
+
+	runtime := newRuntime(context.Background(), infrastructure, struct{}{})
+	returned := make(chan IResult[string], 1)
+	var handlerCalls atomic.Int64
+	go func() {
+		returned <- runtime.Go("async", func(*Runtime[struct{}, string]) string {
+			handlerCalls.Add(1)
+			return "new-output"
+		})
+	}()
+
+	select {
+	case <-infrastructure.started:
+	case <-time.After(time.Second):
+		t.Fatal("async event lookup did not start")
+	}
+
+	var result IResult[string]
+	select {
+	case result = <-returned:
+	case <-time.After(time.Second):
+		t.Fatal("Go blocked while loading checkpoint")
+	}
+
+	close(infrastructure.release)
+	if value := result.Wait(); value != "cached-output" {
+		t.Fatalf("unexpected async output: %q", value)
+	}
+	if handlerCalls.Load() != 0 {
+		t.Fatalf("expected cached async event to skip handler, got %d calls", handlerCalls.Load())
 	}
 }
 
 func TestFlowFailsWhenStepReturnsError_BitsUT(t *testing.T) {
 	stepErr := errors.New("step failed")
-	infrastructure := NewInMemoryInfrastructure()
+	infrastructure := NewInMemoryInfrastructure[struct{}, struct{}]()
 	target := Flow[struct{}, struct{}]{
-		Handler: func(runtime *runtime[struct{}]) struct{} {
+		Handler: func(runtime *Runtime[struct{}, struct{}]) struct{} {
 			return runtime.Step(
 				runtime.Context,
 				"failing-step",
@@ -201,7 +333,7 @@ func TestFlowFailsWhenStepReturnsError_BitsUT(t *testing.T) {
 	}
 	if state.Status != FlowStatusFailed ||
 		len(state.Errors) != 1 ||
-		state.Errors[0] != "step failing-step failed" {
+		state.Errors[0] != "biz error: failing-step" {
 		t.Fatalf("unexpected failed state: %+v", state)
 	}
 	event, err := infrastructure.GetEvent(context.Background(), "failing-step")
@@ -214,9 +346,9 @@ func TestFlowFailsWhenStepReturnsError_BitsUT(t *testing.T) {
 }
 
 func TestFlowFailsWhenHandlerPanicsWithNonError_BitsUT(t *testing.T) {
-	infrastructure := NewInMemoryInfrastructure()
+	infrastructure := NewInMemoryInfrastructure[struct{}, string]()
 	target := Flow[struct{}, string]{
-		Handler: func(*runtime[struct{}]) string {
+		Handler: func(*Runtime[struct{}, string]) string {
 			panic("boom")
 		},
 	}
@@ -229,13 +361,13 @@ func TestFlowFailsWhenHandlerPanicsWithNonError_BitsUT(t *testing.T) {
 	}
 	if state.Status != FlowStatusFailed ||
 		len(state.Errors) != 1 ||
-		state.Errors[0] != "flow panic: boom" {
+		state.Errors[0] != "unknown error: boom" {
 		t.Fatalf("unexpected panic state: %+v", state)
 	}
 }
 
 func TestFlowExecutesNestedParallelWorkflowAcrossHumanResumes_BitsUT(t *testing.T) {
-	infrastructure := NewInMemoryInfrastructure()
+	infrastructure := NewInMemoryInfrastructure[struct{}, string]()
 	var handlerCalls atomic.Int64
 	var initialAutoCalls atomic.Int64
 	var postFirstJoinCalls atomic.Int64
@@ -245,12 +377,12 @@ func TestFlowExecutesNestedParallelWorkflowAcrossHumanResumes_BitsUT(t *testing.
 	var nestedRightCalls atomic.Int64
 
 	target := Flow[struct{}, string]{
-		Handler: func(flowRuntime *runtime[struct{}]) string {
+		Handler: func(flowRuntime *Runtime[struct{}, string]) string {
 			handlerCalls.Add(1)
 
 			initialAuto := flowRuntime.Go(
 				"initial-auto-branch",
-				func(branchRuntime *runtime[struct{}]) string {
+				func(branchRuntime *Runtime[struct{}, string]) string {
 					return branchRuntime.Step(
 						branchRuntime.Context,
 						"initial-auto-task",
@@ -278,7 +410,7 @@ func TestFlowExecutesNestedParallelWorkflowAcrossHumanResumes_BitsUT(t *testing.
 
 			lowerPath := flowRuntime.Go(
 				"lower-branch",
-				func(branchRuntime *runtime[struct{}]) string {
+				func(branchRuntime *Runtime[struct{}, string]) string {
 					lowerEntry := branchRuntime.Step(
 						branchRuntime.Context,
 						"lower-entry-task",
@@ -289,7 +421,7 @@ func TestFlowExecutesNestedParallelWorkflowAcrossHumanResumes_BitsUT(t *testing.
 					)
 					nestedLeft := branchRuntime.Go(
 						"nested-left-branch",
-						func(nestedRuntime *runtime[struct{}]) string {
+						func(nestedRuntime *Runtime[struct{}, string]) string {
 							return nestedRuntime.Step(
 								nestedRuntime.Context,
 								"nested-left-task",
@@ -302,7 +434,7 @@ func TestFlowExecutesNestedParallelWorkflowAcrossHumanResumes_BitsUT(t *testing.
 					)
 					nestedRight := branchRuntime.Go(
 						"nested-right-branch",
-						func(nestedRuntime *runtime[struct{}]) string {
+						func(nestedRuntime *Runtime[struct{}, string]) string {
 							return nestedRuntime.Step(
 								nestedRuntime.Context,
 								"nested-right-task",
@@ -349,7 +481,7 @@ func TestFlowExecutesNestedParallelWorkflowAcrossHumanResumes_BitsUT(t *testing.
 	if len(signals) != 1 {
 		t.Fatalf("expected first human signal only, got %d signals", len(signals))
 	}
-	firstReview := signals[0].(*WaitForSignal)
+	firstReview := signals[0].(*WaitForSignalEvent)
 	if firstReview.Key != "first-review" || string(firstReview.Request) != `"initial-auto"` {
 		t.Fatalf("unexpected first human signal: %+v", firstReview)
 	}
@@ -377,7 +509,7 @@ func TestFlowExecutesNestedParallelWorkflowAcrossHumanResumes_BitsUT(t *testing.
 	if len(signals) != 2 {
 		t.Fatalf("expected two human signals, got %d", len(signals))
 	}
-	secondReview := signals[1].(*WaitForSignal)
+	secondReview := signals[1].(*WaitForSignalEvent)
 	expectedSecondRequest := `"review-one-approved-joined-upper|lower-entry+nested-left+nested-right"`
 	if secondReview.Key != "second-review" ||
 		string(secondReview.Request) != expectedSecondRequest {
@@ -392,8 +524,8 @@ func TestFlowExecutesNestedParallelWorkflowAcrossHumanResumes_BitsUT(t *testing.
 	if err != nil {
 		t.Fatalf("get completed state failed: %v", err)
 	}
-	expectedOutput := `"review-one-approved-joined|review-one-approved-joined-upper|lower-entry+nested-left+nested-right|review-two-approved"`
-	if state.Status != FlowStatusCompleted || string(state.Output) != expectedOutput {
+	expectedOutput := "review-one-approved-joined|review-one-approved-joined-upper|lower-entry+nested-left+nested-right|review-two-approved"
+	if state.Status != FlowStatusCompleted || state.Output != expectedOutput {
 		t.Fatalf("unexpected completed state: %+v", state)
 	}
 	if handlerCalls.Load() != 3 ||
