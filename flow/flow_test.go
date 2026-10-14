@@ -599,6 +599,72 @@ func TestFlowFailsWhenStepReturnsError_BitsUT(t *testing.T) {
 	}
 }
 
+func TestFlowPublicAPIsObserveCanceledContext_BitsUT(t *testing.T) {
+	t.Run("start run", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		infrastructure := NewInMemoryInfrastructure[struct{}, struct{}]()
+		target := Flow[struct{}, struct{}]{
+			Handler: func(*WorkflowContext[struct{}, struct{}]) struct{} {
+				t.Fatal("handler must not run with canceled context")
+				return struct{}{}
+			},
+		}
+
+		target.StartRun(ctx, struct{}{}, infrastructure)
+
+		errs := infrastructure.Errors()
+		if len(errs) != 1 {
+			t.Fatalf("expected one context error, got %v", errs)
+		}
+		var contextErr *ContextError
+		if !errors.As(errs[0], &contextErr) || !errors.Is(errs[0], context.Canceled) {
+			t.Fatalf("expected canceled context error, got %T %v", errs[0], errs[0])
+		}
+	})
+
+	t.Run("workflow api", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		infrastructure := NewInMemoryInfrastructure[struct{}, string]()
+		workflowContext := newWorkflowContext(ctx, infrastructure, struct{}{})
+		var stepCalls atomic.Int64
+
+		expectContextCanceledPanic(t, func() {
+			workflowContext.Step(
+				"blocked",
+				func(StepContext[struct{}, string]) (string, error) {
+					stepCalls.Add(1)
+					return "unexpected", nil
+				},
+			)
+		})
+
+		if stepCalls.Load() != 0 {
+			t.Fatalf("step handler ran despite canceled context")
+		}
+	})
+}
+
+func expectContextCanceledPanic(t *testing.T, run func()) {
+	t.Helper()
+	defer func() {
+		recovered := recover()
+		if recovered == nil {
+			t.Fatal("expected context error panic")
+		}
+		err, ok := recovered.(error)
+		if !ok {
+			t.Fatalf("expected error panic, got %T", recovered)
+		}
+		var contextErr *ContextError
+		if !errors.As(err, &contextErr) || !errors.Is(err, context.Canceled) {
+			t.Fatalf("expected canceled context error, got %T %v", err, err)
+		}
+	}()
+	run()
+}
+
 func TestFlowFailsWhenHandlerPanicsWithNonError_BitsUT(t *testing.T) {
 	infrastructure := NewInMemoryInfrastructure[struct{}, string]()
 	target := Flow[struct{}, string]{

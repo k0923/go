@@ -18,6 +18,39 @@ func (err *ConflictError) Error() string {
 	return fmt.Sprintf("conflict: %s", err.Event.GetKey())
 }
 
+func NewContextError(event Event, err error) *ContextError {
+	return &ContextError{
+		Event: event,
+		Cause: err,
+	}
+}
+
+type ContextError struct {
+	Event Event
+	Cause error
+}
+
+func (err *ContextError) Error() string {
+	if err == nil {
+		return ""
+	}
+	message := "context error"
+	if err.Event != nil {
+		message = fmt.Sprintf("%s: %s", message, err.Event.GetKey())
+	}
+	if err.Cause != nil {
+		return fmt.Sprintf("%s: %s", message, err.Cause.Error())
+	}
+	return message
+}
+
+func (err *ContextError) Unwrap() error {
+	if err == nil {
+		return nil
+	}
+	return err.Cause
+}
+
 type BizError struct {
 	Event Event
 	Cause error

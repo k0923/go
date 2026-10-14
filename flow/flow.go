@@ -10,6 +10,11 @@ type Flow[Input any, Output any] struct {
 }
 
 func (flow *Flow[Input, Output]) StartRun(ctx context.Context, input Input, infrastructure Infrastructure[Input, Output]) {
+	if err := contextErr(ctx); err != nil {
+		infrastructure.OnError(NewContextError(nil, err))
+		return
+	}
+
 	state, err := infrastructure.GetState(ctx)
 	if err != nil {
 		infrastructure.OnError(err)
@@ -40,6 +45,11 @@ func (flow *Flow[Input, Output]) StartRun(ctx context.Context, input Input, infr
 }
 
 func (flow *Flow[Input, Output]) ResumeRun(ctx context.Context, infrastructure Infrastructure[Input, Output], signal Signal) {
+	if err := contextErr(ctx); err != nil {
+		infrastructure.OnError(NewContextError(nil, err))
+		return
+	}
+
 	state, err := infrastructure.GetState(ctx)
 	if err != nil {
 		infrastructure.OnError(err)
@@ -48,6 +58,6 @@ func (flow *Flow[Input, Output]) ResumeRun(ctx context.Context, infrastructure I
 	if state.Status != FlowStatusRunning {
 		return
 	}
-	workflowContext := newWorkflowContext[Input, Output](ctx, infrastructure, state.Input)
+	workflowContext := newWorkflowContext(ctx, infrastructure, state.Input)
 	workflowContext.run(flow.Handler, signal)
 }

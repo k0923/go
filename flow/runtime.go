@@ -36,22 +36,27 @@ func (ctx StepContext[Input, Output]) WaitFor[Request any, Response any](
 	key string,
 	option WaitForOption[Request],
 ) Response {
+	ensureContext(ctx.Context, nil)
 	return ctx.waitFor[Request, Response](key, option)
 }
 
 func (ctx StepContext[Input, Output]) Sleep(key string, duration time.Duration) {
+	ensureContext(ctx.Context, nil)
 	ctx.sleep(key, duration)
 }
 
 func (ctx StepContext[Input, Output]) SleepUntil(key string, until time.Time) {
+	ensureContext(ctx.Context, nil)
 	ctx.sleepUntil(key, until)
 }
 
 func (ctx StepContext[Input, Output]) Now(key string) time.Time {
+	ensureContext(ctx.Context, nil)
 	return ctx.now(key)
 }
 
 func (ctx StepContext[Input, Output]) UUID(key string) string {
+	ensureContext(ctx.Context, nil)
 	return ctx.uuid(key)
 }
 
@@ -63,6 +68,7 @@ func (ctx *GoContext[Input, Output]) Step[T any](
 	key string,
 	handler func(ctx StepContext[Input, Output]) (T, error),
 ) T {
+	ensureContext(ctx.Context, nil)
 	return ctx.step(key, handler)
 }
 
@@ -74,6 +80,7 @@ func (ctx *WorkflowContext[Input, Output]) Go[T any](
 	key string,
 	handler func(ctx *GoContext[Input, Output]) T,
 ) IResult[T] {
+	ensureContext(ctx.Context, nil)
 	return ctx.goResult(key, handler)
 }
 
@@ -127,6 +134,27 @@ type comparableResultEvent interface {
 	comparable
 }
 
+func contextErr(ctx context.Context) error {
+	if ctx == nil {
+		return nil
+	}
+	return ctx.Err()
+}
+
+func ensureContext(ctx context.Context, event Event) {
+	if err := contextErr(ctx); err != nil {
+		panic(NewContextError(event, err))
+	}
+}
+
+func bindContextError(event Event, err error) error {
+	var contextErr *ContextError
+	if errors.As(err, &contextErr) && contextErr.Event == nil {
+		return NewContextError(event, contextErr.Cause)
+	}
+	return err
+}
+
 func (ctx *WorkflowContext[Input, Output]) setState(output Output, status FlowStatus, errors []string) {
 	if err := ctx.infrastructure.SetState(ctx.Context, State[Input, Output]{
 		Input:  ctx.input,
@@ -178,6 +206,7 @@ func (ctx *WorkflowContext[Input, Output]) run(handler func(ctx *WorkflowContext
 	}
 
 	result := run(func() Output {
+		ensureContext(ctx.Context, nil)
 		return handler(ctx)
 	})
 
@@ -381,6 +410,7 @@ func (ctx StepContext[Input, Output]) executeLeasedResultEvent[T any, E comparab
 
 	handleOutput := func(output *fixedResult[T], wrapError func(Event, error) error) T {
 		if output.err != nil {
+			output.err = bindContextError(event, output.err)
 			event.SetError(output.err)
 			event = ctx.updateEvent(event)
 			if wrapError != nil {
@@ -395,6 +425,7 @@ func (ctx StepContext[Input, Output]) executeLeasedResultEvent[T any, E comparab
 	}
 
 	result := handleOutput(run(func() T {
+		ensureContext(ctx.Context, event)
 		result, err := handler(ctx)
 		if err != nil {
 			panic(err)
@@ -427,6 +458,10 @@ func (ctx StepContext[Input, Output]) step[T any](
 			return handler(stepContext)
 		},
 		func(event Event, err error) error {
+			var contextErr *ContextError
+			if errors.As(err, &contextErr) {
+				return err
+			}
 			return NewBizError(event, err)
 		},
 	)
