@@ -16,6 +16,54 @@ type blockingGetEventInfrastructure struct {
 	release chan struct{}
 }
 
+type trackingLeaseInfrastructure struct {
+	*InMemoryInfrastructure[struct{}, string]
+	claims          atomic.Int64
+	renewals        atomic.Int64
+	releases        atomic.Int64
+	leaseDuration   time.Duration
+	renewError      error
+	renewalConflict bool
+}
+
+func (infrastructure *trackingLeaseInfrastructure) ClaimLease(
+	ctx context.Context,
+	key string,
+	ttl time.Duration,
+) (*ExecutionLease, error) {
+	infrastructure.claims.Add(1)
+	lease, err := infrastructure.InMemoryInfrastructure.ClaimLease(ctx, key, ttl)
+	if lease != nil && infrastructure.leaseDuration > 0 {
+		lease.ExpiresAt = time.Now().Add(infrastructure.leaseDuration)
+	}
+	return lease, err
+}
+
+func (infrastructure *trackingLeaseInfrastructure) RenewLease(
+	ctx context.Context,
+	lease ExecutionLease,
+	ttl time.Duration,
+) (*ExecutionLease, error) {
+	infrastructure.renewals.Add(1)
+	if infrastructure.renewError != nil {
+		return nil, infrastructure.renewError
+	}
+	if infrastructure.renewalConflict {
+		_, _ = infrastructure.InMemoryInfrastructure.ReleaseLease(ctx, lease)
+		_, _ = infrastructure.InMemoryInfrastructure.ClaimLease(ctx, lease.Key, ttl)
+		return nil, nil
+	}
+	return infrastructure.InMemoryInfrastructure.RenewLease(ctx, lease, ttl)
+}
+
+func (infrastructure *trackingLeaseInfrastructure) ReleaseLease(
+	ctx context.Context,
+	lease ExecutionLease,
+) (bool, error) {
+	infrastructure.releases.Add(1)
+	return infrastructure.InMemoryInfrastructure.ReleaseLease(ctx, lease)
+}
+
 func (infrastructure *blockingGetEventInfrastructure) GetEvent(ctx context.Context, key string) (Event, error) {
 	close(infrastructure.started)
 	select {
@@ -24,6 +72,158 @@ func (infrastructure *blockingGetEventInfrastructure) GetEvent(ctx context.Conte
 		return nil, ctx.Err()
 	}
 	return infrastructure.InMemoryInfrastructure.GetEvent(ctx, key)
+}
+
+func TestRuntimeLeaseLifecycle(t *testing.T) {
+	t.Run("nested step reuses go lease", func(t *testing.T) {
+		infrastructure := &trackingLeaseInfrastructure{
+			InMemoryInfrastructure: NewInMemoryInfrastructure[struct{}, string](),
+		}
+		var inherited atomic.Bool
+		target := Flow[struct{}, string]{
+			Handler: func(ctx *WorkflowContext[struct{}, string]) string {
+				return ctx.Go("branch", func(goContext *GoContext[struct{}, string]) string {
+					return goContext.Step(
+						"step",
+						func(stepContext StepContext[struct{}, string]) (string, error) {
+							inherited.Store(stepContext.lease == goContext.lease)
+							return "done", nil
+						},
+					)
+				}).Wait()
+			},
+		}
+
+		target.StartRun(context.Background(), struct{}{}, infrastructure)
+
+		if !inherited.Load() {
+			t.Fatal("step did not inherit go lease")
+		}
+		if infrastructure.claims.Load() != 1 || infrastructure.releases.Load() != 1 {
+			t.Fatalf(
+				"expected one claim and release, got claims=%d releases=%d",
+				infrastructure.claims.Load(),
+				infrastructure.releases.Load(),
+			)
+		}
+	})
+
+	tests := []struct {
+		name    string
+		handler func(StepContext[struct{}, string]) (string, error)
+	}{
+		{
+			name: "error",
+			handler: func(StepContext[struct{}, string]) (string, error) {
+				return "", errors.New("failed")
+			},
+		},
+		{
+			name: "signal",
+			handler: func(ctx StepContext[struct{}, string]) (string, error) {
+				return ctx.WaitFor[string, string](
+					"approval",
+					WaitForOption[string]{Request: "review"},
+				), nil
+			},
+		},
+		{
+			name: "unknown panic",
+			handler: func(StepContext[struct{}, string]) (string, error) {
+				panic("failed")
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name+" releases lease", func(t *testing.T) {
+			infrastructure := &trackingLeaseInfrastructure{
+				InMemoryInfrastructure: NewInMemoryInfrastructure[struct{}, string](),
+			}
+			target := Flow[struct{}, string]{
+				Handler: func(ctx *WorkflowContext[struct{}, string]) string {
+					return ctx.Step("step", test.handler)
+				},
+			}
+
+			target.StartRun(context.Background(), struct{}{}, infrastructure)
+
+			if infrastructure.claims.Load() != 1 || infrastructure.releases.Load() != 1 {
+				t.Fatalf(
+					"expected one claim and release, got claims=%d releases=%d",
+					infrastructure.claims.Load(),
+					infrastructure.releases.Load(),
+				)
+			}
+		})
+	}
+}
+
+func TestRuntimeCancelsAndReleasesAfterLeaseRenewalFailure(t *testing.T) {
+	tests := []struct {
+		name            string
+		renewError      error
+		renewalConflict bool
+		expectedStatus  FlowStatus
+		expectedErrors  int
+	}{
+		{
+			name:           "infrastructure error",
+			renewError:     errors.New("renew failed"),
+			expectedStatus: FlowStatusRunning,
+			expectedErrors: 1,
+		},
+		{
+			name:            "generation conflict",
+			renewalConflict: true,
+			expectedStatus:  FlowStatusRunning,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			infrastructure := &trackingLeaseInfrastructure{
+				InMemoryInfrastructure: NewInMemoryInfrastructure[struct{}, string](),
+				leaseDuration:          15 * time.Millisecond,
+				renewError:             test.renewError,
+				renewalConflict:        test.renewalConflict,
+			}
+			target := Flow[struct{}, string]{
+				Handler: func(ctx *WorkflowContext[struct{}, string]) string {
+					return ctx.Step(
+						"step",
+						func(stepContext StepContext[struct{}, string]) (string, error) {
+							<-stepContext.Done()
+							return "", stepContext.Err()
+						},
+					)
+				},
+			}
+
+			target.StartRun(context.Background(), struct{}{}, infrastructure)
+
+			if infrastructure.renewals.Load() != 1 {
+				t.Fatalf("expected one renewal, got %d", infrastructure.renewals.Load())
+			}
+			if infrastructure.releases.Load() != 1 {
+				t.Fatalf("expected one release, got %d", infrastructure.releases.Load())
+			}
+			state, err := infrastructure.GetState(context.Background())
+			if err != nil {
+				t.Fatalf("get state failed: %v", err)
+			}
+			if state.Status != test.expectedStatus {
+				t.Fatalf("expected %s state, got %+v", test.expectedStatus, state)
+			}
+			if len(infrastructure.Errors()) != test.expectedErrors {
+				t.Fatalf(
+					"expected %d infrastructure errors, got %v",
+					test.expectedErrors,
+					infrastructure.Errors(),
+				)
+			}
+		})
+	}
 }
 
 func TestFlowStatusSuspendedValue_BitsUT(t *testing.T) {

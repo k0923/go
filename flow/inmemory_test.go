@@ -318,3 +318,55 @@ func TestInMemoryInfrastructureRejectsCanceledContextAndUnsupportedTypes_BitsUT(
 		t.Fatal("expected unsupported event add to fail")
 	}
 }
+
+func TestInMemoryInfrastructureLeaseLifecycle(t *testing.T) {
+	infrastructure := NewInMemoryInfrastructure[struct{}, struct{}]()
+	ctx := context.Background()
+
+	lease, err := infrastructure.ClaimLease(ctx, "branch", time.Hour)
+	if err != nil {
+		t.Fatalf("claim lease failed: %v", err)
+	}
+	if lease == nil || lease.Generation != 1 {
+		t.Fatalf("unexpected claimed lease: %+v", lease)
+	}
+
+	conflict, err := infrastructure.ClaimLease(ctx, "branch", time.Hour)
+	if err != nil || conflict != nil {
+		t.Fatalf("expected claim conflict, got lease=%+v err=%v", conflict, err)
+	}
+
+	stale := *lease
+	stale.Generation++
+	renewed, err := infrastructure.RenewLease(ctx, stale, time.Hour)
+	if err != nil || renewed != nil {
+		t.Fatalf("expected renew conflict, got lease=%+v err=%v", renewed, err)
+	}
+
+	renewed, err = infrastructure.RenewLease(ctx, *lease, 2*time.Hour)
+	if err != nil {
+		t.Fatalf("renew lease failed: %v", err)
+	}
+	if renewed == nil ||
+		renewed.Generation != lease.Generation ||
+		!renewed.ExpiresAt.After(lease.ExpiresAt) {
+		t.Fatalf("unexpected renewed lease: %+v", renewed)
+	}
+
+	released, err := infrastructure.ReleaseLease(ctx, stale)
+	if err != nil || released {
+		t.Fatalf("expected release conflict, got released=%v err=%v", released, err)
+	}
+	released, err = infrastructure.ReleaseLease(ctx, *renewed)
+	if err != nil || !released {
+		t.Fatalf("release lease failed: released=%v err=%v", released, err)
+	}
+
+	reclaimed, err := infrastructure.ClaimLease(ctx, "branch", time.Hour)
+	if err != nil {
+		t.Fatalf("reclaim lease failed: %v", err)
+	}
+	if reclaimed == nil || reclaimed.Generation != 2 {
+		t.Fatalf("expected generation 2, got %+v", reclaimed)
+	}
+}

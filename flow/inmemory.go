@@ -5,22 +5,107 @@ import (
 	"encoding/json"
 	"fmt"
 	"sync"
+	"time"
 )
 
 var _ Infrastructure[any, any] = (*InMemoryInfrastructure[any, any])(nil)
 
 type InMemoryInfrastructure[Input any, Output any] struct {
-	lock    sync.RWMutex
-	state   State[Input, Output]
-	events  map[string]Event
-	signals []Signal
-	errors  []error
+	lock             sync.RWMutex
+	state            State[Input, Output]
+	events           map[string]Event
+	leases           map[string]ExecutionLease
+	leaseGenerations map[string]int64
+	signals          []Signal
+	errors           []error
 }
 
 func NewInMemoryInfrastructure[Input any, Output any]() *InMemoryInfrastructure[Input, Output] {
 	return &InMemoryInfrastructure[Input, Output]{
-		events: make(map[string]Event),
+		events:           make(map[string]Event),
+		leases:           make(map[string]ExecutionLease),
+		leaseGenerations: make(map[string]int64),
 	}
+}
+
+func (infrastructure *InMemoryInfrastructure[Input, Output]) ClaimLease(
+	ctx context.Context,
+	key string,
+	ttl time.Duration,
+) (*ExecutionLease, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if ttl <= 0 {
+		return nil, fmt.Errorf("lease ttl must be positive")
+	}
+
+	infrastructure.lock.Lock()
+	defer infrastructure.lock.Unlock()
+	infrastructure.initialize()
+
+	now := time.Now()
+	if lease, exists := infrastructure.leases[key]; exists && lease.ExpiresAt.After(now) {
+		return nil, nil
+	}
+
+	generation := infrastructure.leaseGenerations[key] + 1
+	lease := ExecutionLease{
+		Key:        key,
+		Generation: generation,
+		ExpiresAt:  now.Add(ttl),
+	}
+	infrastructure.leases[key] = lease
+	infrastructure.leaseGenerations[key] = generation
+	return cloneLease(lease), nil
+}
+
+func (infrastructure *InMemoryInfrastructure[Input, Output]) RenewLease(
+	ctx context.Context,
+	lease ExecutionLease,
+	ttl time.Duration,
+) (*ExecutionLease, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if ttl <= 0 {
+		return nil, fmt.Errorf("lease ttl must be positive")
+	}
+
+	infrastructure.lock.Lock()
+	defer infrastructure.lock.Unlock()
+	infrastructure.initialize()
+
+	now := time.Now()
+	current, exists := infrastructure.leases[lease.Key]
+	if !exists ||
+		current.Generation != lease.Generation ||
+		!current.ExpiresAt.After(now) {
+		return nil, nil
+	}
+	current.ExpiresAt = now.Add(ttl)
+	infrastructure.leases[lease.Key] = current
+	return cloneLease(current), nil
+}
+
+func (infrastructure *InMemoryInfrastructure[Input, Output]) ReleaseLease(
+	ctx context.Context,
+	lease ExecutionLease,
+) (bool, error) {
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+
+	infrastructure.lock.Lock()
+	defer infrastructure.lock.Unlock()
+	infrastructure.initialize()
+
+	current, exists := infrastructure.leases[lease.Key]
+	if !exists || current.Generation != lease.Generation {
+		return false, nil
+	}
+	delete(infrastructure.leases, lease.Key)
+	return true, nil
 }
 
 func (infrastructure *InMemoryInfrastructure[Input, Output]) AddEvent(ctx context.Context, event Event) (Event, error) {
@@ -133,6 +218,17 @@ func (infrastructure *InMemoryInfrastructure[Input, Output]) initialize() {
 	if infrastructure.events == nil {
 		infrastructure.events = make(map[string]Event)
 	}
+	if infrastructure.leases == nil {
+		infrastructure.leases = make(map[string]ExecutionLease)
+	}
+	if infrastructure.leaseGenerations == nil {
+		infrastructure.leaseGenerations = make(map[string]int64)
+	}
+}
+
+func cloneLease(lease ExecutionLease) *ExecutionLease {
+	result := lease
+	return &result
 }
 
 func cloneState[Input any, Output any](state State[Input, Output]) State[Input, Output] {

@@ -109,6 +109,9 @@ const (
 	InfrastructureMethodResolveSignal InfrastructureMethod = "ResolveSignal"
 	InfrastructureMethodGetState      InfrastructureMethod = "GetState"
 	InfrastructureMethodSetState      InfrastructureMethod = "SetState"
+	InfrastructureMethodClaimLease    InfrastructureMethod = "ClaimLease"
+	InfrastructureMethodRenewLease    InfrastructureMethod = "RenewLease"
+	InfrastructureMethodReleaseLease  InfrastructureMethod = "ReleaseLease"
 )
 
 type InfrastructureError struct {

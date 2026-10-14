@@ -12,10 +12,12 @@ import (
 	"github.com/google/uuid"
 )
 
+const executionLeaseTTL = 30 * time.Second
+
 type StepContext[Input any, Output any] struct {
 	context.Context
 	key            string
-	lease          *ExecutionLease
+	lease          *Lease
 	infrastructure Infrastructure[Input, Output]
 	input          Input
 	events         map[string]Event
@@ -206,13 +208,14 @@ func (ctx *WorkflowContext[Input, Output]) goResult[T any](
 					Status:    FlowStatusRunning,
 					Version:   0,
 				},
-				func() (T, error) {
+				func(executionContext StepContext[Input, Output]) (T, error) {
 					goContext := newGoContext(
-						ctx.Context,
+						executionContext.Context,
 						key,
 						ctx.infrastructure,
 						ctx.input,
 					)
+					goContext.lease = executionContext.lease
 					return handler(goContext), nil
 				},
 				nil,
@@ -280,9 +283,81 @@ func (ctx StepContext[Input, Output]) checkpoint[T any](key string, generate fun
 	return value
 }
 
+func (ctx StepContext[Input, Output]) withLease[T any](
+	event Event,
+	handler func(StepContext[Input, Output]) T,
+) T {
+	if ctx.lease != nil {
+		return handler(ctx)
+	}
+
+	var output T
+	var lease *Lease
+	lease = NewLease(
+		ctx.infrastructure,
+		event.GetKey(),
+		executionLeaseTTL,
+		func(executionContext context.Context) {
+			ctx.Context = executionContext
+			ctx.lease = lease
+			output = handler(ctx)
+		},
+	)
+	err := lease.Run(ctx.Context)
+	if err == nil {
+		return output
+	}
+	if errors.Is(err, ErrLeaseConflict) {
+		panic(NewConflictError(event))
+	}
+
+	var leaseErr *LeaseError
+	if !errors.As(err, &leaseErr) {
+		panic(NewSystemError(event, err))
+	}
+	infrastructureErr := NewInfrastructureError(
+		event,
+		leaseErr.Cause,
+		InfrastructureMethod(leaseErr.Operation),
+	)
+	ctx.infrastructure.OnError(infrastructureErr)
+	if leaseErr.Operation == LeaseOperationClaim {
+		panic(infrastructureErr)
+	}
+	panic(NewConflictError(event))
+}
+
 func (ctx StepContext[Input, Output]) executeResultEvent[T any, E comparableResultEvent](
 	newEvent E,
-	handler func() (T, error),
+	handler func(StepContext[Input, Output]) (T, error),
+	wrapHandlerError func(Event, error) error,
+) T {
+	event := ctx.getEvent[E](newEvent.GetKey())
+	var zero E
+	if event != zero {
+		switch event.GetStatus() {
+		case FlowStatusFailed:
+			panic(NewLegacyBizError(event, errors.New(event.GetError())))
+		case FlowStatusCompleted:
+			return ctx.unmarshal[T](event.GetResult(), event)
+		case FlowStatusRunning, FlowStatusSuspended:
+		default:
+			panic(NewSystemError(event, fmt.Errorf("unknown status %s", event.GetStatus())))
+		}
+	}
+
+	return ctx.withLease(newEvent, func(executionContext StepContext[Input, Output]) T {
+		return executionContext.executeLeasedResultEvent(
+			newEvent,
+			handler,
+			wrapHandlerError,
+		)
+	})
+}
+
+func (ctx StepContext[Input, Output]) executeLeasedResultEvent[T any, E comparableResultEvent](
+	newEvent E,
+	handler func(StepContext[Input, Output]) (T, error),
 	wrapHandlerError func(Event, error) error,
 ) T {
 	event := ctx.getEvent[E](newEvent.GetKey())
@@ -294,7 +369,6 @@ func (ctx StepContext[Input, Output]) executeResultEvent[T any, E comparableResu
 		case FlowStatusCompleted:
 			return ctx.unmarshal[T](event.GetResult(), event)
 		case FlowStatusRunning:
-			panic(NewConflictError(event))
 		case FlowStatusSuspended:
 			event.SetStatus(FlowStatusRunning)
 			event = ctx.updateEvent(event)
@@ -321,7 +395,7 @@ func (ctx StepContext[Input, Output]) executeResultEvent[T any, E comparableResu
 	}
 
 	result := handleOutput(run(func() T {
-		result, err := handler()
+		result, err := handler(ctx)
 		if err != nil {
 			panic(err)
 		}
@@ -347,8 +421,8 @@ func (ctx StepContext[Input, Output]) step[T any](
 			Status:    FlowStatusRunning,
 			Version:   0,
 		},
-		func() (T, error) {
-			stepContext := ctx
+		func(executionContext StepContext[Input, Output]) (T, error) {
+			stepContext := executionContext
 			stepContext.key = key
 			return handler(stepContext)
 		},
