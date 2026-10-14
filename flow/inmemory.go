@@ -264,6 +264,10 @@ func cloneEvent(event Event) (Event, error) {
 	case *SleepSignalEvent:
 		result := *value
 		return &result, nil
+	case *LoopEvent:
+		result := *value
+		result.Result = cloneRawMessage(value.Result)
+		return &result, nil
 	default:
 		return nil, fmt.Errorf("unsupported event type %T", event)
 	}
@@ -280,6 +284,8 @@ func setEventVersion(event Event, version int) {
 	case *CheckpointEvent:
 		value.Version = version
 	case *SleepSignalEvent:
+		value.Version = version
+	case *LoopEvent:
 		value.Version = version
 	}
 }

@@ -12,7 +12,10 @@ import (
 	"github.com/google/uuid"
 )
 
-const executionLeaseTTL = 30 * time.Second
+const (
+	executionLeaseTTL = 30 * time.Second
+	minLoopInterval   = 5 * time.Second
+)
 
 type StepContext[Input any, Output any] struct {
 	context.Context
@@ -70,6 +73,15 @@ func (ctx *GoContext[Input, Output]) Step[T any](
 ) T {
 	ensureContext(ctx.Context, nil)
 	return ctx.step(key, handler)
+}
+
+func (ctx *GoContext[Input, Output]) Loop[T any](
+	key string,
+	option LoopOption,
+	handler func(ctx *GoContext[Input, Output], attempt int) (LoopResult[T], error),
+) T {
+	ensureContext(ctx.Context, nil)
+	return ctx.loop(key, option, handler)
 }
 
 type WorkflowContext[Input any, Output any] struct {
@@ -187,8 +199,11 @@ func (ctx *WorkflowContext[Input, Output]) run(handler func(ctx *WorkflowContext
 			)
 			return
 		}
-		if err := signalEvent.ResolveSignal(signal); err != nil {
-			ctx.infrastructure.OnError(err)
+		if resolveErr := signalEvent.ResolveSignal(signal); resolveErr != nil {
+			if _, ok := resolveErr.(*ConflictError); ok {
+				return
+			}
+			ctx.infrastructure.OnError(resolveErr)
 			return
 		}
 		newEvent, err := ctx.infrastructure.UpdateEvent(ctx.Context, signalEvent)
@@ -251,6 +266,154 @@ func (ctx *WorkflowContext[Input, Output]) goResult[T any](
 			)
 		})
 	})
+}
+
+type LoopOption struct {
+	Interval    time.Duration
+	MaxAttempts int
+}
+
+type LoopResult[T any] struct {
+	Result T
+	Done   bool
+}
+
+func (ctx *GoContext[Input, Output]) loop[T any](
+	key string,
+	option LoopOption,
+	handler func(ctx *GoContext[Input, Output], attempt int) (LoopResult[T], error),
+) T {
+	if option.Interval < minLoopInterval {
+		panic(NewSystemError(nil, fmt.Errorf("loop interval must be at least %s", minLoopInterval)))
+	}
+	if option.MaxAttempts <= 0 {
+		panic(NewSystemError(nil, fmt.Errorf("loop max attempts must be positive")))
+	}
+
+	newEvent := &LoopEvent{
+		Key:       key,
+		StartedAt: time.Now(),
+		Status:    FlowStatusRunning,
+		Version:   0,
+	}
+
+	event := ctx.getEvent[*LoopEvent](key)
+	if event != nil {
+		switch event.GetStatus() {
+		case FlowStatusFailed:
+			panic(NewLegacyBizError(event, errors.New(event.GetError())))
+		case FlowStatusCompleted:
+			return ctx.unmarshal[T](event.GetResult(), event)
+		case FlowStatusRunning, FlowStatusSuspended:
+		default:
+			panic(NewSystemError(event, fmt.Errorf("unknown status %s", event.GetStatus())))
+		}
+	}
+
+	return ctx.withLease(newEvent, func(executionContext StepContext[Input, Output]) T {
+		return executionContext.executeLeasedLoop(
+			newEvent,
+			option,
+			handler,
+		)
+	})
+}
+
+func (ctx StepContext[Input, Output]) executeLeasedLoop[T any](
+	newEvent *LoopEvent,
+	option LoopOption,
+	handler func(ctx *GoContext[Input, Output], attempt int) (LoopResult[T], error),
+) T {
+	event := ctx.getEvent[*LoopEvent](newEvent.GetKey())
+	if event != nil {
+		switch event.GetStatus() {
+		case FlowStatusFailed:
+			panic(NewLegacyBizError(event, errors.New(event.GetError())))
+		case FlowStatusCompleted:
+			return ctx.unmarshal[T](event.GetResult(), event)
+		case FlowStatusRunning:
+		case FlowStatusSuspended:
+			event.SetStatus(FlowStatusRunning)
+			event = ctx.updateEvent(event)
+		default:
+			panic(NewSystemError(event, fmt.Errorf("unknown status %s", event.GetStatus())))
+		}
+	} else {
+		event = ctx.addEvent(newEvent)
+	}
+
+	if event.Attempt >= option.MaxAttempts {
+		err := fmt.Errorf("loop max attempts exceeded: %d", option.MaxAttempts)
+		event.SetError(err)
+		event = ctx.updateEvent(event)
+		panic(NewBizError(event, err))
+	}
+
+	wrapLoopError := func(event Event, err error) error {
+		var contextErr *ContextError
+		if errors.As(err, &contextErr) {
+			return err
+		}
+		return NewBizError(event, err)
+	}
+	handleOutput := func(
+		output *fixedResult[LoopResult[T]],
+		wrapError func(Event, error) error,
+	) LoopResult[T] {
+		if output.err != nil {
+			output.err = bindContextError(event, output.err)
+			event.SetError(output.err)
+			event = ctx.updateEvent(event)
+			if wrapError != nil {
+				panic(wrapError(event, output.err))
+			}
+		}
+		if output.signal != nil {
+			event.SetStatus(FlowStatusSuspended)
+			event = ctx.updateEvent(event)
+		}
+		return output.Wait()
+	}
+
+	loopContext := &GoContext[Input, Output]{
+		StepContext: ctx,
+	}
+	loopContext.key = event.GetKey()
+	output := handleOutput(run(func() LoopResult[T] {
+		ensureContext(ctx.Context, event)
+		result, err := handler(loopContext, event.Attempt)
+		if err != nil {
+			panic(err)
+		}
+		return result
+	}), wrapLoopError)
+
+	if !output.Done && event.Attempt+1 >= option.MaxAttempts {
+		err := fmt.Errorf("loop max attempts exceeded: %d", option.MaxAttempts)
+		event.SetError(err)
+		event = ctx.updateEvent(event)
+		panic(NewBizError(event, err))
+	}
+
+	return handleOutput(run(func() LoopResult[T] {
+		if output.Done {
+			event.SetResult(ctx.marshal(output.Result, event))
+			event.SetStatus(FlowStatusCompleted)
+			event = ctx.updateEvent(event)
+			return output
+		}
+
+		nextAttempt := event.Attempt + 1
+		event.Attempt = nextAttempt
+		event.SetStatus(FlowStatusSuspended)
+		event = ctx.updateEvent(event)
+		ctx.sleep(loopSleepKey(event.GetKey(), event.Attempt), option.Interval)
+		return output
+	}), nil).Result
+}
+
+func loopSleepKey(key string, attempt int) string {
+	return fmt.Sprintf("%s/sleep/%d", key, attempt)
 }
 
 func (ctx StepContext[Input, Output]) waitFor[Request any, Response any](key string, option WaitForOption[Request]) Response {

@@ -249,6 +249,9 @@ func TestExecutionContextHierarchy(t *testing.T) {
 	if _, exists := stepType.FieldByName("runtime"); exists {
 		t.Fatal("StepContext must own atomic runtime capabilities directly")
 	}
+	if _, exists := stepType.MethodByName("Loop"); exists {
+		t.Fatal("StepContext must not expose Loop")
+	}
 }
 
 func TestFlowRunsStepAndReusesCompletedState_BitsUT(t *testing.T) {
@@ -410,6 +413,419 @@ func TestFlowResumesSleepAfterDeadline_BitsUT(t *testing.T) {
 	if handlerCalls.Load() != 2 {
 		t.Fatalf("expected initial and resumed handler calls, got %d", handlerCalls.Load())
 	}
+}
+
+func TestFlowIgnoresSleepSignalBeforeDeadline_BitsUT(t *testing.T) {
+	infrastructure := NewInMemoryInfrastructure[struct{}, string]()
+	var handlerCalls atomic.Int64
+	target := Flow[struct{}, string]{
+		Handler: func(runtime *WorkflowContext[struct{}, string]) string {
+			handlerCalls.Add(1)
+			runtime.Sleep("long-sleep", 25*time.Millisecond)
+			return "completed"
+		},
+	}
+
+	ctx := context.Background()
+	target.StartRun(ctx, struct{}{}, infrastructure)
+	signals := infrastructure.Signals()
+	if len(signals) != 1 {
+		t.Fatalf("expected one sleep signal, got %d", len(signals))
+	}
+	sleep := signals[0].(*SleepSignalEvent)
+
+	target.ResumeRun(ctx, infrastructure, sleep)
+
+	state, err := infrastructure.GetState(ctx)
+	if err != nil {
+		t.Fatalf("get early resumed state failed: %v", err)
+	}
+	if state.Status != FlowStatusRunning {
+		t.Fatalf("expected running state before deadline, got %+v", state)
+	}
+	event, err := infrastructure.GetEvent(ctx, sleep.Key)
+	if err != nil {
+		t.Fatalf("get sleep event failed: %v", err)
+	}
+	if event.GetStatus() != FlowStatusSuspended || event.GetVersion() != sleep.Version {
+		t.Fatalf("sleep event changed before deadline: %+v", event)
+	}
+	if handlerCalls.Load() != 1 {
+		t.Fatalf("handler ran before sleep deadline, got %d calls", handlerCalls.Load())
+	}
+
+	time.Sleep(time.Until(sleep.Until) + 5*time.Millisecond)
+	target.ResumeRun(ctx, infrastructure, sleep)
+
+	state, err = infrastructure.GetState(ctx)
+	if err != nil {
+		t.Fatalf("get resumed state failed: %v", err)
+	}
+	if state.Status != FlowStatusCompleted || state.Output != "completed" {
+		t.Fatalf("unexpected resumed state: %+v", state)
+	}
+	if handlerCalls.Load() != 2 {
+		t.Fatalf("expected handler to rerun after deadline only, got %d calls", handlerCalls.Load())
+	}
+}
+
+func TestFlowLoopPollsUntilDone(t *testing.T) {
+	infrastructure := &trackingLeaseInfrastructure{
+		InMemoryInfrastructure: NewInMemoryInfrastructure[struct{}, string](),
+	}
+	var handlerCalls atomic.Int64
+	target := Flow[struct{}, string]{
+		Handler: func(runtime *WorkflowContext[struct{}, string]) string {
+			return runtime.Loop(
+				"poll",
+				LoopOption{
+					Interval:    minLoopInterval,
+					MaxAttempts: 3,
+				},
+				func(ctx *GoContext[struct{}, string], attempt int) (LoopResult[string], error) {
+					call := handlerCalls.Add(1)
+					if int(call) != attempt+1 {
+						t.Fatalf("expected attempt %d for call %d", call-1, call)
+					}
+					if attempt < 2 {
+						return LoopResult[string]{Result: "pending"}, nil
+					}
+					return LoopResult[string]{Result: "done", Done: true}, nil
+				},
+			)
+		},
+	}
+
+	ctx := context.Background()
+	target.StartRun(ctx, struct{}{}, infrastructure)
+
+	state, err := infrastructure.GetState(ctx)
+	if err != nil {
+		t.Fatalf("get polling state failed: %v", err)
+	}
+	if state.Status != FlowStatusRunning {
+		t.Fatalf("expected running state after first pending poll, got %+v", state)
+	}
+	if handlerCalls.Load() != 1 {
+		t.Fatalf("expected one poll attempt, got %d", handlerCalls.Load())
+	}
+	if infrastructure.claims.Load() != 1 || infrastructure.releases.Load() != 1 {
+		t.Fatalf(
+			"expected first poll to claim and release once, got claims=%d releases=%d",
+			infrastructure.claims.Load(),
+			infrastructure.releases.Load(),
+		)
+	}
+
+	event, err := infrastructure.GetEvent(ctx, "poll")
+	if err != nil {
+		t.Fatalf("get loop event failed: %v", err)
+	}
+	loop := event.(*LoopEvent)
+	if loop.Status != FlowStatusSuspended || loop.Attempt != 1 {
+		t.Fatalf("unexpected loop event after first poll: %+v", loop)
+	}
+
+	signals := infrastructure.Signals()
+	if len(signals) != 1 {
+		t.Fatalf("expected first sleep signal, got %d", len(signals))
+	}
+	firstSleep := signals[0].(*SleepSignalEvent)
+	firstSleep = expireSleepSignal(t, ctx, infrastructure, firstSleep)
+	target.ResumeRun(ctx, infrastructure, firstSleep)
+
+	if handlerCalls.Load() != 2 {
+		t.Fatalf("expected second poll attempt, got %d", handlerCalls.Load())
+	}
+	if infrastructure.claims.Load() != 2 || infrastructure.releases.Load() != 2 {
+		t.Fatalf(
+			"expected second poll to run under a new released lease, got claims=%d releases=%d",
+			infrastructure.claims.Load(),
+			infrastructure.releases.Load(),
+		)
+	}
+	event, err = infrastructure.GetEvent(ctx, "poll")
+	if err != nil {
+		t.Fatalf("get loop event after second poll failed: %v", err)
+	}
+	loop = event.(*LoopEvent)
+	if loop.Status != FlowStatusSuspended || loop.Attempt != 2 {
+		t.Fatalf("unexpected loop event after second poll: %+v", loop)
+	}
+
+	signals = infrastructure.Signals()
+	if len(signals) != 2 {
+		t.Fatalf("expected second sleep signal, got %d", len(signals))
+	}
+	secondSleep := signals[1].(*SleepSignalEvent)
+	secondSleep = expireSleepSignal(t, ctx, infrastructure, secondSleep)
+	target.ResumeRun(ctx, infrastructure, secondSleep)
+
+	state, err = infrastructure.GetState(ctx)
+	if err != nil {
+		t.Fatalf("get completed loop state failed: %v", err)
+	}
+	if state.Status != FlowStatusCompleted || state.Output != "done" {
+		t.Fatalf("unexpected completed loop state: %+v", state)
+	}
+	if handlerCalls.Load() != 3 {
+		t.Fatalf("expected three poll attempts, got %d", handlerCalls.Load())
+	}
+	if infrastructure.claims.Load() != 3 || infrastructure.releases.Load() != 3 {
+		t.Fatalf(
+			"expected every poll attempt to claim and release, got claims=%d releases=%d",
+			infrastructure.claims.Load(),
+			infrastructure.releases.Load(),
+		)
+	}
+	event, err = infrastructure.GetEvent(ctx, "poll")
+	if err != nil {
+		t.Fatalf("get completed loop event failed: %v", err)
+	}
+	loop = event.(*LoopEvent)
+	if loop.Status != FlowStatusCompleted || loop.Attempt != 2 {
+		t.Fatalf("unexpected completed loop event: %+v", loop)
+	}
+}
+
+func TestFlowLoopIgnoresSleepBeforeDeadline(t *testing.T) {
+	infrastructure := NewInMemoryInfrastructure[struct{}, string]()
+	var handlerCalls atomic.Int64
+	target := Flow[struct{}, string]{
+		Handler: func(runtime *WorkflowContext[struct{}, string]) string {
+			return runtime.Loop(
+				"poll",
+				LoopOption{
+					Interval:    minLoopInterval,
+					MaxAttempts: 2,
+				},
+				func(*GoContext[struct{}, string], int) (LoopResult[string], error) {
+					handlerCalls.Add(1)
+					return LoopResult[string]{Result: "pending"}, nil
+				},
+			)
+		},
+	}
+
+	ctx := context.Background()
+	target.StartRun(ctx, struct{}{}, infrastructure)
+	signals := infrastructure.Signals()
+	if len(signals) != 1 {
+		t.Fatalf("expected one sleep signal, got %d", len(signals))
+	}
+	sleep := signals[0].(*SleepSignalEvent)
+
+	target.ResumeRun(ctx, infrastructure, sleep)
+
+	state, err := infrastructure.GetState(ctx)
+	if err != nil {
+		t.Fatalf("get early resumed state failed: %v", err)
+	}
+	if state.Status != FlowStatusRunning {
+		t.Fatalf("expected running state before deadline, got %+v", state)
+	}
+	if handlerCalls.Load() != 1 {
+		t.Fatalf("loop ran before sleep deadline, got %d calls", handlerCalls.Load())
+	}
+	event, err := infrastructure.GetEvent(ctx, "poll")
+	if err != nil {
+		t.Fatalf("get loop event failed: %v", err)
+	}
+	loop := event.(*LoopEvent)
+	if loop.Status != FlowStatusSuspended || loop.Attempt != 1 {
+		t.Fatalf("loop event changed before deadline: %+v", loop)
+	}
+}
+
+func TestFlowLoopFailsAfterMaxAttempts(t *testing.T) {
+	infrastructure := NewInMemoryInfrastructure[struct{}, string]()
+	var handlerCalls atomic.Int64
+	target := Flow[struct{}, string]{
+		Handler: func(runtime *WorkflowContext[struct{}, string]) string {
+			return runtime.Loop(
+				"poll",
+				LoopOption{
+					Interval:    minLoopInterval,
+					MaxAttempts: 2,
+				},
+				func(*GoContext[struct{}, string], int) (LoopResult[string], error) {
+					handlerCalls.Add(1)
+					return LoopResult[string]{Result: "pending"}, nil
+				},
+			)
+		},
+	}
+
+	ctx := context.Background()
+	target.StartRun(ctx, struct{}{}, infrastructure)
+	signals := infrastructure.Signals()
+	if len(signals) != 1 {
+		t.Fatalf("expected one sleep signal, got %d", len(signals))
+	}
+	sleep := signals[0].(*SleepSignalEvent)
+	sleep = expireSleepSignal(t, ctx, infrastructure, sleep)
+	target.ResumeRun(ctx, infrastructure, sleep)
+
+	state, err := infrastructure.GetState(ctx)
+	if err != nil {
+		t.Fatalf("get failed loop state failed: %v", err)
+	}
+	if state.Status != FlowStatusFailed ||
+		len(state.Errors) != 1 ||
+		state.Errors[0] != "biz error: poll" {
+		t.Fatalf("unexpected failed loop state: %+v", state)
+	}
+	if handlerCalls.Load() != 2 {
+		t.Fatalf("expected exactly max attempts, got %d", handlerCalls.Load())
+	}
+	event, err := infrastructure.GetEvent(ctx, "poll")
+	if err != nil {
+		t.Fatalf("get failed loop event failed: %v", err)
+	}
+	loop := event.(*LoopEvent)
+	if loop.Status != FlowStatusFailed ||
+		loop.Error != "loop max attempts exceeded: 2" ||
+		loop.Attempt != 1 {
+		t.Fatalf("unexpected failed loop event: %+v", loop)
+	}
+	if len(infrastructure.Signals()) != 1 {
+		t.Fatalf("loop scheduled a sleep after max attempts: %d", len(infrastructure.Signals()))
+	}
+}
+
+func TestFlowLoopFailsWhenHandlerReturnsError(t *testing.T) {
+	loopErr := errors.New("poll failed")
+	infrastructure := NewInMemoryInfrastructure[struct{}, string]()
+	target := Flow[struct{}, string]{
+		Handler: func(runtime *WorkflowContext[struct{}, string]) string {
+			return runtime.Loop(
+				"poll",
+				LoopOption{
+					Interval:    minLoopInterval,
+					MaxAttempts: 3,
+				},
+				func(*GoContext[struct{}, string], int) (LoopResult[string], error) {
+					return LoopResult[string]{}, loopErr
+				},
+			)
+		},
+	}
+
+	ctx := context.Background()
+	target.StartRun(ctx, struct{}{}, infrastructure)
+
+	state, err := infrastructure.GetState(ctx)
+	if err != nil {
+		t.Fatalf("get failed loop state failed: %v", err)
+	}
+	if state.Status != FlowStatusFailed ||
+		len(state.Errors) != 1 ||
+		state.Errors[0] != "biz error: poll" {
+		t.Fatalf("unexpected failed loop state: %+v", state)
+	}
+	event, err := infrastructure.GetEvent(ctx, "poll")
+	if err != nil {
+		t.Fatalf("get failed loop event failed: %v", err)
+	}
+	if event.GetStatus() != FlowStatusFailed || event.GetError() != loopErr.Error() {
+		t.Fatalf("unexpected failed loop event: %+v", event)
+	}
+}
+
+func TestFlowReusesCompletedLoopResult(t *testing.T) {
+	infrastructure := NewInMemoryInfrastructure[struct{}, string]()
+	var handlerCalls atomic.Int64
+	target := Flow[struct{}, string]{
+		Handler: func(runtime *WorkflowContext[struct{}, string]) string {
+			return runtime.Loop(
+				"poll",
+				LoopOption{
+					Interval:    minLoopInterval,
+					MaxAttempts: 2,
+				},
+				func(*GoContext[struct{}, string], int) (LoopResult[string], error) {
+					handlerCalls.Add(1)
+					return LoopResult[string]{Result: "done", Done: true}, nil
+				},
+			)
+		},
+	}
+
+	ctx := context.Background()
+	target.StartRun(ctx, struct{}{}, infrastructure)
+	target.StartRun(ctx, struct{}{}, infrastructure)
+
+	state, err := infrastructure.GetState(ctx)
+	if err != nil {
+		t.Fatalf("get completed loop state failed: %v", err)
+	}
+	if state.Status != FlowStatusCompleted || state.Output != "done" {
+		t.Fatalf("unexpected completed loop state: %+v", state)
+	}
+	if handlerCalls.Load() != 1 {
+		t.Fatalf("expected completed loop result to be reused, got %d calls", handlerCalls.Load())
+	}
+}
+
+func TestFlowLoopRejectsIntervalBelowMinimum(t *testing.T) {
+	infrastructure := NewInMemoryInfrastructure[struct{}, string]()
+	var handlerCalls atomic.Int64
+	target := Flow[struct{}, string]{
+		Handler: func(runtime *WorkflowContext[struct{}, string]) string {
+			return runtime.Loop(
+				"poll",
+				LoopOption{
+					Interval:    minLoopInterval - time.Nanosecond,
+					MaxAttempts: 2,
+				},
+				func(*GoContext[struct{}, string], int) (LoopResult[string], error) {
+					handlerCalls.Add(1)
+					return LoopResult[string]{Result: "done", Done: true}, nil
+				},
+			)
+		},
+	}
+
+	target.StartRun(context.Background(), struct{}{}, infrastructure)
+
+	state, err := infrastructure.GetState(context.Background())
+	if err != nil {
+		t.Fatalf("get failed loop state failed: %v", err)
+	}
+	if state.Status != FlowStatusFailed ||
+		len(state.Errors) != 1 ||
+		state.Errors[0] != "loop interval must be at least 5s" {
+		t.Fatalf("unexpected failed loop state: %+v", state)
+	}
+	if handlerCalls.Load() != 0 {
+		t.Fatalf("loop handler ran despite invalid interval: %d", handlerCalls.Load())
+	}
+}
+
+func expireSleepSignal(
+	t *testing.T,
+	ctx context.Context,
+	infrastructure interface {
+		GetEvent(context.Context, string) (Event, error)
+		UpdateEvent(context.Context, Event) (Event, error)
+	},
+	signal *SleepSignalEvent,
+) *SleepSignalEvent {
+	t.Helper()
+	event, err := infrastructure.GetEvent(ctx, signal.Key)
+	if err != nil {
+		t.Fatalf("get sleep event failed: %v", err)
+	}
+	sleep := event.(*SleepSignalEvent)
+	sleep.Until = time.Now().Add(-time.Nanosecond)
+	updated, err := infrastructure.UpdateEvent(ctx, sleep)
+	if err != nil {
+		t.Fatalf("update sleep event failed: %v", err)
+	}
+	if updated == nil {
+		t.Fatal("update sleep event conflicted")
+	}
+	return updated.(*SleepSignalEvent)
 }
 
 func TestFlowWaitsForAsyncResult_BitsUT(t *testing.T) {

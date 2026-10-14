@@ -11,6 +11,7 @@ var _ ResultEvent = (*AsyncEvent)(nil)
 var _ Signal = (*WaitForSignalEvent)(nil)
 var _ ResultEvent = (*CheckpointEvent)(nil)
 var _ Signal = (*SleepSignalEvent)(nil)
+var _ ResultEvent = (*LoopEvent)(nil)
 
 type Event interface {
 	GetEventType() string
@@ -164,10 +165,33 @@ func (e *SleepSignalEvent) GetEventType() string {
 }
 
 func (e *SleepSignalEvent) ResolveSignal(signal Signal) error {
-	if _, ok := signal.(*SleepSignalEvent); ok {
-		e.EndedAt = time.Now()
-		e.Status = FlowStatusCompleted
-		return nil
+	if _, ok := signal.(*SleepSignalEvent); !ok {
+		return fmt.Errorf("unsupported signal type %T", signal)
 	}
-	return fmt.Errorf("unsupported signal type %T", signal)
+	if e.Status != FlowStatusSuspended && e.Status != FlowStatusRunning {
+		return NewConflictError(e)
+	}
+	if time.Now().Before(e.Until) {
+		return NewConflictError(e)
+	}
+	e.SetStatus(FlowStatusCompleted)
+	return nil
+}
+
+type LoopEvent struct {
+	BaseEvent
+	Result  json.RawMessage
+	Attempt int
+}
+
+func (e *LoopEvent) GetEventType() string {
+	return "LOOP"
+}
+
+func (e *LoopEvent) GetResult() json.RawMessage {
+	return e.Result
+}
+
+func (e *LoopEvent) SetResult(result json.RawMessage) {
+	e.Result = result
 }
