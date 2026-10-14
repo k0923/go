@@ -6,7 +6,7 @@ import (
 
 type Flow[Input any, Output any] struct {
 	// Handler must not recover panics from flow runtime APIs.
-	Handler func(ctx *Runtime[Input, Output]) Output
+	Handler func(ctx *WorkflowContext[Input, Output]) Output
 }
 
 func (flow *Flow[Input, Output]) StartRun(ctx context.Context, input Input, infrastructure Infrastructure[Input, Output]) {
@@ -21,8 +21,8 @@ func (flow *Flow[Input, Output]) StartRun(ctx context.Context, input Input, infr
 	}
 
 	if state.Status == FlowStatusRunning {
-		runtime := newRuntime(ctx, infrastructure, state.Input)
-		runtime.run(flow.Handler, nil)
+		workflowContext := newWorkflowContext(ctx, infrastructure, state.Input)
+		workflowContext.run(flow.Handler, nil)
 		return
 	}
 
@@ -35,8 +35,8 @@ func (flow *Flow[Input, Output]) StartRun(ctx context.Context, input Input, infr
 		infrastructure.OnError(err)
 		return
 	}
-	runtime := newRuntime(ctx, infrastructure, input)
-	runtime.run(flow.Handler, nil)
+	workflowContext := newWorkflowContext(ctx, infrastructure, input)
+	workflowContext.run(flow.Handler, nil)
 }
 
 func (flow *Flow[Input, Output]) ResumeRun(ctx context.Context, infrastructure Infrastructure[Input, Output], signal Signal) {
@@ -48,6 +48,6 @@ func (flow *Flow[Input, Output]) ResumeRun(ctx context.Context, infrastructure I
 	if state.Status != FlowStatusRunning {
 		return
 	}
-	runtime := newRuntime[Input, Output](ctx, infrastructure, state.Input)
-	runtime.run(flow.Handler, signal)
+	workflowContext := newWorkflowContext[Input, Output](ctx, infrastructure, state.Input)
+	workflowContext.run(flow.Handler, signal)
 }

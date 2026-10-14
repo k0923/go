@@ -10,14 +10,15 @@ import (
 func TestRuntimeIsUsableOutsideFlowPackage(t *testing.T) {
 	infrastructure := flow.NewInMemoryInfrastructure[string, string]()
 	target := flow.Flow[string, string]{
-		Handler: func(runtime *flow.Runtime[string, string]) string {
-			return runtime.Step(
-				runtime.Context,
-				"public-step",
-				func(flow.StepContext[string]) (string, error) {
-					return runtime.GetInput(), nil
-				},
-			)
+		Handler: func(runtime *flow.WorkflowContext[string, string]) string {
+			return runtime.Go("public-go", func(goContext *flow.GoContext[string, string]) string {
+				return goContext.Step(
+					"public-step",
+					func(stepContext flow.StepContext[string, string]) (string, error) {
+						return stepContext.GetInput(), nil
+					},
+				)
+			}).Wait()
 		},
 	}
 

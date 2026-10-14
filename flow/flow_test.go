@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"reflect"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -31,19 +32,37 @@ func TestFlowStatusSuspendedValue_BitsUT(t *testing.T) {
 	}
 }
 
+func TestExecutionContextHierarchy(t *testing.T) {
+	workflowType := reflect.TypeFor[WorkflowContext[struct{}, string]]()
+	goField, exists := workflowType.FieldByName("GoContext")
+	if !exists || !goField.Anonymous {
+		t.Fatal("WorkflowContext must embed GoContext")
+	}
+
+	goType := reflect.TypeFor[GoContext[struct{}, string]]()
+	stepField, exists := goType.FieldByName("StepContext")
+	if !exists || !stepField.Anonymous {
+		t.Fatal("GoContext must embed StepContext")
+	}
+
+	stepType := reflect.TypeFor[StepContext[struct{}, string]]()
+	if _, exists := stepType.FieldByName("runtime"); exists {
+		t.Fatal("StepContext must own atomic runtime capabilities directly")
+	}
+}
+
 func TestFlowRunsStepAndReusesCompletedState_BitsUT(t *testing.T) {
 	infrastructure := NewInMemoryInfrastructure[string, string]()
 	var handlerCalls atomic.Int64
 	var stepCalls atomic.Int64
 	target := Flow[string, string]{
-		Handler: func(runtime *Runtime[string, string]) string {
+		Handler: func(runtime *WorkflowContext[string, string]) string {
 			handlerCalls.Add(1)
 			return runtime.Step(
-				runtime.Context,
 				"echo",
-				func(ctx StepContext[string]) (string, error) {
+				func(ctx StepContext[string, string]) (string, error) {
 					stepCalls.Add(1)
-					return ctx.GetName() + "-output", nil
+					return ctx.GetKey() + "-output", nil
 				},
 			)
 		},
@@ -79,17 +98,15 @@ func TestFlowResumesWaitForAndReusesCompletedStep_BitsUT(t *testing.T) {
 	infrastructure := NewInMemoryInfrastructure[struct{}, string]()
 	var stepCalls atomic.Int64
 	target := Flow[struct{}, string]{
-		Handler: func(runtime *Runtime[struct{}, string]) string {
+		Handler: func(runtime *WorkflowContext[struct{}, string]) string {
 			prepared := runtime.Step(
-				runtime.Context,
 				"prepare",
-				func(StepContext[struct{}]) (string, error) {
+				func(StepContext[struct{}, string]) (string, error) {
 					stepCalls.Add(1)
 					return "prepared", nil
 				},
 			)
 			approval := runtime.WaitFor[string, string](
-				runtime.Context,
 				"approval",
 				WaitForOption[string]{Request: prepared},
 			)
@@ -128,13 +145,48 @@ func TestFlowResumesWaitForAndReusesCompletedStep_BitsUT(t *testing.T) {
 	}
 }
 
+func TestFlowResumesWaitForInsideStepContext(t *testing.T) {
+	infrastructure := NewInMemoryInfrastructure[struct{}, string]()
+	target := Flow[struct{}, string]{
+		Handler: func(runtime *WorkflowContext[struct{}, string]) string {
+			return runtime.Step(
+				"review-step",
+				func(step StepContext[struct{}, string]) (string, error) {
+					return step.WaitFor[string, string](
+						"approval",
+						WaitForOption[string]{Request: "review"},
+					), nil
+				},
+			)
+		},
+	}
+
+	ctx := context.Background()
+	target.StartRun(ctx, struct{}{}, infrastructure)
+	signals := infrastructure.Signals()
+	if len(signals) != 1 {
+		t.Fatalf("expected one signal, got %d", len(signals))
+	}
+	callback := *(signals[0].(*WaitForSignalEvent))
+	callback.Response = json.RawMessage(`"approved"`)
+	target.ResumeRun(ctx, infrastructure, &callback)
+
+	state, err := infrastructure.GetState(ctx)
+	if err != nil {
+		t.Fatalf("get state failed: %v", err)
+	}
+	if state.Status != FlowStatusCompleted || state.Output != "approved" {
+		t.Fatalf("unexpected state: %+v", state)
+	}
+}
+
 func TestFlowResumesSleepAfterDeadline_BitsUT(t *testing.T) {
 	infrastructure := NewInMemoryInfrastructure[struct{}, string]()
 	var handlerCalls atomic.Int64
 	target := Flow[struct{}, string]{
-		Handler: func(runtime *Runtime[struct{}, string]) string {
+		Handler: func(runtime *WorkflowContext[struct{}, string]) string {
 			handlerCalls.Add(1)
-			runtime.Sleep(runtime.Context, "short-sleep", 15*time.Millisecond)
+			runtime.Sleep("short-sleep", 15*time.Millisecond)
 			return "completed"
 		},
 	}
@@ -164,10 +216,10 @@ func TestFlowWaitsForAsyncResult_BitsUT(t *testing.T) {
 	infrastructure := NewInMemoryInfrastructure[struct{}, string]()
 	var asyncCalls atomic.Int64
 	target := Flow[struct{}, string]{
-		Handler: func(flowRuntime *Runtime[struct{}, string]) string {
-			result := flowRuntime.Go("async", func(*Runtime[struct{}, string]) string {
+		Handler: func(flowRuntime *WorkflowContext[struct{}, string]) string {
+			result := flowRuntime.Go("async", func(goContext *GoContext[struct{}, string]) string {
 				asyncCalls.Add(1)
-				return "async-output"
+				return goContext.GetKey() + "-output"
 			})
 			return result.Wait()
 		},
@@ -201,11 +253,10 @@ func TestFlowResumesSignalInsideAsyncResult_BitsUT(t *testing.T) {
 	infrastructure := NewInMemoryInfrastructure[struct{}, string]()
 	var asyncCalls atomic.Int64
 	target := Flow[struct{}, string]{
-		Handler: func(runtime *Runtime[struct{}, string]) string {
-			return runtime.Go("async", func(runtime *Runtime[struct{}, string]) string {
+		Handler: func(runtime *WorkflowContext[struct{}, string]) string {
+			return runtime.Go("async", func(runtime *GoContext[struct{}, string]) string {
 				asyncCalls.Add(1)
 				response := runtime.WaitFor[string, string](
-					runtime.Context,
 					"approval",
 					WaitForOption[string]{Request: "review"},
 				)
@@ -278,11 +329,15 @@ func TestRuntimeGoLoadsCompletedAsyncEventAsynchronously_BitsUT(t *testing.T) {
 		}
 	}()
 
-	runtime := newRuntime(context.Background(), infrastructure, struct{}{})
+	workflowContext := newWorkflowContext(
+		context.Background(),
+		infrastructure,
+		struct{}{},
+	)
 	returned := make(chan IResult[string], 1)
 	var handlerCalls atomic.Int64
 	go func() {
-		returned <- runtime.Go("async", func(*Runtime[struct{}, string]) string {
+		returned <- workflowContext.Go("async", func(*GoContext[struct{}, string]) string {
 			handlerCalls.Add(1)
 			return "new-output"
 		})
@@ -314,11 +369,10 @@ func TestFlowFailsWhenStepReturnsError_BitsUT(t *testing.T) {
 	stepErr := errors.New("step failed")
 	infrastructure := NewInMemoryInfrastructure[struct{}, struct{}]()
 	target := Flow[struct{}, struct{}]{
-		Handler: func(runtime *Runtime[struct{}, struct{}]) struct{} {
+		Handler: func(runtime *WorkflowContext[struct{}, struct{}]) struct{} {
 			return runtime.Step(
-				runtime.Context,
 				"failing-step",
-				func(StepContext[struct{}]) (struct{}, error) {
+				func(StepContext[struct{}, struct{}]) (struct{}, error) {
 					return struct{}{}, stepErr
 				},
 			)
@@ -348,7 +402,7 @@ func TestFlowFailsWhenStepReturnsError_BitsUT(t *testing.T) {
 func TestFlowFailsWhenHandlerPanicsWithNonError_BitsUT(t *testing.T) {
 	infrastructure := NewInMemoryInfrastructure[struct{}, string]()
 	target := Flow[struct{}, string]{
-		Handler: func(*Runtime[struct{}, string]) string {
+		Handler: func(*WorkflowContext[struct{}, string]) string {
 			panic("boom")
 		},
 	}
@@ -366,7 +420,7 @@ func TestFlowFailsWhenHandlerPanicsWithNonError_BitsUT(t *testing.T) {
 	}
 }
 
-func TestFlowExecutesNestedParallelWorkflowAcrossHumanResumes_BitsUT(t *testing.T) {
+func TestFlowExecutesParallelWorkflowAcrossHumanResumes_BitsUT(t *testing.T) {
 	infrastructure := NewInMemoryInfrastructure[struct{}, string]()
 	var handlerCalls atomic.Int64
 	var initialAutoCalls atomic.Int64
@@ -377,16 +431,15 @@ func TestFlowExecutesNestedParallelWorkflowAcrossHumanResumes_BitsUT(t *testing.
 	var nestedRightCalls atomic.Int64
 
 	target := Flow[struct{}, string]{
-		Handler: func(flowRuntime *Runtime[struct{}, string]) string {
+		Handler: func(flowRuntime *WorkflowContext[struct{}, string]) string {
 			handlerCalls.Add(1)
 
 			initialAuto := flowRuntime.Go(
 				"initial-auto-branch",
-				func(branchRuntime *Runtime[struct{}, string]) string {
+				func(branchRuntime *GoContext[struct{}, string]) string {
 					return branchRuntime.Step(
-						branchRuntime.Context,
 						"initial-auto-task",
-						func(StepContext[struct{}]) (string, error) {
+						func(StepContext[struct{}, string]) (string, error) {
 							initialAutoCalls.Add(1)
 							return "initial-auto", nil
 						},
@@ -394,15 +447,13 @@ func TestFlowExecutesNestedParallelWorkflowAcrossHumanResumes_BitsUT(t *testing.
 				},
 			).Wait()
 			firstReview := flowRuntime.WaitFor[string, string](
-				flowRuntime.Context,
 				"first-review",
 				WaitForOption[string]{Request: initialAuto},
 			)
 
 			postFirstJoin := flowRuntime.Step(
-				flowRuntime.Context,
 				"post-first-join",
-				func(StepContext[struct{}]) (string, error) {
+				func(StepContext[struct{}, string]) (string, error) {
 					postFirstJoinCalls.Add(1)
 					return firstReview + "-joined", nil
 				},
@@ -410,55 +461,40 @@ func TestFlowExecutesNestedParallelWorkflowAcrossHumanResumes_BitsUT(t *testing.
 
 			lowerPath := flowRuntime.Go(
 				"lower-branch",
-				func(branchRuntime *Runtime[struct{}, string]) string {
+				func(branchRuntime *GoContext[struct{}, string]) string {
 					lowerEntry := branchRuntime.Step(
-						branchRuntime.Context,
 						"lower-entry-task",
-						func(StepContext[struct{}]) (string, error) {
+						func(StepContext[struct{}, string]) (string, error) {
 							lowerEntryCalls.Add(1)
 							return "lower-entry", nil
 						},
 					)
-					nestedLeft := branchRuntime.Go(
-						"nested-left-branch",
-						func(nestedRuntime *Runtime[struct{}, string]) string {
-							return nestedRuntime.Step(
-								nestedRuntime.Context,
-								"nested-left-task",
-								func(StepContext[struct{}]) (string, error) {
-									nestedLeftCalls.Add(1)
-									return "nested-left", nil
-								},
-							)
+					nestedLeft := branchRuntime.Step(
+						"nested-left-task",
+						func(StepContext[struct{}, string]) (string, error) {
+							nestedLeftCalls.Add(1)
+							return "nested-left", nil
 						},
 					)
-					nestedRight := branchRuntime.Go(
-						"nested-right-branch",
-						func(nestedRuntime *Runtime[struct{}, string]) string {
-							return nestedRuntime.Step(
-								nestedRuntime.Context,
-								"nested-right-task",
-								func(StepContext[struct{}]) (string, error) {
-									nestedRightCalls.Add(1)
-									return "nested-right", nil
-								},
-							)
+					nestedRight := branchRuntime.Step(
+						"nested-right-task",
+						func(StepContext[struct{}, string]) (string, error) {
+							nestedRightCalls.Add(1)
+							return "nested-right", nil
 						},
 					)
-					return lowerEntry + "+" + nestedLeft.Wait() + "+" + nestedRight.Wait()
+					return lowerEntry + "+" + nestedLeft + "+" + nestedRight
 				},
 			)
 			upperTask := flowRuntime.Step(
-				flowRuntime.Context,
 				"upper-task",
-				func(StepContext[struct{}]) (string, error) {
+				func(StepContext[struct{}, string]) (string, error) {
 					upperTaskCalls.Add(1)
 					return postFirstJoin + "-upper", nil
 				},
 			)
 			lowerResult := lowerPath.Wait()
 			secondReview := flowRuntime.WaitFor[string, string](
-				flowRuntime.Context,
 				"second-review",
 				WaitForOption[string]{Request: upperTask + "|" + lowerResult},
 			)
@@ -557,9 +593,7 @@ func TestFlowExecutesNestedParallelWorkflowAcrossHumanResumes_BitsUT(t *testing.
 		"post-first-join",
 		"lower-branch",
 		"lower-entry-task",
-		"nested-left-branch",
 		"nested-left-task",
-		"nested-right-branch",
 		"nested-right-task",
 		"upper-task",
 		"second-review",

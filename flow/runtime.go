@@ -12,18 +12,108 @@ import (
 	"github.com/google/uuid"
 )
 
-type StepContext[Input any] struct {
+type StepContext[Input any, Output any] struct {
 	context.Context
-	name  string
-	input Input
+	key            string
+	lease          *ExecutionLease
+	infrastructure Infrastructure[Input, Output]
+	input          Input
+	events         map[string]Event
+	lock           *sync.Mutex
 }
 
-func (ct StepContext[Input]) GetName() string {
-	return ct.name
+func (ctx StepContext[Input, Output]) GetKey() string {
+	return ctx.key
 }
 
-type StepOption[Input any, Result any] struct {
-	Handler func(ctx StepContext[Input]) (Result, error)
+func (ctx StepContext[Input, Output]) GetInput() Input {
+	return ctx.input
+}
+
+func (ctx StepContext[Input, Output]) WaitFor[Request any, Response any](
+	key string,
+	option WaitForOption[Request],
+) Response {
+	return ctx.waitFor[Request, Response](key, option)
+}
+
+func (ctx StepContext[Input, Output]) Sleep(key string, duration time.Duration) {
+	ctx.sleep(key, duration)
+}
+
+func (ctx StepContext[Input, Output]) SleepUntil(key string, until time.Time) {
+	ctx.sleepUntil(key, until)
+}
+
+func (ctx StepContext[Input, Output]) Now(key string) time.Time {
+	return ctx.now(key)
+}
+
+func (ctx StepContext[Input, Output]) UUID(key string) string {
+	return ctx.uuid(key)
+}
+
+type GoContext[Input any, Output any] struct {
+	StepContext[Input, Output]
+}
+
+func (ctx *GoContext[Input, Output]) Step[T any](
+	key string,
+	handler func(ctx StepContext[Input, Output]) (T, error),
+) T {
+	return ctx.step(key, handler)
+}
+
+type WorkflowContext[Input any, Output any] struct {
+	GoContext[Input, Output]
+}
+
+func (ctx *WorkflowContext[Input, Output]) Go[T any](
+	key string,
+	handler func(ctx *GoContext[Input, Output]) T,
+) IResult[T] {
+	return ctx.goResult(key, handler)
+}
+
+func newStepContext[Input any, Output any](
+	ctx context.Context,
+	key string,
+	infrastructure Infrastructure[Input, Output],
+	input Input,
+) StepContext[Input, Output] {
+	return StepContext[Input, Output]{
+		Context:        ctx,
+		key:            key,
+		infrastructure: infrastructure,
+		input:          input,
+		events:         make(map[string]Event),
+		lock:           &sync.Mutex{},
+	}
+}
+
+func newGoContext[Input any, Output any](
+	ctx context.Context,
+	key string,
+	infrastructure Infrastructure[Input, Output],
+	input Input,
+) *GoContext[Input, Output] {
+	return &GoContext[Input, Output]{
+		StepContext: newStepContext(ctx, key, infrastructure, input),
+	}
+}
+
+func newWorkflowContext[Input any, Output any](
+	ctx context.Context,
+	infrastructure Infrastructure[Input, Output],
+	input Input,
+) *WorkflowContext[Input, Output] {
+	return &WorkflowContext[Input, Output]{
+		GoContext: *newGoContext(ctx, "", infrastructure, input),
+	}
+}
+
+type StepOption[Input any, Output any, Result any] struct {
+	Handler func(ctx StepContext[Input, Output]) (Result, error)
 }
 
 type WaitForOption[Request any] struct {
@@ -35,30 +125,22 @@ type comparableResultEvent interface {
 	comparable
 }
 
-type Runtime[Input any, Output any] struct {
-	context.Context
-	infrastructure Infrastructure[Input, Output]
-	input          Input
-	events         map[string]Event
-	lock           sync.Mutex
-}
-
-func (runtime *Runtime[Input, Output]) setState(output Output, status FlowStatus, errors []string) {
-	if err := runtime.infrastructure.SetState(runtime.Context, State[Input, Output]{
-		Input:  runtime.input,
+func (ctx *WorkflowContext[Input, Output]) setState(output Output, status FlowStatus, errors []string) {
+	if err := ctx.infrastructure.SetState(ctx.Context, State[Input, Output]{
+		Input:  ctx.input,
 		Output: output,
 		Status: status,
 		Errors: errors,
 	}); err != nil {
-		runtime.infrastructure.OnError(err)
+		ctx.infrastructure.OnError(err)
 	}
 }
 
-func (runtime *Runtime[Input, Output]) run(handler func(ctx *Runtime[Input, Output]) Output, signal Signal) {
+func (ctx *WorkflowContext[Input, Output]) run(handler func(ctx *WorkflowContext[Input, Output]) Output, signal Signal) {
 	if signal != nil {
-		event, err := runtime.infrastructure.GetEvent(runtime.Context, signal.GetKey())
+		event, err := ctx.infrastructure.GetEvent(ctx.Context, signal.GetKey())
 		if err != nil {
-			runtime.infrastructure.OnError(err)
+			ctx.infrastructure.OnError(err)
 			return
 		}
 		if event == nil {
@@ -70,56 +152,54 @@ func (runtime *Runtime[Input, Output]) run(handler func(ctx *Runtime[Input, Outp
 		}
 		signalEvent, ok := event.(Signal)
 		if !ok {
-			runtime.infrastructure.OnError(
+			ctx.infrastructure.OnError(
 				NewSystemError(event, fmt.Errorf("event %s is not a signal", event.GetKey())),
 			)
 			return
 		}
 		if err := signalEvent.ResolveSignal(signal); err != nil {
-			runtime.infrastructure.OnError(err)
+			ctx.infrastructure.OnError(err)
 			return
 		}
-		newEvent, err := runtime.infrastructure.UpdateEvent(runtime.Context, signalEvent)
+		newEvent, err := ctx.infrastructure.UpdateEvent(ctx.Context, signalEvent)
 		if err != nil {
-			runtime.infrastructure.OnError(err)
+			ctx.infrastructure.OnError(err)
 			return
 		}
 		if newEvent == nil {
 			// 事件冲突，忽略
 			return
 		}
-		runtime.lock.Lock()
-		runtime.events[newEvent.GetKey()] = newEvent
-		runtime.lock.Unlock()
+		ctx.lock.Lock()
+		ctx.events[newEvent.GetKey()] = newEvent
+		ctx.lock.Unlock()
 	}
 
 	result := run(func() Output {
-		return handler(runtime)
+		return handler(ctx)
 	})
 
 	if err := result.err; err != nil {
 		if _, ok := err.(*ConflictError); ok {
 			return
 		}
-		runtime.infrastructure.OnError(err)
-		runtime.setState(result.value, FlowStatusFailed, []string{err.Error()})
+		ctx.infrastructure.OnError(err)
+		ctx.setState(result.value, FlowStatusFailed, []string{err.Error()})
 		return
 	}
 	if signal := result.signal; signal != nil {
 		return
 	}
-	runtime.setState(result.value, FlowStatusCompleted, nil)
+	ctx.setState(result.value, FlowStatusCompleted, nil)
 }
 
-func (runtime *Runtime[Input, Output]) GetInput() Input {
-	return runtime.input
-}
-
-func (runtime *Runtime[Input, Output]) Go[T any](key string, handler func(ctx *Runtime[Input, Output]) T) IResult[T] {
+func (ctx *WorkflowContext[Input, Output]) goResult[T any](
+	key string,
+	handler func(*GoContext[Input, Output]) T,
+) IResult[T] {
 	return newWaitedResult(func() *fixedResult[T] {
 		return run(func() T {
-			return runtime.executeResultEvent(
-				runtime.Context,
+			return ctx.executeResultEvent(
 				&AsyncEvent{
 					Key:       key,
 					StartedAt: time.Now(),
@@ -127,7 +207,13 @@ func (runtime *Runtime[Input, Output]) Go[T any](key string, handler func(ctx *R
 					Version:   0,
 				},
 				func() (T, error) {
-					return handler(runtime), nil
+					goContext := newGoContext(
+						ctx.Context,
+						key,
+						ctx.infrastructure,
+						ctx.input,
+					)
+					return handler(goContext), nil
 				},
 				nil,
 			)
@@ -135,12 +221,12 @@ func (runtime *Runtime[Input, Output]) Go[T any](key string, handler func(ctx *R
 	})
 }
 
-func (runtime *Runtime[Input, Output]) WaitFor[Request any, Response any](ctx context.Context, key string, option WaitForOption[Request]) Response {
-	waitForSignalEvent := runtime.getEvent[*WaitForSignalEvent](ctx, key)
+func (ctx StepContext[Input, Output]) waitFor[Request any, Response any](key string, option WaitForOption[Request]) Response {
+	waitForSignalEvent := ctx.getEvent[*WaitForSignalEvent](key)
 	if waitForSignalEvent != nil {
 		switch waitForSignalEvent.Status {
 		case FlowStatusCompleted:
-			return runtime.unmarshal[Response](waitForSignalEvent.Response, waitForSignalEvent)
+			return ctx.unmarshal[Response](waitForSignalEvent.Response, waitForSignalEvent)
 		case FlowStatusFailed:
 			panic(NewLegacyBizError(waitForSignalEvent, fmt.Errorf("wait for signal %s failed", key)))
 		case FlowStatusRunning:
@@ -157,27 +243,27 @@ func (runtime *Runtime[Input, Output]) WaitFor[Request any, Response any](ctx co
 		StartedAt: time.Now(),
 		Version:   0,
 	}
-	waitForSignalEvent.Request = runtime.marshal(option.Request, waitForSignalEvent)
-	waitForSignalEvent = runtime.addEvent(ctx, waitForSignalEvent)
+	waitForSignalEvent.Request = ctx.marshal(option.Request, waitForSignalEvent)
+	waitForSignalEvent = ctx.addEvent(waitForSignalEvent)
 	panic(waitForSignalEvent)
 }
 
-func (runtime *Runtime[Input, Output]) Now(ctx context.Context, key string) time.Time {
-	return runtime.checkpoint(ctx, key, func(now time.Time) time.Time {
+func (ctx StepContext[Input, Output]) now(key string) time.Time {
+	return ctx.checkpoint(key, func(now time.Time) time.Time {
 		return now
 	})
 }
 
-func (runtime *Runtime[Input, Output]) UUID(ctx context.Context, key string) string {
-	return runtime.checkpoint(ctx, key, func(time.Time) string {
+func (ctx StepContext[Input, Output]) uuid(key string) string {
+	return ctx.checkpoint(key, func(time.Time) string {
 		return uuid.NewString()
 	})
 }
 
-func (runtime *Runtime[Input, Output]) checkpoint[T any](ctx context.Context, key string, generate func(time.Time) T) T {
-	checkpointEvent := runtime.getEvent[*CheckpointEvent](ctx, key)
+func (ctx StepContext[Input, Output]) checkpoint[T any](key string, generate func(time.Time) T) T {
+	checkpointEvent := ctx.getEvent[*CheckpointEvent](key)
 	if checkpointEvent != nil {
-		return runtime.unmarshal[T](checkpointEvent.GetResult(), checkpointEvent)
+		return ctx.unmarshal[T](checkpointEvent.GetResult(), checkpointEvent)
 	}
 
 	now := time.Now()
@@ -189,48 +275,47 @@ func (runtime *Runtime[Input, Output]) checkpoint[T any](ctx context.Context, ke
 		Status:    FlowStatusCompleted,
 		Version:   0,
 	}
-	checkpointEvent.SetResult(runtime.marshal(value, checkpointEvent))
-	runtime.addEvent(ctx, checkpointEvent)
+	checkpointEvent.SetResult(ctx.marshal(value, checkpointEvent))
+	ctx.addEvent(checkpointEvent)
 	return value
 }
 
-func (runtime *Runtime[Input, Output]) executeResultEvent[T any, E comparableResultEvent](
-	ctx context.Context,
+func (ctx StepContext[Input, Output]) executeResultEvent[T any, E comparableResultEvent](
 	newEvent E,
 	handler func() (T, error),
 	wrapHandlerError func(Event, error) error,
 ) T {
-	event := runtime.getEvent[E](ctx, newEvent.GetKey())
+	event := ctx.getEvent[E](newEvent.GetKey())
 	var zero E
 	if event != zero {
 		switch event.GetStatus() {
 		case FlowStatusFailed:
 			panic(NewLegacyBizError(event, errors.New(event.GetError())))
 		case FlowStatusCompleted:
-			return runtime.unmarshal[T](event.GetResult(), event)
+			return ctx.unmarshal[T](event.GetResult(), event)
 		case FlowStatusRunning:
 			panic(NewConflictError(event))
 		case FlowStatusSuspended:
 			event.SetStatus(FlowStatusRunning)
-			event = runtime.updateEvent(ctx, event)
+			event = ctx.updateEvent(event)
 		default:
 			panic(NewSystemError(event, fmt.Errorf("unknown status %s", event.GetStatus())))
 		}
 	} else {
-		event = runtime.addEvent(ctx, newEvent)
+		event = ctx.addEvent(newEvent)
 	}
 
 	handleOutput := func(output *fixedResult[T], wrapError func(Event, error) error) T {
 		if output.err != nil {
 			event.SetError(output.err)
-			event = runtime.updateEvent(ctx, event)
+			event = ctx.updateEvent(event)
 			if wrapError != nil {
 				panic(wrapError(event, output.err))
 			}
 		}
 		if output.signal != nil {
 			event.SetStatus(FlowStatusSuspended)
-			event = runtime.updateEvent(ctx, event)
+			event = ctx.updateEvent(event)
 		}
 		return output.Wait()
 	}
@@ -244,17 +329,18 @@ func (runtime *Runtime[Input, Output]) executeResultEvent[T any, E comparableRes
 	}), wrapHandlerError)
 
 	return handleOutput(run(func() T {
-		event.SetResult(runtime.marshal(result, event))
+		event.SetResult(ctx.marshal(result, event))
 		event.SetStatus(FlowStatusCompleted)
-		event = runtime.updateEvent(ctx, event)
+		event = ctx.updateEvent(event)
 		return result
 	}), nil)
 }
 
-// Step handler should only perform one atomic side effect and must not call runtime APIs.
-func (runtime *Runtime[Input, Output]) Step[T any](ctx context.Context, key string, handler func(ctx StepContext[Input]) (T, error)) T {
-	return runtime.executeResultEvent(
-		ctx,
+func (ctx StepContext[Input, Output]) step[T any](
+	key string,
+	handler func(ctx StepContext[Input, Output]) (T, error),
+) T {
+	return ctx.executeResultEvent(
 		&StepResultEvent{
 			Key:       key,
 			StartedAt: time.Now(),
@@ -262,11 +348,9 @@ func (runtime *Runtime[Input, Output]) Step[T any](ctx context.Context, key stri
 			Version:   0,
 		},
 		func() (T, error) {
-			return handler(StepContext[Input]{
-				Context: ctx,
-				name:    key,
-				input:   runtime.input,
-			})
+			stepContext := ctx
+			stepContext.key = key
+			return handler(stepContext)
 		},
 		func(event Event, err error) error {
 			return NewBizError(event, err)
@@ -274,15 +358,15 @@ func (runtime *Runtime[Input, Output]) Step[T any](ctx context.Context, key stri
 	)
 }
 
-func (runtime *Runtime[Input, Output]) Sleep(ctx context.Context, key string, duration time.Duration) {
+func (ctx StepContext[Input, Output]) sleep(key string, duration time.Duration) {
 	until := time.Now().Add(duration)
-	runtime.SleepUntil(ctx, key, until)
+	ctx.sleepUntil(key, until)
 }
 
-func (runtime *Runtime[Input, Output]) SleepUntil(ctx context.Context, key string, until time.Time) {
-	sleepEvent := runtime.getEvent[*SleepSignalEvent](ctx, key)
+func (ctx StepContext[Input, Output]) sleepUntil(key string, until time.Time) {
+	sleepEvent := ctx.getEvent[*SleepSignalEvent](key)
 	if sleepEvent == nil {
-		sleepEvent = runtime.addEvent(ctx, &SleepSignalEvent{
+		sleepEvent = ctx.addEvent(&SleepSignalEvent{
 			Key:       key,
 			StartedAt: time.Now(),
 			Status:    FlowStatusSuspended,
@@ -295,14 +379,14 @@ func (runtime *Runtime[Input, Output]) SleepUntil(ctx context.Context, key strin
 		if sleepEvent.Status != FlowStatusCompleted {
 			sleepEvent.Status = FlowStatusCompleted
 			sleepEvent.EndedAt = time.Now()
-			runtime.updateEvent(ctx, sleepEvent)
+			ctx.updateEvent(sleepEvent)
 		}
 		return
 	}
 	panic(sleepEvent)
 }
 
-func (runtime *Runtime[Input, Output]) unmarshal[T any](result json.RawMessage, event Event) T {
+func (ctx StepContext[Input, Output]) unmarshal[T any](result json.RawMessage, event Event) T {
 	var t T
 	if err := json.Unmarshal(result, &t); err != nil {
 		panic(NewUnMarshalError(event, err))
@@ -310,7 +394,7 @@ func (runtime *Runtime[Input, Output]) unmarshal[T any](result json.RawMessage, 
 	return t
 }
 
-func (runtime *Runtime[Input, Output]) marshal(data any, event Event) json.RawMessage {
+func (ctx StepContext[Input, Output]) marshal(data any, event Event) json.RawMessage {
 	result, err := json.Marshal(data)
 	if err != nil {
 		panic(NewMarshalError(event, err))
@@ -318,7 +402,7 @@ func (runtime *Runtime[Input, Output]) marshal(data any, event Event) json.RawMe
 	return json.RawMessage(result)
 }
 
-func (runtime *Runtime[Input, Output]) convertEvent[T Event](event Event) T {
+func (ctx StepContext[Input, Output]) convertEvent[T Event](event Event) T {
 	if evt, ok := event.(T); ok {
 		return evt
 	} else {
@@ -326,11 +410,14 @@ func (runtime *Runtime[Input, Output]) convertEvent[T Event](event Event) T {
 	}
 }
 
-func (runtime *Runtime[Input, Output]) getEvent[T Event](ctx context.Context, key string) T {
-	if evt, exist := runtime.events[key]; exist {
-		return runtime.convertEvent[T](evt)
+func (ctx StepContext[Input, Output]) getEvent[T Event](key string) T {
+	ctx.lock.Lock()
+	cached, exists := ctx.events[key]
+	ctx.lock.Unlock()
+	if exists {
+		return ctx.convertEvent[T](cached)
 	}
-	event, err := runtime.infrastructure.GetEvent(ctx, key)
+	event, err := ctx.infrastructure.GetEvent(ctx.Context, key)
 	if err != nil {
 		panic(NewInfrastructureError(nil, err, InfrastructureMethodGetEvent))
 	}
@@ -338,11 +425,11 @@ func (runtime *Runtime[Input, Output]) getEvent[T Event](ctx context.Context, ke
 		var t T
 		return t
 	}
-	return runtime.convertEvent[T](event)
+	return ctx.convertEvent[T](event)
 }
 
-func (runtime *Runtime[Input, Output]) addEvent[T Event](ctx context.Context, event T) T {
-	result, err := runtime.infrastructure.AddEvent(ctx, event)
+func (ctx StepContext[Input, Output]) addEvent[T Event](event T) T {
+	result, err := ctx.infrastructure.AddEvent(ctx.Context, event)
 	if err != nil {
 		panic(NewInfrastructureError(event, err, InfrastructureMethodAddEvent))
 	}
@@ -356,8 +443,8 @@ func (runtime *Runtime[Input, Output]) addEvent[T Event](ctx context.Context, ev
 	}
 }
 
-func (runtime *Runtime[Input, Output]) updateEvent[T Event](ctx context.Context, event T) T {
-	result, err := runtime.infrastructure.UpdateEvent(ctx, event)
+func (ctx StepContext[Input, Output]) updateEvent[T Event](event T) T {
+	result, err := ctx.infrastructure.UpdateEvent(ctx.Context, event)
 	if err != nil {
 		panic(NewInfrastructureError(event, err, InfrastructureMethodUpdateEvent))
 	}
@@ -368,15 +455,6 @@ func (runtime *Runtime[Input, Output]) updateEvent[T Event](ctx context.Context,
 		return evt
 	} else {
 		panic(NewSystemError(event, fmt.Errorf("event %s is %s, not %s", result, event.GetEventType(), reflect.TypeOf((*T)(nil)).Elem())))
-	}
-}
-
-func newRuntime[Input any, Output any](ctx context.Context, infrastructure Infrastructure[Input, Output], input Input) *Runtime[Input, Output] {
-	return &Runtime[Input, Output]{
-		Context:        ctx,
-		infrastructure: infrastructure,
-		input:          input,
-		events:         make(map[string]Event),
 	}
 }
 
