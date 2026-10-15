@@ -1,6 +1,8 @@
 package workflow
 
-import "context"
+import (
+	"context"
+)
 
 type FlowStatus string
 
@@ -33,6 +35,13 @@ type State[Input any, Output any] struct {
 // 框架本身专注于在给定 key 下保证确定性执行、回放、租约和事件一致性。
 type Infrastructure interface {
 	LeaseInfrastructure
+	// Suspend 持久化一个信号事件，并按信号 key 幂等：
+	// 同 key 同类型已存在时保留既有事件，不覆盖；同 key 类型冲突返回 error。
+	// 同时让该信号可被外部调度器发现与投递，具体投递机制由实现决定。
+	Suspend(ctx context.Context, signal Signal) error
+	// Transaction 提供一个事务边界：handler 内的所有写入要么一起提交，要么一起回滚。
+	// handler 返回非 nil error 即回滚；写入必须对 handler 自身可见（read-your-writes）。
+	Transaction(ctx context.Context, handler func(api Infrastructure) error) error
 	AddEvent(ctx context.Context, event Event) (Event, error)
 	GetEvent(ctx context.Context, key string) (Event, error)
 	UpdateEvent(ctx context.Context, event Event) (Event, error)

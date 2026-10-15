@@ -90,10 +90,11 @@ func (ctx ActionContext) waitFor[Request any, Response any](
 			return ctx.unmarshal[Response](waitForSignalEvent.Response, waitForSignalEvent)
 		case FlowStatusFailed:
 			panic(NewLegacyBizError(waitForSignalEvent, fmt.Errorf("wait for signal %s failed", key)))
-		case FlowStatusRunning:
-			panic(NewConflictError(waitForSignalEvent))
-		case FlowStatusSuspended:
-			panic(NewConflictError(waitForSignalEvent))
+		case FlowStatusRunning, FlowStatusSuspended:
+			// 信号尚未被外部解决：重新以挂起信号结束本次驱动，由 Lease 在同一事务内
+			// 幂等重写信号并释放租约。绝不能以 ConflictError 结束，否则会被上层
+			// 持久化为 FAILED，导致重复驱动永久打坏流程。
+			panic(waitForSignalEvent)
 		default:
 			panic(NewSystemError(waitForSignalEvent, fmt.Errorf("unknown status %s", waitForSignalEvent.Status)))
 		}
@@ -105,7 +106,8 @@ func (ctx ActionContext) waitFor[Request any, Response any](
 		Version:   0,
 	}
 	waitForSignalEvent.Request = ctx.marshal(option.Request, waitForSignalEvent)
-	waitForSignalEvent = ctx.addEvent(waitForSignalEvent)
+	// 信号不在挂起点落库，由 Lease 在挂起提交事务内持久化，
+	// 保证信号对外可见不早于执行单元可恢复。
 	panic(waitForSignalEvent)
 }
 
@@ -149,7 +151,20 @@ func (ctx ActionContext) sleep(key string, duration time.Duration) {
 func (ctx ActionContext) sleepUntil(key string, until time.Time) {
 	sleepEvent := ctx.getEvent[*SleepSignalEvent](key)
 	if sleepEvent == nil {
-		sleepEvent = ctx.addEvent(&SleepSignalEvent{
+		if !time.Now().Before(until) {
+			// 首次执行且已到期：直接落库为 COMPLETED，重放时无需再计算。
+			ctx.addEvent(&SleepSignalEvent{
+				Key:       key,
+				StartedAt: time.Now(),
+				EndedAt:   time.Now(),
+				Status:    FlowStatusCompleted,
+				Version:   0,
+				Until:     until,
+			})
+			return
+		}
+		// 未到期：信号不在挂起点落库，由 Lease 在挂起提交事务内持久化。
+		panic(&SleepSignalEvent{
 			Key:       key,
 			StartedAt: time.Now(),
 			Status:    FlowStatusSuspended,
@@ -157,8 +172,7 @@ func (ctx ActionContext) sleepUntil(key string, until time.Time) {
 			Until:     until,
 		})
 	}
-	duration := time.Until(sleepEvent.Until)
-	if duration <= 0 {
+	if time.Until(sleepEvent.Until) <= 0 {
 		if sleepEvent.Status != FlowStatusCompleted {
 			sleepEvent.Status = FlowStatusCompleted
 			sleepEvent.EndedAt = time.Now()

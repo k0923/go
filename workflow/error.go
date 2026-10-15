@@ -139,6 +139,7 @@ const (
 	InfrastructureMethodAddEvent      InfrastructureMethod = "AddEvent"
 	InfrastructureMethodGetEvent      InfrastructureMethod = "GetEvent"
 	InfrastructureMethodUpdateEvent   InfrastructureMethod = "UpdateEvent"
+	InfrastructureMethodSuspend       InfrastructureMethod = "Suspend"
 	InfrastructureMethodResolveSignal InfrastructureMethod = "ResolveSignal"
 	InfrastructureMethodGetState      InfrastructureMethod = "GetState"
 	InfrastructureMethodSetState      InfrastructureMethod = "SetState"
