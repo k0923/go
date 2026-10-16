@@ -8,3 +8,6 @@
 flow-review/report.html
 flow-review/report.md
 tmp/
+*.db
+*.log
+*.out

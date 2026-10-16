@@ -1,0 +1,39 @@
+.scroll-thin { scrollbar-width: thin; scrollbar-color: rgb(51 65 85) transparent; }
+.scroll-thin::-webkit-scrollbar { width: 8px; height: 8px; }
+.scroll-thin::-webkit-scrollbar-thumb { background: rgb(51 65 85); border-radius: 8px; }
+
+.btn-primary, .btn-secondary, .btn-danger, .btn-ghost {
+  display: inline-flex; align-items: center; gap: .4rem; justify-content: center;
+  border-radius: .5rem; padding: .45rem .8rem; font-size: .8125rem; font-weight: 500;
+  transition: background-color .15s, color .15s, box-shadow .15s; white-space: nowrap;
+}
+.btn-primary { background: rgb(99 102 241); color: white; box-shadow: 0 4px 14px -4px rgb(99 102 241 / .6); }
+.btn-primary:hover { background: rgb(129 140 248); }
+.btn-primary:disabled { opacity: .5; cursor: not-allowed; }
+.btn-secondary { background: rgb(30 41 59); color: rgb(226 232 240); box-shadow: inset 0 0 0 1px rgb(255 255 255 / .06); }
+.btn-secondary:hover { background: rgb(51 65 85); }
+.btn-danger { background: rgb(244 63 94 / .1); color: rgb(253 164 175); box-shadow: inset 0 0 0 1px rgb(244 63 94 / .2); }
+.btn-danger:hover { background: rgb(244 63 94 / .2); }
+.btn-ghost { color: rgb(148 163 184); padding: .3rem .55rem; }
+.btn-ghost:hover { background: rgb(255 255 255 / .05); color: rgb(226 232 240); }
+
+.tab { padding: .85rem 0; color: rgb(148 163 184); border-bottom: 2px solid transparent; margin-bottom: -1px; transition: color .15s; }
+.tab:hover { color: rgb(226 232 240); }
+.tab-active { color: white; border-color: rgb(129 140 248); }
+
+.chip { display: inline-flex; align-items: center; gap: .35rem; border-radius: 9999px; padding: .15rem .6rem; font-size: .7rem; font-weight: 600; letter-spacing: .02em; }
+
+.json-key { color: rgb(165 180 252); }
+.json-str { color: rgb(134 239 172); }
+.json-num { color: rgb(253 186 116); }
+.json-bool { color: rgb(244 114 182); }
+.json-null { color: rgb(148 163 184); }
+
+.editor { tab-size: 2; }
+
+@keyframes drawer-in { from { transform: translateX(24px); opacity: 0 } to { transform: none; opacity: 1 } }
+.drawer-in { animation: drawer-in .18s ease-out; }
+@keyframes fade-up { from { transform: translateY(6px); opacity: 0 } to { transform: none; opacity: 1 } }
+.fade-up { animation: fade-up .2s ease-out; }
+@keyframes flash { 0% { background-color: rgb(99 102 241 / .18) } 100% { background-color: transparent } }
+.flash { animation: flash 1.2s ease-out; }

@@ -1,0 +1,155 @@
+<!doctype html>
+<html lang="zh-CN" class="h-full">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Workflow Debugger</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%236366f1'/%3E%3Cpath d='M9 11h14M9 16h9M9 21h11' stroke='white' stroke-width='2.5' stroke-linecap='round'/%3E%3C/svg%3E">
+  <script src="https://cdn.tailwindcss.com?plugins=forms"></script>
+  <script>
+    tailwind.config = {
+      theme: {
+        extend: {
+          fontFamily: {
+            sans: ['Inter', 'ui-sans-serif', 'system-ui', '-apple-system', 'PingFang SC', 'sans-serif'],
+            mono: ['JetBrains Mono', 'ui-monospace', 'SFMono-Regular', 'Menlo', 'monospace'],
+          },
+        },
+      },
+    }
+  </script>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="app.css">
+</head>
+<body class="h-full bg-slate-950 text-slate-200 font-sans antialiased">
+<div class="flex h-full">
+  <!-- Sidebar -->
+  <aside class="w-80 shrink-0 border-r border-white/5 bg-slate-900/60 flex flex-col">
+    <div class="px-5 pt-5 pb-4 border-b border-white/5">
+      <div class="flex items-center gap-3">
+        <div class="h-9 w-9 rounded-xl bg-gradient-to-br from-indigo-500 to-fuchsia-500 grid place-items-center shadow-lg shadow-indigo-500/20">
+          <svg class="h-5 w-5 text-white" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="6" cy="6" r="2.5"/><circle cx="18" cy="6" r="2.5"/><circle cx="12" cy="18" r="2.5"/><path d="M6 8.5v2a3 3 0 0 0 3 3h6a3 3 0 0 0 3-3v-2M12 13.5v2"/></svg>
+        </div>
+        <div>
+          <div class="font-semibold text-white leading-tight">Workflow Debugger</div>
+          <div class="text-xs text-slate-400 flex items-center gap-1.5 mt-0.5">
+            <span id="conn-dot" class="h-1.5 w-1.5 rounded-full bg-slate-500"></span>
+            <span id="conn-text">connecting…</span>
+          </div>
+        </div>
+      </div>
+      <div class="mt-4 relative">
+        <svg class="absolute left-3 top-2.5 h-4 w-4 text-slate-500" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>
+        <input id="search" type="search" placeholder="搜索 run / workflow"
+          class="w-full rounded-lg border-0 bg-slate-800/70 pl-9 pr-3 py-2 text-sm text-slate-200 placeholder:text-slate-500 ring-1 ring-white/5 focus:ring-2 focus:ring-indigo-500">
+      </div>
+      <div id="status-filter" class="mt-3 flex flex-wrap gap-1.5 text-xs"></div>
+    </div>
+    <div id="run-list" class="flex-1 overflow-y-auto scroll-thin p-3 space-y-4"></div>
+    <div class="px-5 py-3 border-t border-white/5 text-[11px] text-slate-500 leading-relaxed">
+      在代码中调用 <code class="font-mono text-slate-400">debugger.Run(ctx, wf, input, opts)</code> 接入
+    </div>
+  </aside>
+
+  <!-- Main -->
+  <main class="flex-1 min-w-0 flex flex-col">
+    <div id="empty" class="flex-1 grid place-items-center">
+      <div class="text-center max-w-md px-6">
+        <div class="mx-auto h-14 w-14 rounded-2xl bg-slate-800/80 ring-1 ring-white/5 grid place-items-center mb-5">
+          <svg class="h-7 w-7 text-indigo-400" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M4 6h16M4 12h10M4 18h7"/></svg>
+        </div>
+        <h2 class="text-lg font-semibold text-white">选择一个 Run 开始调试</h2>
+        <p class="mt-2 text-sm text-slate-400">每个 Run 拥有独立的记录、租约、通知与事件。一个 Server 可同时调试多个工作流。</p>
+        <pre class="mt-6 text-left text-xs font-mono bg-slate-900 ring-1 ring-white/5 rounded-xl p-4 text-slate-300 overflow-x-auto">result, err := debugger.Run(ctx, definition, input,
+    debugger.Options{RunID: "order-1"})</pre>
+      </div>
+    </div>
+
+    <div id="detail" class="hidden flex-1 min-h-0 flex flex-col">
+      <!-- Header -->
+      <header class="px-8 pt-6 pb-5 border-b border-white/5 bg-gradient-to-b from-slate-900/80 to-transparent">
+        <div class="flex items-start justify-between gap-6">
+          <div class="min-w-0">
+            <div class="flex items-center gap-3 flex-wrap">
+              <h1 id="d-title" class="text-xl font-semibold text-white truncate"></h1>
+              <span id="d-status"></span>
+              <span id="d-online"></span>
+            </div>
+            <div id="d-meta" class="mt-1.5 text-sm text-slate-400 flex flex-wrap gap-x-4 gap-y-1"></div>
+          </div>
+          <div class="flex items-center gap-2 shrink-0">
+            <button id="btn-redrive" class="btn-secondary" title="入队一个手动 WAKE，已接入的 worker 会重新 Drive">
+              <svg class="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12a9 9 0 1 1-2.64-6.36M21 4v5h-5"/></svg>
+              Re-drive
+            </button>
+            <button id="btn-delete" class="btn-danger" title="删除该 Run 的所有数据">
+              <svg class="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 7h16M10 11v6M14 11v6M6 7l1 13h10l1-13M9 7V4h6v3"/></svg>
+            </button>
+          </div>
+        </div>
+        <div class="mt-5 grid grid-cols-2 md:grid-cols-5 gap-3" id="d-stats"></div>
+        <div class="mt-4">
+          <div class="h-2 rounded-full bg-slate-800 overflow-hidden flex" id="d-bar"></div>
+        </div>
+        <div id="d-error" class="hidden mt-4 rounded-lg bg-rose-500/10 ring-1 ring-rose-500/20 px-4 py-3 text-sm text-rose-200 font-mono whitespace-pre-wrap break-all"></div>
+      </header>
+
+      <div class="flex-1 min-h-0 flex">
+        <!-- Center column -->
+        <section class="flex-1 min-w-0 flex flex-col">
+          <nav class="px-8 border-b border-white/5 flex gap-6 text-sm" id="tabs">
+            <button data-tab="steps" class="tab tab-active">步骤</button>
+            <button data-tab="events" class="tab">事件时间线 <span id="ev-count" class="ml-1 text-xs text-slate-500"></span></button>
+            <button data-tab="messages" class="tab">通知</button>
+            <button data-tab="io" class="tab">输入 / 输出</button>
+          </nav>
+          <div class="flex-1 overflow-y-auto scroll-thin px-8 py-6">
+            <div data-panel="steps" id="p-steps"></div>
+            <div data-panel="events" class="hidden">
+              <div class="flex items-center gap-2 mb-4 flex-wrap" id="ev-filter"></div>
+              <ol id="p-events" class="relative space-y-1"></ol>
+            </div>
+            <div data-panel="messages" class="hidden" id="p-messages"></div>
+            <div data-panel="io" class="hidden" id="p-io"></div>
+          </div>
+        </section>
+
+        <!-- Right: pending actions -->
+        <aside class="w-[400px] shrink-0 border-l border-white/5 bg-slate-900/40 flex flex-col">
+          <div class="px-6 py-4 border-b border-white/5 flex items-center justify-between">
+            <div class="font-medium text-white flex items-center gap-2">
+              <span class="relative flex h-2 w-2" id="wait-ping"></span>
+              等待中的信号
+            </div>
+            <span id="wait-count" class="text-xs text-slate-400"></span>
+          </div>
+          <div id="p-waits" class="flex-1 overflow-y-auto scroll-thin p-4 space-y-4"></div>
+        </aside>
+      </div>
+    </div>
+  </main>
+</div>
+
+<!-- Record drawer -->
+<div id="drawer" class="fixed inset-0 z-40 hidden">
+  <div class="absolute inset-0 bg-slate-950/70 backdrop-blur-sm" data-close></div>
+  <div class="absolute right-0 top-0 h-full w-[640px] max-w-full bg-slate-900 ring-1 ring-white/10 shadow-2xl flex flex-col drawer-in">
+    <div class="px-6 py-4 border-b border-white/5 flex items-center justify-between">
+      <div class="min-w-0">
+        <div class="text-xs text-slate-400" id="dr-kind"></div>
+        <div class="font-mono text-white truncate" id="dr-key"></div>
+      </div>
+      <button data-close class="p-2 rounded-lg hover:bg-white/5 text-slate-400">
+        <svg class="h-5 w-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M6 6l12 12M18 6 6 18"/></svg>
+      </button>
+    </div>
+    <div class="flex-1 overflow-y-auto scroll-thin p-6 space-y-5" id="dr-body"></div>
+  </div>
+</div>
+
+<div id="toasts" class="fixed bottom-5 right-5 z-50 space-y-2"></div>
+
+<script src="app.js"></script>
+</body>
+</html>
