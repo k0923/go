@@ -78,6 +78,11 @@ result, err := engine.Drive(ctx, definition, input)
 
 所有调用都遵循 Go 的 error 返回惯例。编排函数应在错误或挂起时立即返回。引擎另外登记框架 API 返回的错误和挂起点，避免忽略错误后误报成功；这个兜底不阻止错误后的业务代码继续执行。
 
+合并错误中的所有挂起点会保留在 Pending 中；同时存在真实错误时仍返回该错误，
+只有纯挂起结果才是 `Suspended` / nil。Action 的 FAILED 提交失败、提交结果未知或
+执行 context 取消时保持可重试；不能仅凭 `errors.As(err, *PermanentError)` 停止调度，
+应以 `Result.Status` 判断是否终止。panic 的原因即使含 Permanent，也仍作为代码故障处理。
+
 根 Workflow 的完成状态由本次驱动结果表达；内核不保存根输出或维护调度器的实例状态。外部系统负责状态和终止策略。已完成 Action、检查点和信号持久化回放。Record 是 CAS 快照，不是不可变事件日志。
 
 ## Action 接口与纯函数边界
@@ -97,6 +102,12 @@ output, err := ctx.Run("step", workflow.AsAction(fn), input)
 - IO Action：可以调用 HTTP、数据库、消息系统；必须响应标准 context 取消，并使用外部幂等机制。不得依赖 context 中的时间、随机数或 attempt 身份改变业务结果。
 - Action 不持有工作流状态，不捕获可变编排状态，不调用 Flow API。无状态客户端依赖可以通过具名方法接收器绑定。
 - 输出、输入及信号负载必须可 JSON 编解码。指针与可变对象不能在并行分支之间不加保护地共享。
+
+Action 成功输出在提交前先按 JSON 编码，再解码到一个全新的输出类型实例；
+首次执行和回放都向 Flow 返回该表示。`any` 中的数值按标准 JSON 解码为 `float64`，
+不会保留原始 `int` 类型，也不能保证大整数精度。需要精确数值时使用明确的整数 DTO、
+字符串或 DTO 中声明为 `json.Number` 的字段。自定义 MarshalJSON/UnmarshalJSON
+应保持确定性并能够往返；解码失败不会提交 COMPLETED。
 - 流程时间和 UUID 在 Flow 中通过 `Now(key)` / `UUID(key)` 检查点获取，再作为 Action input 传入。
 
 结果持久化之前发生故障，IO Action 可能重复执行。`ActionKey(ctx)` 在一个绑定实例内稳定，外部幂等键应组合为“实例标识 + ActionKey”，不要包含租约 Generation。引擎不承诺外部副作用 exactly-once。

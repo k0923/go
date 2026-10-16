@@ -1,12 +1,16 @@
 package condition
 
-import "fmt"
+import (
+	"fmt"
+
+	"github.com/k0923/go/condition/rule"
+)
 
 // Schema declares the fields a rule may reference and binds each of them to
 // an accessor on T. The same Schema serves two purposes:
 //
-//   - Check turns a Node into a *TypedNode, the backend-neutral form consumed
-//     by query translators (see the sqlquery and mongoquery packages);
+//   - Check validates a rule.Cond into a *Checked, the backend-neutral input
+//     of query translators (see the sqlquery and mongoquery packages);
 //   - Compile additionally builds an in-memory Condition[T] from it.
 //
 // Register every field before the first Check/Compile.
@@ -18,7 +22,7 @@ type Schema[T any] struct {
 // binding is an evaluated operand: only the member matching its kind is set
 // (plus length and quant for list kinds).
 type binding[T any] struct {
-	cond   Condition[T]
+	bl     Expr[T, bool]
 	num    Expr[T, float64]
 	str    Expr[T, string]
 	nums   Expr[T, []float64]
@@ -26,7 +30,7 @@ type binding[T any] struct {
 	length Expr[T, int]
 	// quant builds any/all/none with a predicate already checked against the
 	// element schema; it captures the element type E at registration time.
-	quant func(q quantifier, pred *TypedNode) Condition[T]
+	quant func(q quantifier, chk *Checked, pred rule.Cond) Condition[T]
 }
 
 // NewSchema returns an empty schema.
@@ -59,10 +63,10 @@ func (s *Schema[T]) Field(name string) (*FieldInfo, bool) {
 	return f, ok
 }
 
-// Bool registers a boolean field. It is usable directly as a condition.
+// Bool registers a boolean field.
 func (s *Schema[T]) Bool(name string, get func(T) bool) *Schema[T] {
 	mustGetter(name, get == nil)
-	return s.add(name, KindBool, nil, binding[T]{cond: CondFunc[T](func(v T) (bool, error) { return get(v), nil })})
+	return s.add(name, KindBool, nil, binding[T]{bl: Field(get)})
 }
 
 // String registers a string field.
@@ -85,8 +89,8 @@ func (s *Schema[T]) Number[N Number](name string, get func(T) N) *Schema[T] {
 	return s.add(name, KindNumber, nil, binding[T]{num: Field(func(v T) float64 { return float64(get(v)) })})
 }
 
-// Strings registers a string list field. Inside any/all/none the element is
-// referenced as {"field":"$"}.
+// Strings registers a string list field. Inside an array rule the element is
+// referenced as "$".
 func (s *Schema[T]) Strings(name string, get func(T) []string) *Schema[T] {
 	mustGetter(name, get == nil)
 	items := Field(get)
@@ -94,8 +98,8 @@ func (s *Schema[T]) Strings(name string, get func(T) []string) *Schema[T] {
 	return s.add(name, KindStrings, elem.fields, binding[T]{strs: items, length: Len(items), quant: quantOver(items, elem)})
 }
 
-// Numbers registers a number list field. Inside any/all/none the element is
-// referenced as {"field":"$"}.
+// Numbers registers a number list field. Inside an array rule the element is
+// referenced as "$".
 func (s *Schema[T]) Numbers(name string, get func(T) []float64) *Schema[T] {
 	mustGetter(name, get == nil)
 	items := Field(get)
@@ -104,7 +108,7 @@ func (s *Schema[T]) Numbers(name string, get func(T) []float64) *Schema[T] {
 }
 
 // List registers a list of objects whose fields are described by elem. It is
-// the operand of any/all/none and len. elem may be s itself for recursive
+// the x of array rules and of len. elem may be s itself for recursive
 // structures.
 func (s *Schema[T]) List[E any](name string, get func(T) []E, elem *Schema[E]) *Schema[T] {
 	mustGetter(name, get == nil)
@@ -115,174 +119,147 @@ func (s *Schema[T]) List[E any](name string, get func(T) []E, elem *Schema[E]) *
 	return s.add(name, KindObjects, elem.fields, binding[T]{length: Len(items), quant: quantOver(items, elem)})
 }
 
-func quantOver[T, E any](items Expr[T, []E], elem *Schema[E]) func(quantifier, *TypedNode) Condition[T] {
-	return func(q quantifier, pred *TypedNode) Condition[T] {
-		return newQuant(q, items, elem.build(pred).cond)
+func quantOver[T, E any](items Expr[T, []E], elem *Schema[E]) func(quantifier, *Checked, rule.Cond) Condition[T] {
+	return func(q quantifier, chk *Checked, pred rule.Cond) Condition[T] {
+		return newQuant(q, items, elem.cond(chk, pred))
 	}
 }
 
-// Check validates n and returns its typed form. All configuration errors are
+// Check validates c against the schema. All configuration errors are
 // reported here as *CompileError carrying the JSON path of the bad node.
-// The result is the input for query translators.
-func (s *Schema[T]) Check(n Node) (*TypedNode, error) {
-	t, err := check(s.fields, n, "$", 0)
+// The result is the input of Compile and of query translators.
+func (s *Schema[T]) Check(c rule.Cond) (*Checked, error) { return check(s.fields, c) }
+
+// CheckJSON is rule.Parse followed by Check.
+func (s *Schema[T]) CheckJSON(data []byte) (*Checked, error) {
+	c, err := rule.Parse(data)
 	if err != nil {
 		return nil, err
 	}
-	if t.Kind != KindBool {
-		return nil, errAt(t.Path, ErrTypeMismatch, "want bool, got %s", t.Kind)
-	}
-	return t, nil
+	return s.Check(c)
 }
 
-// CheckJSON is ParseNode followed by Check.
-func (s *Schema[T]) CheckJSON(data []byte) (*TypedNode, error) {
-	n, err := ParseNode(data)
+// Compile checks c and builds an executable in-memory condition.
+func (s *Schema[T]) Compile(c rule.Cond) (Condition[T], error) {
+	chk, err := s.Check(c)
 	if err != nil {
 		return nil, err
 	}
-	return s.Check(n)
+	return s.Build(chk), nil
 }
 
-// Compile checks n and builds an executable in-memory condition.
-func (s *Schema[T]) Compile(n Node) (Condition[T], error) {
-	t, err := s.Check(n)
-	if err != nil {
-		return nil, err
-	}
-	return s.build(t).cond, nil
-}
-
-// CompileJSON is ParseNode followed by Compile.
+// CompileJSON is rule.Parse followed by Compile.
 func (s *Schema[T]) CompileJSON(data []byte) (Condition[T], error) {
-	n, err := ParseNode(data)
+	c, err := rule.Parse(data)
 	if err != nil {
 		return nil, err
 	}
-	return s.Compile(n)
+	return s.Compile(c)
 }
 
-// build turns a node produced by Check against this schema into executable
-// operands. Check has already enforced every invariant relied on here.
-func (s *Schema[T]) build(t *TypedNode) binding[T] {
-	if t.Field != nil {
-		return s.bind[t.Field]
-	}
-	if t.IsLiteral() {
-		return literalBinding[T](t)
-	}
-	args := func() []binding[T] {
-		out := make([]binding[T], len(t.Args))
-		for i, a := range t.Args {
-			out[i] = s.build(a)
+// Build turns a rule checked against this schema into an executable
+// condition. It panics if chk was produced by a different schema.
+func (s *Schema[T]) Build(chk *Checked) Condition[T] {
+	return s.cond(chk, chk.Root())
+}
+
+// cond and expr turn checked nodes into executable operands. Check has
+// already enforced every invariant relied on here.
+func (s *Schema[T]) cond(chk *Checked, n rule.Cond) Condition[T] {
+	conds := func(items []rule.Cond) []Condition[T] {
+		out := make([]Condition[T], len(items))
+		for i, it := range items {
+			out[i] = s.cond(chk, it)
 		}
 		return out
 	}
-
-	switch op := t.Op; {
-	case op == OpAnd || op == OpOr:
-		vs := args()
-		conds := make([]Condition[T], len(vs))
-		for i, v := range vs {
-			conds[i] = v.cond
-		}
-		if op == OpAnd {
-			return binding[T]{cond: And(conds...)}
-		}
-		return binding[T]{cond: Or(conds...)}
-
-	case op == OpNot:
-		return binding[T]{cond: Not(s.build(t.Args[0]).cond)}
-
-	case op == OpEq || op == OpNe:
-		vs, neg := args(), op == OpNe
-		switch t.Args[0].Kind {
-		case KindNumber:
-			return binding[T]{cond: newEq(neg, vs[0].num, vs[1].num)}
-		case KindString:
-			return binding[T]{cond: newEq(neg, vs[0].str, vs[1].str)}
+	switch n := n.(type) {
+	case *rule.And:
+		return And(conds(n.Items)...)
+	case *rule.Or:
+		return Or(conds(n.Items)...)
+	case *rule.Not:
+		return Not(s.cond(chk, n.X))
+	case *rule.Quant:
+		return s.field(chk, n.X).quant(quantOf[n.Op], chk, n.Y)
+	case *rule.Compare:
+		x, y := s.expr(chk, n.X), s.expr(chk, n.Y)
+		switch n.Type {
+		case rule.TypeBoolean:
+			return newEq(n.Op == rule.OpNe, x.bl, y.bl)
+		case rule.TypeNumber:
+			return compare(n.Op, x.num, y.num, y.nums, n.Y)
 		default:
-			return binding[T]{cond: newEq(neg, condAsExpr(vs[0].cond), condAsExpr(vs[1].cond))}
+			if op, ok := strOf[n.Op]; ok {
+				return newStr(op, x.str, y.str)
+			}
+			return compare(n.Op, x.str, y.str, y.strs, n.Y)
 		}
+	}
+	panic(fmt.Sprintf("condition: unchecked node %T", n))
+}
 
-	case op.isOrder():
-		vs := args()
-		if t.Args[0].Kind == KindNumber {
-			return binding[T]{cond: newOrd(ordOf[op], vs[0].num, vs[1].num)}
+// compare builds eq/ne/order/in/nin for a scalar type V.
+func compare[T any, V ordered](op rule.Op, x, y Expr[T, V], list Expr[T, []V], yNode rule.Expr) Condition[T] {
+	switch op {
+	case rule.OpEq, rule.OpNe:
+		return newEq(op == rule.OpNe, x, y)
+	case rule.OpIn, rule.OpNin:
+		neg := op == rule.OpNin
+		if _, isField := yNode.(*rule.Field); !isField {
+			vals, _ := list.Eval(*new(T))
+			return newIn(neg, x, vals)
 		}
-		return binding[T]{cond: newOrd(ordOf[op], vs[0].str, vs[1].str)}
-
-	case op.isString():
-		vs := args()
-		return binding[T]{cond: newStr(strOf[op], vs[0].str, vs[1].str)}
-
-	case op == OpIn || op == OpNotIn:
-		vs, neg := args(), op == OpNotIn
-		list := t.Args[1]
-		switch {
-		case list.Kind == KindEmptyList:
-			return binding[T]{cond: constCond[T](neg)}
-		case t.Args[0].Kind == KindNumber:
-			return binding[T]{cond: inBinding(neg, vs[0].num, vs[1].nums, list.Lit)}
-		default:
-			return binding[T]{cond: inBinding(neg, vs[0].str, vs[1].strs, list.Lit)}
+		if neg {
+			return NotInList(x, list)
 		}
+		return InList(x, list)
+	}
+	return newOrd(ordOf[op], x, y)
+}
 
-	case op.isQuant():
-		return binding[T]{cond: s.build(t.Args[0]).quant(quantOf[op], t.Args[1])}
+// ordered is the set of scalar operand types that support every
+// comparison operator.
+type ordered interface{ ~float64 | ~string }
 
-	case op.isArith():
-		vs := args()
-		return binding[T]{num: newArith(arithOf[op], vs[0].num, vs[1].num)}
+func (s *Schema[T]) field(chk *Checked, f *rule.Field) binding[T] {
+	b, ok := s.bind[chk.Field(f)]
+	if !ok {
+		panic("condition: rule was checked against a different schema")
+	}
+	return b
+}
 
-	default: // OpLen
-		if t.Args[0].Kind == KindEmptyList {
-			return binding[T]{num: Const[T](0.0)}
-		}
-		l := s.build(t.Args[0]).length
-		if c, ok := l.(constExpr[T, int]); ok {
-			return binding[T]{num: Const[T](float64(c.v))}
-		}
+func (s *Schema[T]) expr(chk *Checked, e rule.Expr) binding[T] {
+	switch e := e.(type) {
+	case *rule.Field:
+		return s.field(chk, e)
+	case *rule.Number:
+		return binding[T]{num: Const[T](e.V)}
+	case *rule.String:
+		return binding[T]{str: Const[T](e.V)}
+	case *rule.Bool:
+		return binding[T]{bl: Const[T](e.V)}
+	case *rule.Numbers:
+		return binding[T]{nums: Const[T](e.V)}
+	case *rule.Strings:
+		return binding[T]{strs: Const[T](e.V)}
+	case *rule.Arith:
+		return binding[T]{num: newArith(arithOf[e.Op], s.expr(chk, e.X).num, s.expr(chk, e.Y).num)}
+	case *rule.Len:
+		l := s.field(chk, e.X).length
 		return binding[T]{num: ExprFunc[T, float64](func(v T) (float64, error) {
 			n, err := l.Eval(v)
 			return float64(n), err
 		})}
 	}
+	panic(fmt.Sprintf("condition: unchecked node %T", e))
 }
 
-func literalBinding[T any](t *TypedNode) binding[T] {
-	l := t.Lit
-	switch l.Kind() {
-	case KindBool:
-		return binding[T]{cond: constCond[T](l.Bool())}
-	case KindNumber:
-		return binding[T]{num: Const[T](l.Number())}
-	case KindString:
-		return binding[T]{str: Const[T](l.String())}
-	case KindNumbers:
-		return binding[T]{nums: Const[T](l.Numbers()), length: Const[T](l.Len())}
-	case KindStrings:
-		return binding[T]{strs: Const[T](l.Strings()), length: Const[T](l.Len())}
-	}
-	return binding[T]{length: Const[T](0)} // KindEmptyList
-}
-
-// condAsExpr lets a condition take part in eq/ne as a bool operand.
-func condAsExpr[T any](c Condition[T]) Expr[T, bool] {
-	if k, ok := c.(constCond[T]); ok {
-		return Const[T](bool(k))
-	}
-	return ExprFunc[T, bool](c.Match)
-}
-
-// inBinding uses the hashed In for literal lists and InList otherwise.
-func inBinding[T any, V comparable](neg bool, x Expr[T, V], list Expr[T, []V], lit *Literal) Condition[T] {
-	if lit != nil {
-		vals, _ := list.Eval(*new(T))
-		return newIn(neg, x, vals)
-	}
-	if neg {
-		return NotInList(x, list)
-	}
-	return InList(x, list)
-}
+// Explicit mappings from rule operators to the evaluator's internal enums.
+var (
+	ordOf   = map[rule.Op]ordOp{rule.OpLt: opLt, rule.OpLte: opLe, rule.OpGt: opGt, rule.OpGte: opGe}
+	strOf   = map[rule.Op]strOp{rule.OpContains: opContains, rule.OpStartsWith: opPrefix, rule.OpEndsWith: opSuffix}
+	quantOf = map[rule.Op]quantifier{rule.OpAny: qAny, rule.OpAll: qAll, rule.OpNone: qNone}
+	arithOf = map[rule.Op]arithOp{rule.OpAdd: opAdd, rule.OpSub: opSub, rule.OpMul: opMul, rule.OpDiv: opDiv}
+)

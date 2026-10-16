@@ -6,6 +6,8 @@ import (
 	"strings"
 	"sync"
 	"testing"
+
+	"github.com/k0923/go/condition/rule"
 )
 
 func itemSchema() *Schema[item] {
@@ -38,26 +40,30 @@ func TestCompileJSON(t *testing.T) {
 		name, src string
 		want      bool
 	}{
-		{"ge", `{"op":"ge","args":[{"field":"age"},{"value":18}]}`, true},
-		{"bool field", `{"field":"vip"}`, true},
-		{"bool eq", `{"op":"eq","args":[{"field":"vip"},{"value":false}]}`, false},
-		{"not", `{"op":"not","args":[{"field":"vip"}]}`, false},
-		{"string order", `{"op":"lt","args":[{"field":"name"},{"value":"bob"}]}`, true},
-		{"starts_with", `{"op":"starts_with","args":[{"field":"name"},{"value":"al"}]}`, true},
-		{"in literal", `{"op":"in","args":[{"field":"city"},{"value":["sh","bj"]}]}`, true},
-		{"in empty", `{"op":"in","args":[{"field":"city"},{"value":[]}]}`, false},
-		{"not_in empty", `{"op":"not_in","args":[{"field":"age"},{"value":[]}]}`, true},
-		{"in number list", `{"op":"in","args":[{"field":"age"},{"value":[1,30]}]}`, true},
-		{"in field list", `{"op":"in","args":[{"value":"beta"},{"field":"tags"}]}`, true},
-		{"or false", `{"op":"or","args":[{"value":false},{"op":"eq","args":[{"field":"city"},{"value":"sh"}]}]}`, false},
-		{"and empty", `{"op":"and"}`, true},
-		{"any object", `{"op":"any","args":[{"field":"items"},{"op":"lt","args":[{"field":"price"},{"value":10}]}]}`, true},
-		{"all object", `{"op":"all","args":[{"field":"items"},{"op":"lt","args":[{"field":"price"},{"value":10}]}]}`, false},
-		{"nested quant", `{"op":"any","args":[{"field":"items"},{"op":"in","args":[{"value":"sale"},{"field":"tags"}]}]}`, true},
-		{"none scalar", `{"op":"none","args":[{"field":"scores"},{"op":"lt","args":[{"field":"$"},{"value":60}]}]}`, true},
-		{"len", `{"op":"eq","args":[{"op":"len","args":[{"field":"items"}]},{"value":2}]}`, true},
-		{"len empty literal", `{"op":"eq","args":[{"op":"len","args":[{"value":[]}]},{"value":0}]}`, true},
-		{"arith", `{"op":"eq","args":[{"op":"div","args":[{"op":"mul","args":[{"field":"age"},{"value":2}]},{"value":4}]},{"value":15}]}`, true},
+		{"gte", `{"type":"number","x":"age","opt":"gte","y":18}`, true},
+		{"bool eq", `{"type":"boolean","x":"vip","opt":"eq","y":false}`, false},
+		{"not", `{"type":"not","x":{"type":"boolean","x":"vip","opt":"eq","y":true}}`, false},
+		{"string order", `{"type":"string","x":"name","opt":"lt","y":"bob"}`, true},
+		{"starts_with", `{"type":"string","x":"name","opt":"starts_with","y":"al"}`, true},
+		{"in literal", `{"type":"string","x":"city","opt":"in","y":["sh","bj"]}`, true},
+		{"in empty", `{"type":"string","x":"city","opt":"in","y":[]}`, false},
+		{"nin empty", `{"type":"number","x":"age","opt":"nin","y":[]}`, true},
+		{"in number list", `{"type":"number","x":"age","opt":"in","y":[1,30]}`, true},
+		{"in field list", `{"type":"string","x":{"type":"literal","value":"beta"},"opt":"in","y":{"type":"field","name":"tags"}}`, true},
+		{"field vs field", `{"type":"string","x":"name","opt":"gt","y":{"type":"field","name":"city"}}`, false},
+		{"explicit literal y", `{"type":"number","x":"age","opt":"eq","y":{"type":"literal","value":30}}`, true},
+		{"explicit field x", `{"type":"number","x":{"type":"field","name":"age"},"opt":"eq","y":30}`, true},
+		{"literal on the left", `{"type":"number","x":18,"opt":"lt","y":{"type":"field","name":"age"}}`, true},
+		{"and empty", `{"type":"and","items":[]}`, true},
+		{"and no items", `{"type":"and"}`, true},
+		{"or empty", `{"type":"or"}`, false},
+		{"any object", `{"type":"array","x":"items","opt":"any","y":{"type":"number","x":"price","opt":"lt","y":10}}`, true},
+		{"all object", `{"type":"array","x":"items","opt":"all","y":{"type":"number","x":"price","opt":"lt","y":10}}`, false},
+		{"nested quant", `{"type":"array","x":"items","opt":"any","y":{"type":"array","x":"tags","opt":"any","y":{"type":"string","x":"$","opt":"eq","y":"sale"}}}`, true},
+		{"none scalar", `{"type":"array","x":"scores","opt":"none","y":{"type":"number","x":"$","opt":"lt","y":60}}`, true},
+		{"len", `{"type":"number","x":{"type":"len","x":"items"},"opt":"eq","y":2}`, true},
+		{"arith", `{"type":"number","x":{"type":"arith","x":{"type":"arith","x":"age","opt":"mul","y":2},"opt":"div","y":4},"opt":"eq","y":15}`, true},
+		{"arith on the right", `{"type":"number","x":"age","opt":"eq","y":{"type":"arith","x":"age","opt":"add","y":0}}`, true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -77,24 +83,40 @@ func TestCompileErrors(t *testing.T) {
 		kind      error
 		path      string
 	}{
-		{"unknown op", `{"op":"xor","args":[]}`, ErrUnknownOp, "$"},
-		{"unknown field", `{"op":"and","args":[{"field":"vip"},{"field":"agee"}]}`, ErrUnknownField, "$.args[1]"},
-		{"kind mismatch", `{"op":"gt","args":[{"field":"age"},{"value":"18"}]}`, ErrTypeMismatch, "$"},
-		{"ordered bool", `{"op":"gt","args":[{"field":"vip"},{"value":true}]}`, ErrTypeMismatch, "$"},
-		{"non bool root", `{"field":"age"}`, ErrTypeMismatch, "$"},
-		{"non bool in and", `{"op":"and","args":[{"field":"vip"},{"field":"name"}]}`, ErrTypeMismatch, "$.args[1]"},
-		{"arity", `{"op":"eq","args":[{"field":"age"}]}`, ErrArity, "$"},
-		{"quant arity", `{"op":"any","args":[{"field":"items"}]}`, ErrArity, "$"},
-		{"quant on scalar", `{"op":"any","args":[{"field":"age"},{"value":true}]}`, ErrTypeMismatch, "$.args[0]"},
-		{"quant pred field from parent", `{"op":"any","args":[{"field":"items"},{"op":"gt","args":[{"field":"age"},{"value":1}]}]}`, ErrUnknownField, "$.args[1].args[0]"},
-		{"in wrong element", `{"op":"in","args":[{"field":"city"},{"value":[1,2]}]}`, ErrTypeMismatch, "$"},
-		{"mixed list", `{"op":"in","args":[{"field":"city"},{"value":["a",1]}]}`, ErrTypeMismatch, "$.args[1]"},
-		{"object literal", `{"op":"eq","args":[{"field":"city"},{"value":{"a":1}}]}`, ErrInvalidNode, "$.args[1]"},
-		{"empty node", `{}`, ErrInvalidNode, "$"},
-		{"two kinds", `{"op":"and","field":"vip"}`, ErrInvalidNode, "$"},
-		{"args without op", `{"field":"vip","args":[{"value":true}]}`, ErrInvalidNode, "$"},
-		{"literal div zero", `{"op":"gt","args":[{"op":"div","args":[{"field":"age"},{"value":0}]},{"value":1}]}`, ErrDivideByZero, "$.args[0].args[1]"},
-		{"len scalar", `{"op":"eq","args":[{"op":"len","args":[{"field":"age"}]},{"value":0}]}`, ErrTypeMismatch, "$.args[0].args[0]"},
+		// Structure: rejected by rule.Parse.
+		{"unknown type", `{"type":"xor","items":[]}`, ErrUnknownOp, "$.type"},
+		{"unknown opt", `{"type":"number","x":"age","opt":"ge","y":1}`, ErrUnknownOp, "$.opt"},
+		{"opt not for type", `{"type":"boolean","x":"vip","opt":"gt","y":true}`, ErrUnknownOp, "$.opt"},
+		{"string op on number", `{"type":"number","x":"age","opt":"contains","y":1}`, ErrUnknownOp, "$.opt"},
+		{"quant opt", `{"type":"array","x":"items","opt":"eq","y":{"type":"and"}}`, ErrUnknownOp, "$.opt"},
+		{"missing type", `{"x":"age"}`, ErrInvalidNode, "$"},
+		{"missing key", `{"type":"number","x":"age","opt":"eq"}`, ErrInvalidNode, "$"},
+		{"unknown key", `{"type":"and","items":[],"opt":"eq"}`, ErrInvalidNode, "$.opt"},
+		{"misspelt key", `{"type":"number","x":"age","op":"eq","y":1}`, ErrInvalidNode, "$.op"},
+		{"literal type", `{"type":"number","x":"age","opt":"gt","y":"18"}`, ErrTypeMismatch, "$.y"},
+		{"null literal", `{"type":"number","x":"age","opt":"gt","y":null}`, ErrTypeMismatch, "$.y"},
+		{"in wants a list", `{"type":"string","x":"city","opt":"in","y":"bj"}`, ErrTypeMismatch, "$.y"},
+		{"in wrong element", `{"type":"string","x":"city","opt":"in","y":[1,2]}`, ErrTypeMismatch, "$.y"},
+		{"mixed list", `{"type":"string","x":"city","opt":"in","y":["a",1]}`, ErrTypeMismatch, "$.y"},
+		{"eq wants a scalar", `{"type":"string","x":"city","opt":"eq","y":["bj"]}`, ErrTypeMismatch, "$.y"},
+		{"unknown expr type", `{"type":"string","x":"city","opt":"eq","y":{"a":1}}`, ErrInvalidNode, "$.y"},
+		{"condition as value", `{"type":"boolean","x":"vip","opt":"eq","y":{"type":"and"}}`, ErrTypeMismatch, "$.y"},
+		{"value as condition", `{"type":"and","items":[{"type":"field","name":"vip"}]}`, ErrTypeMismatch, "$.items[0]"},
+		{"not an object", `{"type":"and","items":[true]}`, ErrInvalidNode, "$.items[0]"},
+		{"empty field", `{"type":"number","x":"","opt":"eq","y":1}`, ErrInvalidNode, "$.x"},
+		{"array x not a field", `{"type":"array","x":{"type":"len","x":"items"},"opt":"any","y":{"type":"and"}}`, ErrTypeMismatch, "$.x"},
+		{"trailing", `{"type":"and"} {}`, ErrInvalidNode, "$"},
+		{"bad json", `{"type":`, ErrInvalidNode, "$"},
+		// Schema: rejected by Check.
+		{"unknown field", `{"type":"and","items":[{"type":"boolean","x":"vip","opt":"eq","y":true},{"type":"boolean","x":"agee","opt":"eq","y":true}]}`, ErrUnknownField, "$.items[1].x"},
+		{"field kind", `{"type":"number","x":"name","opt":"gt","y":1}`, ErrTypeMismatch, "$.x"},
+		{"field kind y", `{"type":"string","x":"name","opt":"eq","y":{"type":"field","name":"age"}}`, ErrTypeMismatch, "$.y"},
+		{"in field not a list", `{"type":"string","x":"name","opt":"in","y":{"type":"field","name":"city"}}`, ErrTypeMismatch, "$.y"},
+		{"quant on scalar", `{"type":"array","x":"age","opt":"any","y":{"type":"and"}}`, ErrTypeMismatch, "$.x"},
+		{"quant pred field from parent", `{"type":"array","x":"items","opt":"any","y":{"type":"number","x":"age","opt":"gt","y":1}}`, ErrUnknownField, "$.y.x"},
+		{"injection", `{"type":"string","x":"$where","opt":"eq","y":"1"}`, ErrUnknownField, "$.x"},
+		{"literal div zero", `{"type":"number","x":{"type":"arith","x":"age","opt":"div","y":0},"opt":"gt","y":1}`, ErrDivideByZero, "$.x.y"},
+		{"len scalar", `{"type":"number","x":{"type":"len","x":"age"},"opt":"eq","y":0}`, ErrTypeMismatch, "$.x.x"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -113,54 +135,99 @@ func TestCompileErrors(t *testing.T) {
 	}
 }
 
+func vipRule() rule.Cond {
+	return &rule.Compare{Type: rule.TypeBoolean, X: &rule.Field{Name: "vip"}, Op: rule.OpEq, Y: &rule.Bool{V: true}}
+}
+
 func TestCompileDepthLimit(t *testing.T) {
-	n := Ref("vip")
+	var c rule.Cond = vipRule()
 	for range MaxDepth + 1 {
-		n = Op(OpNot, n)
+		c = &rule.Not{X: c}
 	}
-	if _, err := userSchema().Compile(n); !errors.Is(err, ErrTooDeep) {
+	if _, err := userSchema().Compile(c); !errors.Is(err, ErrTooDeep) {
 		t.Fatalf("want ErrTooDeep, got %v", err)
+	}
+	data, _ := json.Marshal(c)
+	if _, err := rule.Parse(data); !errors.Is(err, ErrTooDeep) {
+		t.Fatalf("Parse: want ErrTooDeep, got %v", err)
 	}
 }
 
-func TestParseNodeStrict(t *testing.T) {
-	for name, src := range map[string]string{
-		"misspelt key": `{"opt":"and"}`, // the old API's field name must not be silently ignored
-		"trailing":     `{"op":"and"} {}`,
-		"bad json":     `{"op":`,
-	} {
+// TestCheckGoBuiltRules covers trees built in Go, which bypass Parse and so
+// can hold things the JSON decoder never produces.
+func TestCheckGoBuiltRules(t *testing.T) {
+	s := userSchema()
+	shared := &rule.Field{Name: "tags"}
+	cases := map[string]struct {
+		c    rule.Cond
+		kind error
+		path string
+	}{
+		"nil root":  {nil, ErrInvalidNode, "$"},
+		"nil item":  {&rule.And{Items: []rule.Cond{vipRule(), nil}}, ErrInvalidNode, "$.items[1]"},
+		"typed nil": {&rule.Not{X: (*rule.Or)(nil)}, ErrInvalidNode, "$.x"},
+		"opt for type": {&rule.Compare{Type: rule.TypeNumber, X: &rule.Field{Name: "age"}, Op: rule.OpContains, Y: &rule.Number{V: 1}},
+			ErrUnknownOp, "$.opt"},
+		"literal kind": {&rule.Compare{Type: rule.TypeNumber, X: &rule.Field{Name: "age"}, Op: rule.OpEq, Y: &rule.String{V: "1"}},
+			ErrTypeMismatch, "$.y"},
+		"bad arith op": {&rule.Compare{Type: rule.TypeNumber, X: &rule.Arith{X: &rule.Number{V: 1}, Op: rule.OpEq, Y: &rule.Number{V: 1}}, Op: rule.OpEq, Y: &rule.Number{V: 1}},
+			ErrUnknownOp, "$.x.opt"},
+		// The same *Field resolves to tags of user at the root and to tags of
+		// item inside the quantifier: Checked.Field could not answer for both.
+		"shared field node": {&rule.And{Items: []rule.Cond{
+			&rule.Compare{Type: rule.TypeNumber, X: &rule.Len{X: shared}, Op: rule.OpEq, Y: &rule.Number{V: 0}},
+			&rule.Quant{X: &rule.Field{Name: "items"}, Op: rule.OpAny, Y: &rule.Compare{Type: rule.TypeNumber, X: &rule.Len{X: shared}, Op: rule.OpEq, Y: &rule.Number{V: 0}}},
+		}}, ErrInvalidNode, "$.items[1].y.x.x"},
+	}
+	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
-			if _, err := ParseNode([]byte(src)); err == nil {
-				t.Fatal("expected error")
+			_, err := s.Check(tc.c)
+			var ce *CompileError
+			if !errors.As(err, &ce) || !errors.Is(err, tc.kind) || ce.Path != tc.path {
+				t.Fatalf("want %v at %s, got %v", tc.kind, tc.path, err)
 			}
 		})
 	}
 }
 
-func TestNodeRoundTrip(t *testing.T) {
-	n := Op(OpAnd,
-		Op(OpGe, Ref("age"), LitNum(18)),
-		Op(OpIn, Ref("city"), LitStrs("bj", "sh")),
-		Op(OpEq, Ref("vip"), LitBool(false)),
-		Op(OpEq, Op(OpLen, Ref("tags")), LitNum(0)),
-	)
-	data, err := json.Marshal(n)
+// TestRoundTrip: a Go-built tree marshals to the canonical JSON form, parses
+// back to an equal tree and compiles to the same behaviour.
+func TestRoundTrip(t *testing.T) {
+	age, city := &rule.Field{Name: "age"}, &rule.Field{Name: "city"}
+	c := &rule.And{Items: []rule.Cond{
+		&rule.Compare{Type: rule.TypeNumber, X: age, Op: rule.OpGte, Y: &rule.Number{V: 18}},
+		&rule.Compare{Type: rule.TypeString, X: city, Op: rule.OpIn, Y: &rule.Strings{V: []string{"bj", "sh"}}},
+		&rule.Compare{Type: rule.TypeBoolean, X: &rule.Field{Name: "vip"}, Op: rule.OpEq, Y: &rule.Bool{V: false}},
+		&rule.Compare{Type: rule.TypeNumber, X: &rule.Len{X: &rule.Field{Name: "tags"}}, Op: rule.OpEq, Y: &rule.Number{V: 0}},
+		&rule.Compare{Type: rule.TypeString, X: &rule.String{V: "x"}, Op: rule.OpNin, Y: &rule.Field{Name: "tags"}},
+		&rule.Compare{Type: rule.TypeNumber, X: &rule.Field{Name: "age"}, Op: rule.OpNin, Y: &rule.Numbers{}},
+		&rule.Quant{X: &rule.Field{Name: "items"}, Op: rule.OpAll, Y: &rule.Compare{
+			Type: rule.TypeNumber, X: &rule.Arith{X: &rule.Field{Name: "price"}, Op: rule.OpMul, Y: &rule.Number{V: 2}}, Op: rule.OpLt, Y: &rule.Number{V: 100}}},
+	}}
+	data, err := json.Marshal(c)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if strings.Contains(string(data), `"value":null`) || strings.Contains(string(data), `"field":""`) {
-		t.Fatalf("empty members should be omitted: %s", data)
+	for _, want := range []string{`"x":"age"`, `"y":18`, `"y":["bj","sh"]`, `"y":false`, `"y":[]`,
+		`"x":{"type":"literal","value":"x"}`, `"y":{"type":"field","name":"tags"}`} {
+		if !strings.Contains(string(data), want) {
+			t.Fatalf("missing %s in %s", want, data)
+		}
 	}
-	// false and 0 must survive omitzero: they are meaningful literals.
-	if !strings.Contains(string(data), `"value":false`) || !strings.Contains(string(data), `"value":0`) {
-		t.Fatalf("zero literals dropped: %s", data)
+	parsed, err := rule.Parse(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	again, _ := json.Marshal(parsed)
+	if string(again) != string(data) {
+		t.Fatalf("not canonical:\n%s\n%s", data, again)
 	}
 	s := userSchema()
-	fromGo, err := s.Compile(n)
+	fromGo, err := s.Compile(c)
 	if err != nil {
 		t.Fatal(err)
 	}
-	fromJSON, err := s.CompileJSON(data)
+	fromJSON, err := s.Compile(parsed)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -181,6 +248,10 @@ func TestSchemaRegistration(t *testing.T) {
 		"nil get":   func() { NewSchema[user]().Bool("x", nil) },
 		"nil num":   func() { NewSchema[user]().Number("x", (func(user) int)(nil)) },
 		"nil elem":  func() { NewSchema[user]().List("items", func(u user) []item { return nil }, (*Schema[item])(nil)) },
+		"foreign checked": func() {
+			chk, _ := userSchema().Check(vipRule())
+			userSchema().Build(chk)
+		},
 	} {
 		t.Run(name, func(t *testing.T) {
 			defer func() {
@@ -194,10 +265,10 @@ func TestSchemaRegistration(t *testing.T) {
 }
 
 func TestConcurrentMatch(t *testing.T) {
-	c, err := userSchema().CompileJSON([]byte(`{"op":"and","args":[
-		{"op":"ge","args":[{"field":"age"},{"value":18}]},
-		{"op":"in","args":[{"field":"city"},{"value":["a","b","c","d","e","f","g","h","i","bj"]}]},
-		{"op":"any","args":[{"field":"items"},{"op":"lt","args":[{"field":"price"},{"value":10}]}]}]}`))
+	c, err := userSchema().CompileJSON([]byte(`{"type":"and","items":[
+		{"type":"number","x":"age","opt":"gte","y":18},
+		{"type":"string","x":"city","opt":"in","y":["a","b","c","d","e","f","g","h","i","bj"]},
+		{"type":"array","x":"items","opt":"any","y":{"type":"number","x":"price","opt":"lt","y":10}}]}`))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -215,47 +286,76 @@ func TestConcurrentMatch(t *testing.T) {
 	wg.Wait()
 }
 
-// FuzzCompileJSON checks that arbitrary input never panics and that a
-// successfully compiled condition never panics when matched.
+// FuzzCompileJSON checks that arbitrary input never panics, that a compiled
+// condition never panics when matched, and that every accepted rule
+// round-trips through its canonical JSON form.
 func FuzzCompileJSON(f *testing.F) {
 	for _, seed := range []string{
-		`{"op":"and","args":[{"field":"vip"}]}`,
-		`{"op":"any","args":[{"field":"items"},{"op":"lt","args":[{"field":"price"},{"value":10}]}]}`,
-		`{"op":"eq","args":[{"op":"div","args":[{"field":"age"},{"field":"age"}]},{"value":1}]}`,
-		`{"op":"in","args":[{"field":"city"},{"value":["a"]}]}`,
+		`{"type":"and","items":[{"type":"boolean","x":"vip","opt":"eq","y":true}]}`,
+		`{"type":"array","x":"items","opt":"any","y":{"type":"number","x":"price","opt":"lt","y":10}}`,
+		`{"type":"number","x":{"type":"arith","x":"age","opt":"div","y":{"type":"field","name":"age"}},"opt":"eq","y":1}`,
+		`{"type":"string","x":"city","opt":"in","y":["a"]}`,
+		`{"type":"string","x":{"type":"literal","value":"a"},"opt":"nin","y":{"type":"field","name":"tags"}}`,
+		`{"type":"number","x":{"type":"len","x":"items"},"opt":"gte","y":1}`,
 	} {
 		f.Add([]byte(seed))
 	}
 	s := userSchema()
 	f.Fuzz(func(t *testing.T, data []byte) {
-		c, err := s.CompileJSON(data)
+		r, err := rule.Parse(data)
+		if err != nil {
+			return
+		}
+		out, err := json.Marshal(r)
+		if err != nil {
+			t.Fatalf("marshal: %v", err)
+		}
+		r2, err := rule.Parse(out)
+		if err != nil {
+			t.Fatalf("canonical form rejected: %v\n%s", err, out)
+		}
+		if out2, _ := json.Marshal(r2); string(out2) != string(out) {
+			t.Fatalf("not canonical:\n%s\n%s", out, out2)
+		}
+		c, err := s.Compile(r)
 		if err != nil {
 			return
 		}
 		_, _ = c.Match(alice)
 		_, _ = c.Match(user{})
-		// Translators must accept every checked tree without panicking;
-		// that is covered by their own packages, here we pin Check == Compile.
-		if _, err := s.CheckJSON(data); err != nil {
-			t.Fatalf("Compile accepted but Check rejected: %v", err)
-		}
 	})
 }
 
-func TestCheckTypedNode(t *testing.T) {
-	typed, err := userSchema().CheckJSON([]byte(`{"op":"any","args":[{"field":"items"},{"op":"gt","args":[{"field":"price"},{"value":10}]}]}`))
+func TestChecked(t *testing.T) {
+	chk, err := userSchema().CheckJSON([]byte(`{"type":"array","x":"items","opt":"any","y":{"type":"number","x":"price","opt":"gt","y":10}}`))
 	if err != nil {
 		t.Fatal(err)
 	}
-	list, pred := typed.Args[0], typed.Args[1]
-	if typed.Kind != KindBool || list.Field.Kind != KindObjects || list.Field.Elem["price"] == nil {
-		t.Fatalf("unexpected typed tree: %+v", typed)
+	q := chk.Root().(*rule.Quant)
+	list := chk.Field(q.X)
+	if list.Kind != KindObjects || list.Elem["price"] == nil {
+		t.Fatalf("unexpected list field: %+v", list)
 	}
 	// Predicate fields resolve against the element schema.
-	if f := pred.Args[0].Field; f != list.Field.Elem["price"] || pred.Args[1].Lit.Number() != 10 || pred.Path != "$.args[1]" {
-		t.Fatalf("unexpected predicate: %+v", pred)
+	pred := q.Y.(*rule.Compare)
+	if chk.Field(pred.X.(*rule.Field)) != list.Elem["price"] || chk.Path(pred) != "$.y" || chk.Path(pred.Y) != "$.y.y" {
+		t.Fatalf("unexpected predicate resolution")
 	}
 	if f, ok := userSchema().Field("tags"); !ok || f.Kind != KindStrings || f.Elem[SelfField].Kind != KindString {
 		t.Fatalf("scalar list element: %+v", f)
+	}
+}
+
+func TestOps(t *testing.T) {
+	for _, op := range rule.Ops() {
+		if got, ok := rule.ParseOp(op.String()); !ok || got != op {
+			t.Fatalf("round trip %s: got %v %v", op, got, ok)
+		}
+	}
+	if _, ok := rule.ParseOp("ge"); ok {
+		t.Fatal("unknown name accepted")
+	}
+	if rule.Op(0).String() != "invalid" {
+		t.Fatal("zero op must print invalid")
 	}
 }

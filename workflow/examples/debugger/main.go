@@ -27,6 +27,7 @@ import (
 	"os/signal"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/k0923/go/workflow"
 	"github.com/k0923/go/workflow/debugger"
 )
@@ -171,7 +172,7 @@ func main() {
 	definition := workflow.NewWorkflow("order", "v2", orchestrateOrder)
 	id := *run
 	if id == "" {
-		id = fmt.Sprintf("order-%d", time.Now().Unix()%100000)
+		id = "order-" + uuid.NewString()
 	}
 	result, err := debugger.Run(ctx, definition, Order{ID: id, Amount: *amount}, debugger.Options{
 		Server: *server, RunID: id,

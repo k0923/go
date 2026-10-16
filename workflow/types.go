@@ -100,6 +100,13 @@ type OperationError struct {
 func (e *OperationError) Error() string { return fmt.Sprintf("%s %s: %v", e.Op, e.Key, e.Cause) }
 func (e *OperationError) Unwrap() error { return e.Cause }
 
+// Keep diagnostic causes, while an uncommitted failure remains retryable.
+// 保留诊断原因，但尚未提交的失败仍可重试。
+type retryableExecutionError struct{ cause error }
+
+func (e *retryableExecutionError) Error() string { return e.cause.Error() }
+func (e *retryableExecutionError) Unwrap() error { return e.cause }
+
 // Permanent marks a domain failure that must be persisted and never retried.
 // Permanent 标记必须持久化且永不重试的领域失败。
 func Permanent(err error) error {

@@ -1,4 +1,4 @@
-// Package sqlquery translates a checked condition (condition.TypedNode) into a
+// Package sqlquery translates a checked rule (condition.Checked) into a
 // parameterised SQL WHERE clause, so the same rule that condition evaluates in
 // memory can also be pushed down to a relational database.
 //
@@ -31,6 +31,7 @@ import (
 	"strings"
 
 	"github.com/k0923/go/condition"
+	"github.com/k0923/go/condition/rule"
 )
 
 // ErrUnsupported is returned when a rule cannot be expressed for the given
@@ -77,14 +78,14 @@ type Relation struct {
 	Relations map[string]Relation
 }
 
-// Where translates t into a WHERE clause body and its arguments.
-func Where(t *condition.TypedNode, opt Options) (string, []any, error) {
-	if t == nil || t.Kind != condition.KindBool {
-		return "", nil, fmt.Errorf("sqlquery: want a checked bool node")
+// Where translates a checked rule into a WHERE clause body and its arguments.
+func Where(chk *condition.Checked, opt Options) (string, []any, error) {
+	if chk == nil {
+		return "", nil, fmt.Errorf("sqlquery: nil rule")
 	}
-	w := &writer{opt: opt}
+	w := &writer{opt: opt, chk: chk}
 	root := &scope{alias: opt.Table, columns: opt.Columns, relations: opt.Relations}
-	sql, err := w.cond(t, root)
+	sql, err := w.cond(chk.Root(), root)
 	if err != nil {
 		return "", nil, err
 	}
@@ -100,12 +101,13 @@ type scope struct {
 
 type writer struct {
 	opt     Options
+	chk     *condition.Checked
 	args    []any
 	aliases int
 }
 
-func unsupported(t *condition.TypedNode, format string, a ...any) error {
-	return fmt.Errorf("%w: %s: %s", ErrUnsupported, t.Path, fmt.Sprintf(format, a...))
+func (w *writer) unsupported(n rule.Node, format string, a ...any) error {
+	return fmt.Errorf("%w: %s: %s", ErrUnsupported, w.chk.Path(n), fmt.Sprintf(format, a...))
 }
 
 func (w *writer) quote(ident string) string {
@@ -147,11 +149,11 @@ func (w *writer) collate(s string) string {
 	return s + " COLLATE " + w.quote(w.opt.Collate)
 }
 
-func (w *writer) column(t *condition.TypedNode, sc *scope) (string, error) {
-	name := t.Field.Name
+func (w *writer) column(f *rule.Field, sc *scope) (string, error) {
+	name := f.Name
 	if name == condition.SelfField {
 		if sc.self == "" {
-			return "", unsupported(t, "no value column mapped for %q", name)
+			return "", w.unsupported(f, "no value column mapped for %q", name)
 		}
 		return sc.self, nil
 	}
@@ -165,30 +167,15 @@ func (w *writer) column(t *condition.TypedNode, sc *scope) (string, error) {
 	return w.quote(sc.alias) + "." + w.quote(col), nil
 }
 
-// cond renders a bool-kinded node as a predicate.
-func (w *writer) cond(t *condition.TypedNode, sc *scope) (string, error) {
-	switch {
-	case t.Field != nil:
-		return w.column(t, sc)
-	case t.IsLiteral():
-		if t.Lit.Bool() {
-			return "TRUE", nil
-		}
-		return "FALSE", nil
-	}
-
-	switch t.Op {
-	case condition.OpAnd, condition.OpOr:
-		empty, sep := "TRUE", " AND "
-		if t.Op == condition.OpOr {
-			empty, sep = "FALSE", " OR "
-		}
-		if len(t.Args) == 0 {
+// cond renders a condition as a predicate.
+func (w *writer) cond(n rule.Cond, sc *scope) (string, error) {
+	group := func(items []rule.Cond, empty, sep string) (string, error) {
+		if len(items) == 0 {
 			return empty, nil
 		}
-		parts := make([]string, len(t.Args))
-		for i, a := range t.Args {
-			s, err := w.cond(a, sc)
+		parts := make([]string, len(items))
+		for i, it := range items {
+			s, err := w.cond(it, sc)
 			if err != nil {
 				return "", err
 			}
@@ -198,104 +185,98 @@ func (w *writer) cond(t *condition.TypedNode, sc *scope) (string, error) {
 			return parts[0], nil
 		}
 		return "(" + strings.Join(parts, sep) + ")", nil
-
-	case condition.OpNot:
-		s, err := w.cond(t.Args[0], sc)
+	}
+	switch n := n.(type) {
+	case *rule.And:
+		return group(n.Items, "TRUE", " AND ")
+	case *rule.Or:
+		return group(n.Items, "FALSE", " OR ")
+	case *rule.Not:
+		s, err := w.cond(n.X, sc)
 		return "NOT (" + s + ")", err
-
-	case condition.OpEq, condition.OpNe, condition.OpLt, condition.OpLe, condition.OpGt, condition.OpGe:
-		a, b, err := w.pair(t, sc)
+	case *rule.Quant:
+		return w.quant(n, sc)
+	case *rule.Compare:
+		switch op := n.Op; {
+		case op == rule.OpContains || op == rule.OpStartsWith || op == rule.OpEndsWith:
+			return w.stringOp(n, sc)
+		case op.IsList():
+			s, err := w.in(n, sc)
+			if err != nil || op == rule.OpIn {
+				return s, err
+			}
+			return "NOT (" + s + ")", nil
+		}
+		a, b, err := w.pair(n.X, n.Y, sc)
 		if err != nil {
 			return "", err
 		}
-		if t.Args[0].Kind == condition.KindString {
+		if n.Type == rule.TypeString {
 			a = w.collate(a)
 		}
-		return a + " " + cmpOps[t.Op] + " " + b, nil
-
-	case condition.OpContains, condition.OpStartsWith, condition.OpEndsWith:
-		return w.stringOp(t, sc)
-
-	case condition.OpIn, condition.OpNotIn:
-		s, err := w.in(t, sc)
-		if err != nil || t.Op == condition.OpIn {
-			return s, err
-		}
-		return "NOT (" + s + ")", nil
-
-	case condition.OpAny, condition.OpAll, condition.OpNone:
-		return w.quant(t, sc)
+		return a + " " + cmpOps[n.Op] + " " + b, nil
 	}
-	return "", unsupported(t, "operator %s", t.Op)
+	return "", w.unsupported(n, "condition %T", n)
 }
 
 var (
-	cmpOps   = map[condition.Operator]string{condition.OpEq: "=", condition.OpNe: "<>", condition.OpLt: "<", condition.OpLe: "<=", condition.OpGt: ">", condition.OpGe: ">="}
-	arithOps = map[condition.Operator]string{condition.OpAdd: "+", condition.OpSub: "-", condition.OpMul: "*"}
+	cmpOps   = map[rule.Op]string{rule.OpEq: "=", rule.OpNe: "<>", rule.OpLt: "<", rule.OpLte: "<=", rule.OpGt: ">", rule.OpGte: ">="}
+	arithOps = map[rule.Op]string{rule.OpAdd: "+", rule.OpSub: "-", rule.OpMul: "*"}
 )
 
-func (w *writer) pair(t *condition.TypedNode, sc *scope) (string, string, error) {
-	a, err := w.val(t.Args[0], sc)
+func (w *writer) pair(x, y rule.Expr, sc *scope) (string, string, error) {
+	a, err := w.val(x, sc)
 	if err != nil {
 		return "", "", err
 	}
-	b, err := w.val(t.Args[1], sc)
+	b, err := w.val(y, sc)
 	return a, b, err
 }
 
-// val renders a scalar-kinded node (number, string or bool) as an expression.
-func (w *writer) val(t *condition.TypedNode, sc *scope) (string, error) {
-	switch {
-	case t.Field != nil:
-		return w.column(t, sc)
-	case t.IsLiteral():
-		switch t.Kind {
-		case condition.KindBool:
-			return strings.ToUpper(strconv.FormatBool(t.Lit.Bool())), nil
-		case condition.KindNumber:
-			return w.bindNum(t.Lit.Number()), nil
-		default:
-			return w.bind(t.Lit.String()), nil
-		}
-	case t.Kind == condition.KindBool:
-		s, err := w.cond(t, sc)
-		return "(" + s + ")", err
-	}
-	switch t.Op {
-	case condition.OpAdd, condition.OpSub, condition.OpMul, condition.OpDiv:
-		a, b, err := w.pair(t, sc)
+// val renders a scalar expression (number, string or bool).
+func (w *writer) val(e rule.Expr, sc *scope) (string, error) {
+	switch e := e.(type) {
+	case *rule.Field:
+		return w.column(e, sc)
+	case *rule.Bool:
+		return strings.ToUpper(strconv.FormatBool(e.V)), nil
+	case *rule.Number:
+		return w.bindNum(e.V), nil
+	case *rule.String:
+		return w.bind(e.V), nil
+	case *rule.Arith:
+		a, b, err := w.pair(e.X, e.Y, sc)
 		if err != nil {
 			return "", err
 		}
-		if t.Op == condition.OpDiv {
+		if e.Op == rule.OpDiv {
 			// Force floating-point division to match the evaluator.
 			return "(" + a + " * 1.0 / " + b + ")", nil
 		}
-		return "(" + a + " " + arithOps[t.Op] + " " + b + ")", nil
-	case condition.OpLen:
-		return w.length(t.Args[0], sc)
+		return "(" + a + " " + arithOps[e.Op] + " " + b + ")", nil
+	case *rule.Len:
+		return w.length(e.X, sc)
 	}
-	return "", unsupported(t, "operator %s as a value", t.Op)
+	return "", w.unsupported(e, "expression %T as a value", e)
 }
 
 func escapeLike(s string) string {
 	return strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`).Replace(s)
 }
 
-func (w *writer) stringOp(t *condition.TypedNode, sc *scope) (string, error) {
-	x, err := w.val(t.Args[0], sc)
+func (w *writer) stringOp(n *rule.Compare, sc *scope) (string, error) {
+	x, err := w.val(n.X, sc)
 	if err != nil {
 		return "", err
 	}
-	pat := t.Args[1]
 	// A literal pattern uses LIKE on PostgreSQL and MySQL so prefix searches
 	// can use an index. SQLite's LIKE is case-insensitive, so it never does.
-	if pat.IsLiteral() && w.opt.Dialect != SQLite {
-		s := escapeLike(pat.Lit.String())
-		switch t.Op {
-		case condition.OpContains:
+	if pat, ok := n.Y.(*rule.String); ok && w.opt.Dialect != SQLite {
+		s := escapeLike(pat.V)
+		switch n.Op {
+		case rule.OpContains:
 			s = "%" + s + "%"
-		case condition.OpStartsWith:
+		case rule.OpStartsWith:
 			s += "%"
 		default:
 			s = "%" + s
@@ -307,14 +288,14 @@ func (w *writer) stringOp(t *condition.TypedNode, sc *scope) (string, error) {
 		return x + like + w.bind(s) + ` ESCAPE '\'`, nil
 	}
 	// p renders the pattern again for every use, rebinding literals.
-	p := func() (string, error) { return w.val(pat, sc) }
+	p := func() (string, error) { return w.val(n.Y, sc) }
 	ln := w.strLen()
-	switch t.Op {
-	case condition.OpContains:
+	switch n.Op {
+	case rule.OpContains:
 		fn := map[Dialect]string{SQLite: "instr", Postgres: "strpos", MySQL: "INSTR"}[w.opt.Dialect]
 		y, err := p()
 		return fn + "(" + x + ", " + y + ") > 0", err
-	case condition.OpStartsWith:
+	case rule.OpStartsWith:
 		y1, err := p()
 		if err != nil {
 			return "", err
@@ -336,62 +317,67 @@ func (w *writer) stringOp(t *condition.TypedNode, sc *scope) (string, error) {
 	}
 }
 
-func (w *writer) in(t *condition.TypedNode, sc *scope) (string, error) {
-	list := t.Args[1]
-	if list.Kind == condition.KindEmptyList {
+func (w *writer) in(n *rule.Compare, sc *scope) (string, error) {
+	var phs []string
+	switch l := n.Y.(type) {
+	case *rule.Numbers:
+		for _, v := range l.V {
+			phs = append(phs, w.bindNum(v))
+		}
+	case *rule.Strings:
+		for _, v := range l.V {
+			phs = append(phs, w.bind(v))
+		}
+	case *rule.Field:
+		return w.inField(n, l, sc)
+	default:
+		return "", w.unsupported(n.Y, "list %T", l)
+	}
+	if len(phs) == 0 {
 		return "FALSE", nil
 	}
-	x, err := w.val(t.Args[0], sc)
+	x, err := w.val(n.X, sc)
 	if err != nil {
 		return "", err
 	}
-	if list.IsLiteral() {
-		var phs []string
-		if list.Kind == condition.KindNumbers {
-			for _, v := range list.Lit.Numbers() {
-				phs = append(phs, w.bindNum(v))
-			}
-		} else {
-			for _, v := range list.Lit.Strings() {
-				phs = append(phs, w.bind(v))
-			}
-		}
-		if t.Args[0].Kind == condition.KindString {
-			x = w.collate(x)
-		}
-		return x + " IN (" + strings.Join(phs, ", ") + ")", nil
+	if n.Type == rule.TypeString {
+		x = w.collate(x)
 	}
-	// A list field: membership is "some element equals x".
-	if _, ok := sc.relations[list.Field.Name]; !ok && w.opt.Dialect == Postgres {
+	return x + " IN (" + strings.Join(phs, ", ") + ")", nil
+}
+
+// inField renders membership in a list field: "some element equals x".
+func (w *writer) inField(n *rule.Compare, list *rule.Field, sc *scope) (string, error) {
+	x, err := w.val(n.X, sc)
+	if err != nil {
+		return "", err
+	}
+	if _, ok := sc.relations[list.Name]; !ok && w.opt.Dialect == Postgres {
 		col, err := w.column(list, sc)
 		return x + " = ANY(" + col + ")", err
 	}
 	return w.exists(list, sc, func(el *scope) (string, error) {
 		if el.self == "" {
-			return "", unsupported(list, "no value column mapped for %q", condition.SelfField)
+			return "", w.unsupported(list, "no value column mapped for %q", condition.SelfField)
 		}
-		return w.collateIf(t.Args[0].Kind, el.self) + " = " + x, nil
+		self := el.self
+		if n.Type == rule.TypeString {
+			self = w.collate(self)
+		}
+		return self + " = " + x, nil
 	})
 }
 
-func (w *writer) collateIf(k condition.Kind, s string) string {
-	if k == condition.KindString {
-		return w.collate(s)
-	}
-	return s
-}
-
-func (w *writer) quant(t *condition.TypedNode, sc *scope) (string, error) {
-	list, pred := t.Args[0], t.Args[1]
-	negatePred := t.Op == condition.OpAll
-	s, err := w.exists(list, sc, func(el *scope) (string, error) {
-		p, err := w.cond(pred, el)
+func (w *writer) quant(n *rule.Quant, sc *scope) (string, error) {
+	negatePred := n.Op == rule.OpAll
+	s, err := w.exists(n.X, sc, func(el *scope) (string, error) {
+		p, err := w.cond(n.Y, el)
 		if negatePred {
 			p = "NOT (" + p + ")"
 		}
 		return p, err
 	})
-	if err != nil || t.Op == condition.OpAny {
+	if err != nil || n.Op == rule.OpAny {
 		return s, err
 	}
 	// all = no element fails the predicate; none = no element matches it.
@@ -399,7 +385,7 @@ func (w *writer) quant(t *condition.TypedNode, sc *scope) (string, error) {
 }
 
 // exists renders EXISTS (SELECT 1 FROM <elements of list> WHERE <where(el)>).
-func (w *writer) exists(list *condition.TypedNode, sc *scope, where func(*scope) (string, error)) (string, error) {
+func (w *writer) exists(list *rule.Field, sc *scope, where func(*scope) (string, error)) (string, error) {
 	from, el, err := w.elements(list, sc)
 	if err != nil {
 		return "", err
@@ -411,11 +397,8 @@ func (w *writer) exists(list *condition.TypedNode, sc *scope, where func(*scope)
 	return "EXISTS (SELECT 1 FROM " + from.table + " WHERE " + joinWhere(from.on, cond) + ")", nil
 }
 
-func (w *writer) length(list *condition.TypedNode, sc *scope) (string, error) {
-	if list.IsLiteral() {
-		return strconv.Itoa(list.Lit.Len()), nil
-	}
-	if _, ok := sc.relations[list.Field.Name]; !ok && w.opt.Dialect == Postgres && list.Kind != condition.KindObjects {
+func (w *writer) length(list *rule.Field, sc *scope) (string, error) {
+	if _, ok := sc.relations[list.Name]; !ok && w.opt.Dialect == Postgres && w.chk.Field(list).Kind != condition.KindObjects {
 		col, err := w.column(list, sc)
 		return "cardinality(" + col + ")", err
 	}
@@ -440,13 +423,13 @@ func joinWhere(on, cond string) string {
 }
 
 // elements resolves a list field to a FROM source and the element scope.
-func (w *writer) elements(list *condition.TypedNode, sc *scope) (source, *scope, error) {
+func (w *writer) elements(list *rule.Field, sc *scope) (source, *scope, error) {
 	w.aliases++
 	alias := "t" + strconv.Itoa(w.aliases)
 	qa := w.quote(alias)
-	if rel, ok := sc.relations[list.Field.Name]; ok {
+	if rel, ok := sc.relations[list.Name]; ok {
 		if sc.alias == "" && strings.Contains(rel.On, "{parent}") {
-			return source{}, nil, unsupported(list, "Options.Table (or the parent relation) must name the parent alias")
+			return source{}, nil, w.unsupported(list, "Options.Table (or the parent relation) must name the parent alias")
 		}
 		on := strings.NewReplacer("{parent}", w.quote(sc.alias), "{child}", qa).Replace(rel.On)
 		el := &scope{alias: alias, columns: rel.Columns, relations: rel.Relations}
@@ -455,12 +438,12 @@ func (w *writer) elements(list *condition.TypedNode, sc *scope) (source, *scope,
 		}
 		return source{table: w.quote(rel.Table) + " AS " + qa, on: on}, el, nil
 	}
-	if w.opt.Dialect == Postgres && list.Kind != condition.KindObjects {
+	if w.opt.Dialect == Postgres && w.chk.Field(list).Kind != condition.KindObjects {
 		col, err := w.column(list, sc)
 		if err != nil {
 			return source{}, nil, err
 		}
 		return source{table: "unnest(" + col + ") AS " + qa + "(v)"}, &scope{self: qa + ".v"}, nil
 	}
-	return source{}, nil, unsupported(list, "list field %q needs a Relation", list.Field.Name)
+	return source{}, nil, w.unsupported(list, "list field %q needs a Relation", list.Name)
 }

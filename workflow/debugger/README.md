@@ -43,7 +43,7 @@ result, err := debugger.Run(ctx, definition, input, debugger.Options{
 | 事件时间线 | 引擎事件（Drive、Action、回放、挂起）与存储事件（commit、resolve、cancel、debugger 操作），可隐藏回放 |
 | 通知 | REQUEST / WAKE / CANCEL 消息及其投递状态 |
 | 等待中的信号 | WaitFor：查看 Request，编辑 JSON 后「提交并推进」（⌘/Ctrl+Enter）；Sleep：「立即唤醒」；WaitAny 成员：「标记失败」 |
-| Re-drive / 删除 | 入队手动 WAKE；清空该 Run 的全部数据 |
+| Re-drive / 删除 | 入队手动 WAKE；删除运行数据并保留禁止复用 ID 的标记 |
 
 UI 通过 SSE 实时刷新。样式使用 Tailwind CDN，首次打开需要能访问 `cdn.tailwindcss.com`。
 
@@ -55,6 +55,25 @@ UI 通过 SSE 实时刷新。样式使用 Tailwind CDN，首次打开需要能�
 - UI 提交 JSON 等同于 `Engine.ResolveSignal`：只有第一次提交生效，WaitAny 中已取消/失败的成员忽略后续提交。
 - 「立即唤醒」会把 Sleep 的 `Until` 改为当前时间再解析，属于调试专用操作。
 - 每次 Drive 都会全量回放，时间线里出现大量 `action_replayed` 是正常的。
+- 空 RunID 使用 UUID 创建独立运行；显式 ID 用于恢复尚未删除的运行。
+- 删除会持久化 tombstone，旧 worker 后续操作返回 ErrNotFound 并退出；
+  相同 RunID 不可重新注册。新运行需使用新 ID，避免旧租约跨运行生命周期生效。
+- SQLite 在取得实际写锁后采样服务端时间，避免锁等待期间过期的租约仍通过校验。
+- WAKE 在后续 Drive 成功、再次挂起或确认 FAILED 后 ACK；暂时错误保留消息，
+  ACK 失败会重试。等待期间定期复核持久状态，使冗余 worker 的旧挂起快照能重新驱动。
+- 引擎事件发送失败会重试并保留有界内存批次（最多 4096 条），服务端按事件 ID 去重；
+  持续故障、编码失败或队列溢出通过 Logf 提示时间线不完整。进程退出仍可能丢失未送达事件。
+- UI 草稿按 Run 隔离；详情只接受最新刷新请求，事件按 ID 去重且游标不回退。
+- 服务取消会终止 SSE/长轮询，等待 HTTP 关闭后再关闭数据库。
+
+回归验证（不包含 legacy）：
+
+```sh
+go test -race ./workflow ./workflow/debugger ./workflow/cmd/... ./workflow/examples/...
+node --test workflow/debugger/ui_regression_test.cjs
+```
+
+Node 用例直接执行 UI 函数验证草稿、刷新时序与提交归属；不替代浏览器焦点、渲染和完整交互验证。
 
 ## HTTP API
 

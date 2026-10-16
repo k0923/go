@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io/fs"
 	"log"
+	"net"
 	"net/http"
 	"regexp"
 	"strconv"
@@ -432,16 +433,29 @@ func ListenAndServe(ctx context.Context, addr, dbPath string) error {
 		return err
 	}
 	defer store.Close()
-	server := &http.Server{Addr: addr, Handler: NewServer(store), ReadHeaderTimeout: 10 * time.Second}
+	serviceCtx, stop := context.WithCancel(ctx)
+	defer stop()
+	server := &http.Server{
+		Addr: addr, Handler: NewServer(store), ReadHeaderTimeout: 10 * time.Second,
+		BaseContext: func(net.Listener) context.Context { return serviceCtx },
+	}
+	stopped := make(chan struct{})
+	var shutdownErr error
 	go func() {
-		<-ctx.Done()
+		defer close(stopped)
+		<-serviceCtx.Done()
 		shutdown, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 		defer cancel()
-		_ = server.Shutdown(shutdown)
+		if shutdownErr = server.Shutdown(shutdown); shutdownErr != nil {
+			shutdownErr = errors.Join(shutdownErr, server.Close())
+		}
 	}()
 	log.Printf("workflow debugger listening on http://%s (db: %s)", addr, dbPath)
-	if err = server.ListenAndServe(); errors.Is(err, http.ErrServerClosed) {
-		return nil
+	err = server.ListenAndServe()
+	stop()
+	<-stopped
+	if errors.Is(err, http.ErrServerClosed) {
+		err = nil
 	}
-	return err
+	return errors.Join(err, shutdownErr)
 }

@@ -1,4 +1,4 @@
-// Package mongoquery translates a checked condition (condition.TypedNode) into
+// Package mongoquery translates a checked rule (condition.Checked) into
 // a MongoDB filter document, so the same rule that condition evaluates in
 // memory can also be pushed down to MongoDB.
 //
@@ -29,6 +29,7 @@ import (
 	"strings"
 
 	"github.com/k0923/go/condition"
+	"github.com/k0923/go/condition/rule"
 )
 
 // ErrUnsupported is returned for nodes that cannot be translated.
@@ -43,37 +44,42 @@ type Options struct {
 	Paths map[string]string
 }
 
-// Filter translates t into a MongoDB filter document.
-func Filter(t *condition.TypedNode, opt Options) (map[string]any, error) {
-	if t == nil || t.Kind != condition.KindBool {
-		return nil, fmt.Errorf("mongoquery: want a checked bool node")
+// Filter translates a checked rule into a MongoDB filter document.
+func Filter(chk *condition.Checked, opt Options) (map[string]any, error) {
+	if chk == nil {
+		return nil, fmt.Errorf("mongoquery: nil rule")
 	}
-	tr := &translator{opt: opt}
-	return tr.filter(t)
+	tr := &translator{opt: opt, chk: chk}
+	return tr.filter(chk.Root())
 }
 
 // filter renders a root-level predicate, preferring native operators and
 // wrapping only the parts that need aggregation in $expr.
-func (tr *translator) filter(t *condition.TypedNode) (map[string]any, error) {
-	if f, ok, err := tr.query(t, scope{}); err != nil || ok {
+func (tr *translator) filter(n rule.Cond) (map[string]any, error) {
+	if f, ok, err := tr.query(n, scope{}); err != nil || ok {
 		return f, err
 	}
-	if t.Op == condition.OpAnd || t.Op == condition.OpOr {
-		parts := make([]any, len(t.Args))
-		for i, a := range t.Args {
-			f, err := tr.filter(a)
+	group := func(op string, items []rule.Cond) (map[string]any, error) {
+		parts := make([]any, len(items))
+		for i, it := range items {
+			f, err := tr.filter(it)
 			if err != nil {
 				return nil, err
 			}
 			parts[i] = f
 		}
-		return doc(logicOps[t.Op], parts), nil
+		return doc(op, parts), nil
 	}
-	if t.Op == condition.OpNot {
-		f, err := tr.filter(t.Args[0])
+	switch n := n.(type) {
+	case *rule.And:
+		return group("$and", n.Items)
+	case *rule.Or:
+		return group("$or", n.Items)
+	case *rule.Not:
+		f, err := tr.filter(n.X)
 		return doc("$nor", []any{f}), err
 	}
-	e, err := tr.expr(t, scope{})
+	e, err := tr.cond(n, scope{})
 	if err != nil {
 		return nil, err
 	}
@@ -82,7 +88,7 @@ func (tr *translator) filter(t *condition.TypedNode) (map[string]any, error) {
 
 // scope tracks where field references resolve.
 //
-//	key:    prefix for Options.Paths lookups ("" at the root, "items." inside)
+//	key:     prefix for Options.Paths lookups ("" at the root, "items." inside)
 //	elemVar: aggregation variable bound to the element ("" outside $map)
 type scope struct {
 	key     string
@@ -91,16 +97,17 @@ type scope struct {
 
 type translator struct {
 	opt  Options
+	chk  *condition.Checked
 	vars int
 }
 
 func doc(k string, v any) map[string]any { return map[string]any{k: v} }
 
-func unsupported(t *condition.TypedNode, format string, a ...any) error {
-	return fmt.Errorf("%w: %s: %s", ErrUnsupported, t.Path, fmt.Sprintf(format, a...))
+func (tr *translator) unsupported(n rule.Node, format string, a ...any) error {
+	return fmt.Errorf("%w: %s: %s", ErrUnsupported, tr.chk.Path(n), fmt.Sprintf(format, a...))
 }
 
-func (tr *translator) path(f *condition.FieldInfo, sc scope) string {
+func (tr *translator) path(f *rule.Field, sc scope) string {
 	if p, ok := tr.opt.Paths[sc.key+f.Name]; ok {
 		return p
 	}
@@ -108,29 +115,29 @@ func (tr *translator) path(f *condition.FieldInfo, sc scope) string {
 }
 
 // lit renders a literal as a BSON-compatible value. Integral numbers become
-// int64 so they print and compare naturally.
-func lit(l *condition.Literal) any {
-	switch l.Kind() {
-	case condition.KindBool:
-		return l.Bool()
-	case condition.KindNumber:
-		return num(l.Number())
-	case condition.KindString:
-		return l.String()
-	case condition.KindNumbers:
-		out := make([]any, l.Len())
-		for i, x := range l.Numbers() {
+// int64 so they print and compare naturally. ok is false for non-literals.
+func lit(e rule.Expr) (v any, ok bool) {
+	switch e := e.(type) {
+	case *rule.Bool:
+		return e.V, true
+	case *rule.Number:
+		return num(e.V), true
+	case *rule.String:
+		return e.V, true
+	case *rule.Numbers:
+		out := make([]any, len(e.V))
+		for i, x := range e.V {
 			out[i] = num(x)
 		}
-		return out
-	case condition.KindStrings:
-		out := make([]any, l.Len())
-		for i, x := range l.Strings() {
+		return out, true
+	case *rule.Strings:
+		out := make([]any, len(e.V))
+		for i, x := range e.V {
 			out[i] = x
 		}
-		return out
+		return out, true
 	}
-	return []any{} // KindEmptyList
+	return nil, false
 }
 
 func num(f float64) any {
@@ -141,46 +148,35 @@ func num(f float64) any {
 }
 
 var (
-	logicOps = map[condition.Operator]string{condition.OpAnd: "$and", condition.OpOr: "$or"}
-	cmpOps   = map[condition.Operator]string{condition.OpEq: "$eq", condition.OpNe: "$ne", condition.OpLt: "$lt", condition.OpLe: "$lte", condition.OpGt: "$gt", condition.OpGe: "$gte"}
+	cmpOps = map[rule.Op]string{rule.OpEq: "$eq", rule.OpNe: "$ne", rule.OpLt: "$lt", rule.OpLte: "$lte", rule.OpGt: "$gt", rule.OpGte: "$gte"}
 	// flipped is cmpOps with the operands swapped (literal op field).
-	flipped  = map[condition.Operator]string{condition.OpEq: "$eq", condition.OpNe: "$ne", condition.OpLt: "$gt", condition.OpLe: "$gte", condition.OpGt: "$lt", condition.OpGe: "$lte"}
-	inOps    = map[condition.Operator]string{condition.OpIn: "$in", condition.OpNotIn: "$nin"}
-	arithOps = map[condition.Operator]string{condition.OpAdd: "$add", condition.OpSub: "$subtract", condition.OpMul: "$multiply", condition.OpDiv: "$divide"}
+	flipped  = map[rule.Op]string{rule.OpEq: "$eq", rule.OpNe: "$ne", rule.OpLt: "$gt", rule.OpLte: "$gte", rule.OpGt: "$lt", rule.OpGte: "$lte"}
+	inOps    = map[rule.Op]string{rule.OpIn: "$in", rule.OpNin: "$nin"}
+	arithOps = map[rule.Op]string{rule.OpAdd: "$add", rule.OpSub: "$subtract", rule.OpMul: "$multiply", rule.OpDiv: "$divide"}
 )
 
 var falseFilter = doc("$expr", false)
 
-// query tries to express t in the native query language. ok is false when
-// t needs aggregation expressions; the caller then falls back to $expr.
-func (tr *translator) query(t *condition.TypedNode, sc scope) (map[string]any, bool, error) {
+// docField reports whether e is a field addressable by a native query path,
+// that is, not the scalar element "$".
+func docField(e rule.Expr) (*rule.Field, bool) {
+	f, ok := e.(*rule.Field)
+	return f, ok && f.Name != condition.SelfField
+}
+
+// query tries to express n in the native query language. ok is false when
+// n needs aggregation expressions; the caller then falls back to $expr.
+func (tr *translator) query(n rule.Cond, sc scope) (map[string]any, bool, error) {
 	if sc.elemVar != "" {
 		return nil, false, nil
 	}
-	switch {
-	case t.Field != nil:
-		if t.Field.Name == condition.SelfField {
-			return nil, false, nil
+	group := func(op string, items []rule.Cond, empty map[string]any) (map[string]any, bool, error) {
+		if len(items) == 0 {
+			return empty, true, nil
 		}
-		return doc(tr.path(t.Field, sc), true), true, nil
-	case t.IsLiteral():
-		if t.Lit.Bool() {
-			return map[string]any{}, true, nil
-		}
-		return falseFilter, true, nil
-	}
-
-	switch t.Op {
-	case condition.OpAnd, condition.OpOr:
-		if len(t.Args) == 0 {
-			if t.Op == condition.OpAnd {
-				return map[string]any{}, true, nil
-			}
-			return falseFilter, true, nil
-		}
-		parts := make([]any, len(t.Args))
-		for i, a := range t.Args {
-			f, ok, err := tr.query(a, sc)
+		parts := make([]any, len(items))
+		for i, it := range items {
+			f, ok, err := tr.query(it, sc)
 			if err != nil || !ok {
 				return nil, ok, err
 			}
@@ -189,240 +185,289 @@ func (tr *translator) query(t *condition.TypedNode, sc scope) (map[string]any, b
 		if len(parts) == 1 {
 			return parts[0].(map[string]any), true, nil
 		}
-		return doc(logicOps[t.Op], parts), true, nil
+		return doc(op, parts), true, nil
+	}
 
-	case condition.OpNot:
-		f, ok, err := tr.query(t.Args[0], sc)
+	switch n := n.(type) {
+	case *rule.And:
+		return group("$and", n.Items, map[string]any{})
+	case *rule.Or:
+		return group("$or", n.Items, falseFilter)
+	case *rule.Not:
+		f, ok, err := tr.query(n.X, sc)
 		if err != nil || !ok {
 			return nil, ok, err
 		}
 		return doc("$nor", []any{f}), true, nil
-
-	case condition.OpEq, condition.OpNe, condition.OpLt, condition.OpLe, condition.OpGt, condition.OpGe:
-		field, value, op, ok := fieldVsLiteral(t)
-		if !ok || field.Field.Name == condition.SelfField {
-			return nil, false, nil
+	case *rule.Quant:
+		if tr.chk.Field(n.X).Kind != condition.KindObjects {
+			return tr.scalarQuant(n, sc)
 		}
-		return doc(tr.path(field.Field, sc), doc(op, lit(value.Lit))), true, nil
-
-	case condition.OpContains, condition.OpStartsWith, condition.OpEndsWith:
-		x, pat := t.Args[0], t.Args[1]
-		if x.Field == nil || x.Field.Name == condition.SelfField || !pat.IsLiteral() {
-			return nil, false, nil
-		}
-		re := regexp.QuoteMeta(pat.Lit.String())
-		switch t.Op {
-		case condition.OpStartsWith:
-			re = `\A` + re
-		case condition.OpEndsWith:
-			re = re + `\z`
-		}
-		return doc(tr.path(x.Field, sc), doc("$regex", re)), true, nil
-
-	case condition.OpIn, condition.OpNotIn:
-		x, list := t.Args[0], t.Args[1]
-		if list.Kind == condition.KindEmptyList {
-			if t.Op == condition.OpIn {
-				return falseFilter, true, nil
-			}
-			return map[string]any{}, true, nil
-		}
-		switch {
-		case x.Field != nil && x.Field.Name != condition.SelfField && list.IsLiteral():
-			return doc(tr.path(x.Field, sc), doc(inOps[t.Op], lit(list.Lit))), true, nil
-		case x.IsLiteral() && list.Field != nil:
-			// Array membership: {tags: "x"} matches when any element equals "x".
-			f := doc(tr.path(list.Field, sc), doc("$eq", lit(x.Lit)))
-			if t.Op == condition.OpNotIn {
-				f = doc("$nor", []any{f})
-			}
-			return f, true, nil
-		}
-		return nil, false, nil
-
-	case condition.OpAny, condition.OpAll, condition.OpNone:
-		list, pred := t.Args[0], t.Args[1]
-		if list.Kind != condition.KindObjects {
-			return tr.scalarQuant(t, sc)
-		}
-		elem := scope{key: sc.key + list.Field.Name + "."}
-		p, ok, err := tr.query(pred, elem)
+		elem := scope{key: sc.key + n.X.Name + "."}
+		p, ok, err := tr.query(n.Y, elem)
 		if err != nil || !ok {
 			return nil, ok, err
 		}
-		path := tr.path(list.Field, sc)
-		switch t.Op {
-		case condition.OpAny:
+		path := tr.path(n.X, sc)
+		switch n.Op {
+		case rule.OpAny:
 			return doc(path, doc("$elemMatch", p)), true, nil
-		case condition.OpAll: // no element fails the predicate
+		case rule.OpAll: // no element fails the predicate
 			return doc(path, doc("$not", doc("$elemMatch", doc("$nor", []any{p})))), true, nil
 		default: // no element satisfies it
 			return doc(path, doc("$not", doc("$elemMatch", p))), true, nil
 		}
+	case *rule.Compare:
+		return tr.compare(n, sc)
 	}
 	return nil, false, nil
+}
+
+func (tr *translator) compare(n *rule.Compare, sc scope) (map[string]any, bool, error) {
+	switch op := n.Op; {
+	case op == rule.OpContains || op == rule.OpStartsWith || op == rule.OpEndsWith:
+		x, okX := docField(n.X)
+		pat, okY := n.Y.(*rule.String)
+		if !okX || !okY {
+			return nil, false, nil
+		}
+		re := regexp.QuoteMeta(pat.V)
+		switch op {
+		case rule.OpStartsWith:
+			re = `\A` + re
+		case rule.OpEndsWith:
+			re = re + `\z`
+		}
+		return doc(tr.path(x, sc), doc("$regex", re)), true, nil
+
+	case op.IsList():
+		if list, ok := n.Y.(*rule.Field); ok {
+			v, isLit := lit(n.X)
+			if !isLit {
+				return nil, false, nil
+			}
+			// Array membership: {tags: "x"} matches when any element equals "x".
+			f := doc(tr.path(list, sc), doc("$eq", v))
+			if op == rule.OpNin {
+				f = doc("$nor", []any{f})
+			}
+			return f, true, nil
+		}
+		values, _ := lit(n.Y)
+		if len(values.([]any)) == 0 {
+			if op == rule.OpIn {
+				return falseFilter, true, nil
+			}
+			return map[string]any{}, true, nil
+		}
+		x, ok := docField(n.X)
+		if !ok {
+			return nil, false, nil
+		}
+		return doc(tr.path(x, sc), doc(inOps[op], values)), true, nil
+	}
+	field, value, op, ok := fieldVsLiteral(n)
+	if !ok {
+		return nil, false, nil
+	}
+	return doc(tr.path(field, sc), doc(op, value)), true, nil
 }
 
 // scalarQuant handles any/all/none over a scalar list whose predicate is
 // "$ op literal": it becomes a native $elemMatch on the array, which can use
 // a multikey index. Other predicates fall back to $expr.
-func (tr *translator) scalarQuant(t *condition.TypedNode, sc scope) (map[string]any, bool, error) {
-	list, pred := t.Args[0], t.Args[1]
+func (tr *translator) scalarQuant(n *rule.Quant, sc scope) (map[string]any, bool, error) {
 	// all(p) is none(!p); every supported operator has a native complement,
 	// so no $not is ever needed inside $elemMatch.
 	complement := map[string]string{"$eq": "$ne", "$ne": "$eq", "$lt": "$gte", "$gte": "$lt", "$gt": "$lte", "$lte": "$gt", "$in": "$nin", "$nin": "$in"}
+	pred, ok := n.Y.(*rule.Compare)
+	if !ok {
+		return nil, false, nil
+	}
+	isSelf := func(e rule.Expr) bool { f, ok := e.(*rule.Field); return ok && f.Name == condition.SelfField }
 	var op string
 	var arg any
-	switch pred.Op {
-	case condition.OpEq, condition.OpNe, condition.OpLt, condition.OpLe, condition.OpGt, condition.OpGe:
-		field, value, o, ok := fieldVsLiteral(pred)
-		if !ok || field.Field.Name != condition.SelfField {
+	switch {
+	case pred.Op.IsList():
+		v, isLit := lit(pred.Y)
+		if !isSelf(pred.X) || !isLit || len(v.([]any)) == 0 {
 			return nil, false, nil
 		}
-		op, arg = o, lit(value.Lit)
-	case condition.OpIn, condition.OpNotIn:
-		x, l := pred.Args[0], pred.Args[1]
-		if x.Field == nil || x.Field.Name != condition.SelfField || !l.IsLiteral() || l.Kind == condition.KindEmptyList {
+		op, arg = inOps[pred.Op], v
+	case cmpOps[pred.Op] != "":
+		var x rule.Expr
+		if x, arg, op, ok = selfVsLiteral(pred); !ok || !isSelf(x) {
 			return nil, false, nil
 		}
-		op, arg = inOps[pred.Op], lit(l.Lit)
 	default:
 		return nil, false, nil
 	}
-	path := tr.path(list.Field, sc)
-	switch t.Op {
-	case condition.OpAny:
+	path := tr.path(n.X, sc)
+	switch n.Op {
+	case rule.OpAny:
 		return doc(path, doc("$elemMatch", doc(op, arg))), true, nil
-	case condition.OpNone:
+	case rule.OpNone:
 		return doc(path, doc("$not", doc("$elemMatch", doc(op, arg)))), true, nil
 	default:
 		return doc(path, doc("$not", doc("$elemMatch", doc(complement[op], arg)))), true, nil
 	}
 }
 
-// fieldVsLiteral normalises "field op literal" and "literal op field".
-func fieldVsLiteral(t *condition.TypedNode) (field, value *condition.TypedNode, op string, ok bool) {
-	a, b := t.Args[0], t.Args[1]
-	switch {
-	case a.Field != nil && b.IsLiteral():
-		return a, b, cmpOps[t.Op], true
-	case a.IsLiteral() && b.Field != nil:
-		return b, a, flipped[t.Op], true
+// selfVsLiteral normalises "x op literal" and "literal op x" for the six
+// comparison operators.
+func selfVsLiteral(n *rule.Compare) (x rule.Expr, value any, op string, ok bool) {
+	if cmpOps[n.Op] == "" {
+		return nil, nil, "", false
+	}
+	if v, isLit := lit(n.Y); isLit {
+		if _, isField := n.X.(*rule.Field); isField {
+			return n.X, v, cmpOps[n.Op], true
+		}
+	}
+	if v, isLit := lit(n.X); isLit {
+		if _, isField := n.Y.(*rule.Field); isField {
+			return n.Y, v, flipped[n.Op], true
+		}
 	}
 	return nil, nil, "", false
 }
 
-// expr translates t into an aggregation expression (for $expr).
-func (tr *translator) expr(t *condition.TypedNode, sc scope) (any, error) {
-	switch {
-	case t.Field != nil:
-		return tr.fieldRef(t, sc), nil
-	case t.IsLiteral():
-		if t.Kind == condition.KindString && strings.HasPrefix(t.Lit.String(), "$") {
-			return doc("$literal", t.Lit.String()), nil // otherwise read as a field path
-		}
-		if t.Kind.IsList() {
-			return doc("$literal", lit(t.Lit)), nil
-		}
-		return lit(t.Lit), nil
+// fieldVsLiteral is selfVsLiteral restricted to document fields.
+func fieldVsLiteral(n *rule.Compare) (*rule.Field, any, string, bool) {
+	x, v, op, ok := selfVsLiteral(n)
+	if !ok {
+		return nil, nil, "", false
 	}
+	f, ok := docField(x)
+	return f, v, op, ok
+}
 
-	args := func() ([]any, error) {
-		out := make([]any, len(t.Args))
-		for i, a := range t.Args {
-			e, err := tr.expr(a, sc)
+// cond translates a condition into an aggregation expression (for $expr).
+func (tr *translator) cond(n rule.Cond, sc scope) (any, error) {
+	group := func(op string, items []rule.Cond, empty bool) (any, error) {
+		if len(items) == 0 {
+			return empty, nil
+		}
+		out := make([]any, len(items))
+		for i, it := range items {
+			e, err := tr.cond(it, sc)
 			if err != nil {
 				return nil, err
 			}
 			out[i] = e
 		}
-		return out, nil
+		return doc(op, out), nil
 	}
-	list := func(t *condition.TypedNode) (any, error) {
-		e, err := tr.expr(t, sc)
-		return doc("$ifNull", []any{e, doc("$literal", []any{})}), err
+	switch n := n.(type) {
+	case *rule.And:
+		return group("$and", n.Items, true)
+	case *rule.Or:
+		return group("$or", n.Items, false)
+	case *rule.Not:
+		e, err := tr.cond(n.X, sc)
+		return doc("$not", []any{e}), err
+	case *rule.Quant:
+		return tr.quant(n, sc)
+	case *rule.Compare:
+		return tr.compareExpr(n, sc)
 	}
+	return nil, tr.unsupported(n, "condition %T", n)
+}
 
-	switch t.Op {
-	case condition.OpAnd, condition.OpOr:
-		if len(t.Args) == 0 {
-			return t.Op == condition.OpAnd, nil
+func (tr *translator) compareExpr(n *rule.Compare, sc scope) (any, error) {
+	if n.Op.IsList() {
+		if l, ok := lit(n.Y); ok && len(l.([]any)) == 0 {
+			return n.Op == rule.OpNin, nil
 		}
-		as, err := args()
-		return doc(logicOps[t.Op], as), err
-	case condition.OpNot:
-		as, err := args()
-		return doc("$not", as), err
-	case condition.OpEq, condition.OpNe, condition.OpLt, condition.OpLe, condition.OpGt, condition.OpGe:
-		as, err := args()
-		return doc(cmpOps[t.Op], as), err
-	case condition.OpAdd, condition.OpSub, condition.OpMul, condition.OpDiv:
-		as, err := args()
-		return doc(arithOps[t.Op], as), err
-	case condition.OpContains, condition.OpStartsWith, condition.OpEndsWith:
-		as, err := args()
-		if err != nil {
-			return nil, err
-		}
-		x, y := as[0], as[1]
-		idx := doc("$indexOfBytes", []any{x, y})
-		switch t.Op {
-		case condition.OpContains:
-			return doc("$gte", []any{idx, 0}), nil
-		case condition.OpStartsWith:
-			return doc("$eq", []any{idx, 0}), nil
-		}
+	}
+	x, err := tr.expr(n.X, sc)
+	if err != nil {
+		return nil, err
+	}
+	y, err := tr.expr(n.Y, sc)
+	if err != nil {
+		return nil, err
+	}
+	switch n.Op {
+	case rule.OpContains:
+		return doc("$gte", []any{doc("$indexOfBytes", []any{x, y}), 0}), nil
+	case rule.OpStartsWith:
+		return doc("$eq", []any{doc("$indexOfBytes", []any{x, y}), 0}), nil
+	case rule.OpEndsWith:
 		lx, ly := doc("$strLenBytes", x), doc("$strLenBytes", y)
 		tail := doc("$substrBytes", []any{x, doc("$subtract", []any{lx, ly}), ly})
 		return doc("$and", []any{doc("$gte", []any{lx, ly}), doc("$eq", []any{tail, y})}), nil
-	case condition.OpIn, condition.OpNotIn:
-		if t.Args[1].Kind == condition.KindEmptyList {
-			return t.Op == condition.OpNotIn, nil
+	case rule.OpIn, rule.OpNin:
+		in := doc("$in", []any{x, orEmpty(y)})
+		if n.Op == rule.OpNin {
+			return doc("$not", []any{in}), nil
 		}
-		x, err := tr.expr(t.Args[0], sc)
-		if err != nil {
-			return nil, err
-		}
-		l, err := list(t.Args[1])
-		in := doc("$in", []any{x, l})
-		if t.Op == condition.OpNotIn {
-			return doc("$not", []any{in}), err
-		}
-		return in, err
-	case condition.OpLen:
-		l, err := list(t.Args[0])
-		return doc("$size", l), err
-	case condition.OpAny, condition.OpAll, condition.OpNone:
-		items, err := list(t.Args[0])
-		if err != nil {
-			return nil, err
-		}
-		tr.vars++
-		v := "e" + strconv.Itoa(tr.vars)
-		elem := scope{key: sc.key + t.Args[0].Field.Name + ".", elemVar: v}
-		pred, err := tr.expr(t.Args[1], elem)
-		if err != nil {
-			return nil, err
-		}
-		mapped := []any{doc("$map", map[string]any{"input": items, "as": v, "in": pred})}
-		switch t.Op {
-		case condition.OpAny:
-			return doc("$anyElementTrue", mapped), nil
-		case condition.OpAll:
-			return doc("$allElementsTrue", mapped), nil
-		default:
-			return doc("$not", []any{doc("$anyElementTrue", mapped)}), nil
-		}
+		return in, nil
 	}
-	return nil, unsupported(t, "operator %s", t.Op)
+	return doc(cmpOps[n.Op], []any{x, y}), nil
 }
 
-func (tr *translator) fieldRef(t *condition.TypedNode, sc scope) string {
+// orEmpty treats a missing or null list as an empty one.
+func orEmpty(list any) any { return doc("$ifNull", []any{list, doc("$literal", []any{})}) }
+
+func (tr *translator) quant(n *rule.Quant, sc scope) (any, error) {
+	items, err := tr.expr(n.X, sc)
+	if err != nil {
+		return nil, err
+	}
+	tr.vars++
+	v := "e" + strconv.Itoa(tr.vars)
+	elem := scope{key: sc.key + n.X.Name + ".", elemVar: v}
+	pred, err := tr.cond(n.Y, elem)
+	if err != nil {
+		return nil, err
+	}
+	mapped := []any{doc("$map", map[string]any{"input": orEmpty(items), "as": v, "in": pred})}
+	switch n.Op {
+	case rule.OpAny:
+		return doc("$anyElementTrue", mapped), nil
+	case rule.OpAll:
+		return doc("$allElementsTrue", mapped), nil
+	default:
+		return doc("$not", []any{doc("$anyElementTrue", mapped)}), nil
+	}
+}
+
+// expr translates a value into an aggregation expression.
+func (tr *translator) expr(e rule.Expr, sc scope) (any, error) {
+	switch e := e.(type) {
+	case *rule.Field:
+		return tr.fieldRef(e, sc), nil
+	case *rule.String:
+		if strings.HasPrefix(e.V, "$") {
+			return doc("$literal", e.V), nil // otherwise read as a field path
+		}
+		return e.V, nil
+	case *rule.Numbers, *rule.Strings:
+		v, _ := lit(e)
+		return doc("$literal", v), nil
+	case *rule.Number, *rule.Bool:
+		v, _ := lit(e)
+		return v, nil
+	case *rule.Arith:
+		x, err := tr.expr(e.X, sc)
+		if err != nil {
+			return nil, err
+		}
+		y, err := tr.expr(e.Y, sc)
+		return doc(arithOps[e.Op], []any{x, y}), err
+	case *rule.Len:
+		return doc("$size", orEmpty(tr.fieldRef(e.X, sc))), nil
+	}
+	return nil, tr.unsupported(e, "expression %T", e)
+}
+
+func (tr *translator) fieldRef(f *rule.Field, sc scope) string {
 	if sc.elemVar != "" {
-		if t.Field.Name == condition.SelfField {
+		if f.Name == condition.SelfField {
 			return "$$" + sc.elemVar
 		}
-		return "$$" + sc.elemVar + "." + tr.path(t.Field, sc)
+		return "$$" + sc.elemVar + "." + tr.path(f, sc)
 	}
-	return "$" + tr.path(t.Field, sc)
+	return "$" + tr.path(f, sc)
 }

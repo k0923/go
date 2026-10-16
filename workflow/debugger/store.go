@@ -31,6 +31,14 @@ CREATE TABLE IF NOT EXISTS runs (
 	updated_at INTEGER NOT NULL,
 	last_seen INTEGER NOT NULL DEFAULT 0
 );
+CREATE TABLE IF NOT EXISTS deleted_runs (
+	id TEXT PRIMARY KEY
+);
+CREATE TABLE IF NOT EXISTS engine_event_ids (
+	run_id TEXT NOT NULL,
+	event_id TEXT NOT NULL,
+	PRIMARY KEY (run_id, event_id)
+);
 CREATE TABLE IF NOT EXISTS records (
 	run_id TEXT NOT NULL,
 	key TEXT NOT NULL,
@@ -213,6 +221,22 @@ func (s *Store) tx(ctx context.Context, run string, fn func(*txn) error) error {
 	defer s.mu.Unlock()
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
+		return err
+	}
+	// Acquire the SQLite writer lock before sampling the fencing clock.
+	// 在读取 fencing 时钟之前获取 SQLite 写锁。
+	if _, err = tx.ExecContext(ctx, `UPDATE runs SET id = id WHERE id = ?`, run); err != nil {
+		tx.Rollback()
+		return err
+	}
+	var deleted string
+	err = tx.QueryRowContext(ctx, `SELECT id FROM deleted_runs WHERE id = ?`, run).Scan(&deleted)
+	if err == nil {
+		tx.Rollback()
+		return workflow.ErrNotFound
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		tx.Rollback()
 		return err
 	}
 	t := &txn{tx: tx, s: s, run: run, now: s.now()}
@@ -658,6 +682,7 @@ func (s *Store) WaitAny(ctx context.Context, run, key string, requests []workflo
 			for i, request := range requests {
 				old := existing.Requests[i]
 				if request.Key != old.Key || request.Kind != old.Kind || request.Duration != old.Duration ||
+					(request.Error == "") != (old.Error == "") ||
 					!request.Until.Equal(old.Until) || !sameRaw(request.Request, old.Request) {
 					return workflow.ErrChanged
 				}
@@ -681,7 +706,7 @@ func (s *Store) WaitAny(ctx context.Context, run, key string, requests []workflo
 			}
 			switch request.Kind {
 			case workflow.SignalKind:
-				if !json.Valid(request.Request) {
+				if request.Error == "" && !json.Valid(request.Request) {
 					return workflow.ErrInvalid
 				}
 			case workflow.SleepKind:
@@ -707,6 +732,9 @@ func (s *Store) WaitAny(ctx context.Context, run, key string, requests []workflo
 			g.Requests = append(g.Requests, request)
 			record := &workflow.Record{Key: request.Key, Kind: request.Kind, Status: workflow.Suspended,
 				Version: 1, Input: clone(request.Request), StartedAt: t.now}
+			if request.Error != "" {
+				record.Status, record.Error, record.EndedAt = workflow.Failed, request.Error, t.now
+			}
 			if request.Kind == workflow.SleepKind {
 				record.Until = request.Until
 				if record.Until.IsZero() {
@@ -715,6 +743,10 @@ func (s *Store) WaitAny(ctx context.Context, run, key string, requests []workflo
 			}
 			if err = t.saveRecord(record, key); err != nil {
 				return err
+			}
+			if record.Status == workflow.Failed {
+				g.State.Failures = append(g.State.Failures, workflow.WaitFailure{Key: record.Key, Message: record.Error})
+				continue
 			}
 			g.State.Pending = append(g.State.Pending, pendingOf(record))
 			if record.Kind == workflow.SleepKind {
@@ -726,10 +758,16 @@ func (s *Store) WaitAny(ctx context.Context, run, key string, requests []workflo
 				return err
 			}
 		}
+		if len(g.State.Pending) == 0 {
+			g.State.Status = workflow.Failed
+			if err = t.enqueueID(key+"|"+workflow.WakeNotification+"|failed", key, workflow.WakeNotification, t.now); err != nil {
+				return err
+			}
+		}
 		if err = t.saveGroup(key, g); err != nil {
 			return err
 		}
-		t.log("store.wait_any", key, map[string]any{"status": workflow.Suspended, "pending": g.State.Pending})
+		t.log("store.wait_any", key, map[string]any{"status": g.State.Status, "pending": g.State.Pending})
 		if err = t.advanceGroup(key); err != nil {
 			return err
 		}
@@ -876,7 +914,7 @@ func (t *txn) failWait(key string, version int64, message string) (bool, error) 
 
 func (s *Store) Register(ctx context.Context, spec RunSpec) (RunInfo, error) {
 	if spec.ID == "" {
-		spec.ID = spec.Workflow + "-" + uuid.NewString()[:8]
+		spec.ID = spec.Workflow + "-" + uuid.NewString()
 	}
 	err := s.tx(ctx, spec.ID, func(t *txn) error {
 		var status string
@@ -923,6 +961,21 @@ func (s *Store) AppendEvents(ctx context.Context, run string, events []json.RawM
 		for _, event := range events {
 			if !json.Valid(event) {
 				return workflow.ErrInvalid
+			}
+			var identity struct {
+				ID string `json:"id"`
+			}
+			if err := json.Unmarshal(event, &identity); err != nil {
+				return workflow.ErrInvalid
+			}
+			if identity.ID != "" {
+				res, err := t.exec(`INSERT OR IGNORE INTO engine_event_ids (run_id, event_id) VALUES (?, ?)`, run, identity.ID)
+				if err != nil {
+					return err
+				}
+				if n, _ := res.RowsAffected(); n == 0 {
+					continue
+				}
 			}
 			if _, err := t.exec(`INSERT INTO events (run_id, source, at, payload) VALUES (?, 'engine', ?, ?)`,
 				run, ts(t.now), string(event)); err != nil {
@@ -1016,7 +1069,11 @@ func (s *Store) Delete(ctx context.Context, run string) error {
 	if err != nil {
 		return err
 	}
-	for _, table := range []string{"records", "leases", "messages", "wait_groups", "events"} {
+	if _, err = tx.ExecContext(ctx, `INSERT OR IGNORE INTO deleted_runs (id) VALUES (?)`, run); err != nil {
+		tx.Rollback()
+		return err
+	}
+	for _, table := range []string{"records", "leases", "messages", "wait_groups", "events", "engine_event_ids"} {
 		if _, err = tx.Exec(`DELETE FROM `+table+` WHERE run_id = ?`, run); err != nil {
 			tx.Rollback()
 			return err

@@ -70,6 +70,9 @@ type WaitRequest struct {
 	Kind     Kind
 	Duration time.Duration
 	Until    time.Time
+	// Error isolates an unusable request while preserving its ordered identity.
+	// Error 隔离不可用请求，同时保留其有序身份。
+	Error string `json:",omitempty"`
 }
 
 type WaitAnyState struct {
@@ -155,7 +158,6 @@ func (f *FlowContext) WaitAny[R, Q any](key string, cases ...WaitCase[Q]) (resul
 		}
 	}
 	var requests []WaitRequest
-	var failures []WaitFailure
 	for i, candidate := range cases {
 		kind := candidate.Kind
 		if kind == "" {
@@ -166,18 +168,14 @@ func (f *FlowContext) WaitAny[R, Q any](key string, cases ...WaitCase[Q]) (resul
 		if kind != SleepKind {
 			raw, marshalErr = invoke(func() (json.RawMessage, error) { return json.Marshal(candidate.Request) })
 		}
-		if marshalErr != nil {
-			failures = append(failures, WaitFailure{Key: keys[i], Message: marshalErr.Error()})
-			continue
-		}
-		requests = append(requests, WaitRequest{
+		request := WaitRequest{
 			Key: keys[i], Request: raw, Kind: kind,
 			Duration: candidate.Duration, Until: candidate.Until,
-		})
-	}
-	if len(requests) == 0 {
-		result.Failures = failures
-		return result, Permanent(fmt.Errorf("wait group %s has no usable candidates: %v", group, failures))
+		}
+		if marshalErr != nil {
+			request.Error = marshalErr.Error()
+		}
+		requests = append(requests, request)
 	}
 	state, stateErr := api.WaitAny(f.Context(), group, requests)
 	if stateErr != nil {
@@ -186,7 +184,7 @@ func (f *FlowContext) WaitAny[R, Q any](key string, cases ...WaitCase[Q]) (resul
 	if state == nil {
 		return result, fmt.Errorf("%w: nil WaitAny snapshot", ErrInvalid)
 	}
-	result.Failures = append(failures, state.Failures...)
+	result.Failures = append([]WaitFailure(nil), state.Failures...)
 	switch state.Status {
 	case Completed:
 		result.Key = state.WinnerKey

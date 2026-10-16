@@ -9,25 +9,25 @@
 //     adult := condition.Ge(condition.Field(func(u User) int { return u.Age }), condition.Const[User](18))
 //     rule := condition.And(adult, condition.In(city, "bj", "sh"))
 //
-//  2. A declarative Node tree (JSON friendly) checked against a Schema. All
-//     validation — unknown operators, unknown fields, kind mismatches, arity,
-//     constant division by zero, nesting depth — happens once in Check and is
-//     reported as a *CompileError carrying the JSON path of the offending node.
-//     Check yields a *TypedNode, the backend-neutral intermediate form:
+//  2. Declarative rules (package rule) checked against a Schema. A rule is a
+//     tree of closed node types — And, Or, Not, Compare, Quant for
+//     conditions; Field, literals, Arith, Len for values — with a flat JSON
+//     form such as {"type":"number","x":"amount","opt":"gte","y":100}. The
+//     left operand may be any expression, not only a field. All validation —
+//     unknown types, opt values, fields, kind mismatches, constant division
+//     by zero, nesting depth — happens in rule.Parse and Schema.Check and is
+//     reported as a *CompileError carrying the JSON path of the bad node:
 //
-//     Node ─Check─> TypedNode ─┬─ Compile            -> Condition[T] (Match)
-//     ├─ sqlquery.Where     -> SQL WHERE + args
-//     └─ mongoquery.Filter  -> MongoDB filter
+//     JSON ─rule.Parse─> rule.Cond ─Schema.Check─> *Checked ─┬─ Schema.Build     -> Condition[T] (Match)
+//     ├─ sqlquery.Where   -> SQL WHERE + args
+//     └─ mongoquery.Filter -> MongoDB filter
 //
-//     Every consumer reads the same TypedNode, so evaluation and generated
+//     Every consumer reads the same *Checked, so evaluation and generated
 //     queries cannot disagree about what a rule means. New backends (ES,
-//     ClickHouse, ...) are written the same way against TypedNode.
-//     Match never has to re-validate configuration.
-//
-//     Node.Value is untyped only because it is the wire format. TypedNode
-//     carries an Operator enum and a *Literal whose accessor must match its
-//     Kind, so backends never type-assert on any. In Go code, build nodes
-//     with Op(OpXxx, ...) and the typed LitXxx constructors.
+//     ClickHouse, ...) are written the same way: a type switch over the rule
+//     node types, with Checked.Field for the resolved field of a reference.
+//     No node carries an untyped value: literals are *rule.Number,
+//     *rule.Strings and so on, decoded according to the comparison type.
 //
 // Semantics worth knowing:
 //

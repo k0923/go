@@ -45,10 +45,10 @@ func ExampleSchema_CompileJSON() {
 		List("lines", func(o Order) []Line { return o.Lines }, lineSchema)
 
 	rule, err := schema.CompileJSON([]byte(`{
-		"op": "and",
-		"args": [
-			{"op": "ge", "args": [{"field": "amount"}, {"value": 100}]},
-			{"op": "all", "args": [{"field": "lines"}, {"op": "starts_with", "args": [{"field": "sku"}, {"value": "A-"}]}]}
+		"type": "and",
+		"items": [
+			{"type": "number", "x": "amount", "opt": "gte", "y": 100},
+			{"type": "array", "x": "lines", "opt": "all", "y": {"type": "string", "x": "sku", "opt": "starts_with", "y": "A-"}}
 		]
 	}`))
 	if err != nil {
@@ -58,9 +58,9 @@ func ExampleSchema_CompileJSON() {
 	fmt.Println(ok)
 
 	// Configuration mistakes are caught once, at compile time, with a path.
-	_, err = schema.CompileJSON([]byte(`{"op":"gt","args":[{"field":"country"},{"value":1}]}`))
+	_, err = schema.CompileJSON([]byte(`{"type":"number","x":"country","opt":"gt","y":1}`))
 	fmt.Println(errors.Is(err, condition.ErrTypeMismatch), err)
 	// Output:
 	// true
-	// true condition: $: type mismatch: gt on string and number
+	// true condition: $.x: type mismatch: want number, got string
 }

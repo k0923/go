@@ -35,6 +35,7 @@ func (m *MemoryInfrastructure) WaitAny(ctx context.Context, key string, requests
 			old := existing.requests[i]
 			if request.Key != old.Key || request.Kind != old.Kind ||
 				request.Duration != old.Duration || !request.Until.Equal(old.Until) ||
+				(request.Error == "") != (old.Error == "") ||
 				!bytes.Equal(request.Request, old.Request) {
 				return nil, ErrChanged
 			}
@@ -52,7 +53,7 @@ func (m *MemoryInfrastructure) WaitAny(ctx context.Context, key string, requests
 		}
 		switch request.Kind {
 		case SignalKind:
-			if !json.Valid(request.Request) {
+			if request.Error == "" && !json.Valid(request.Request) {
 				return nil, ErrInvalid
 			}
 		case SleepKind:
@@ -71,6 +72,9 @@ func (m *MemoryInfrastructure) WaitAny(ctx context.Context, key string, requests
 		storedRequest.Request = raw
 		group.requests = append(group.requests, storedRequest)
 		record := &Record{Key: request.Key, Kind: request.Kind, Status: Suspended, Version: 1, Input: raw, StartedAt: m.now()}
+		if request.Error != "" {
+			record.Status, record.Error, record.EndedAt = Failed, request.Error, m.now()
+		}
 		if request.Kind == SleepKind {
 			record.Until = request.Until
 			if record.Until.IsZero() {
@@ -79,6 +83,10 @@ func (m *MemoryInfrastructure) WaitAny(ctx context.Context, key string, requests
 		}
 		m.records[request.Key] = record
 		m.waitOwners[request.Key] = key
+		if record.Status == Failed {
+			group.state.Failures = append(group.state.Failures, WaitFailure{Key: record.Key, Message: record.Error})
+			continue
+		}
 		group.state.Pending = append(group.state.Pending, pendingRecord(record))
 		if record.Kind == SleepKind {
 			m.enqueue(record, WakeNotification, record.Until)
@@ -87,6 +95,11 @@ func (m *MemoryInfrastructure) WaitAny(ctx context.Context, key string, requests
 		}
 	}
 	m.waitGroups[key] = group
+	if len(group.state.Pending) == 0 {
+		group.state.Status = Failed
+		id := fmt.Sprintf("%s|%s|failed", key, WakeNotification)
+		m.messages[id] = Notification{ID: id, Key: key, Purpose: WakeNotification, AvailableAt: m.now()}
+	}
 	m.advanceWaitGroup(key)
 	return copyWaitAnyState(group.state), nil
 }

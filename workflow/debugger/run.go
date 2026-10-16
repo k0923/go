@@ -3,11 +3,13 @@ package debugger
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"sync"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/k0923/go/workflow"
 )
 
@@ -57,7 +59,7 @@ func Run[I, O any](ctx context.Context, definition workflow.Workflow[I, O], inpu
 	}
 	runID := options.RunID
 	if runID == "" {
-		runID = fmt.Sprintf("%s-%d", definition.Name, time.Now().UnixMilli())
+		runID = definition.Name + "-" + uuid.NewString()
 	}
 	client, err := NewClient(options.Server, runID)
 	if err != nil {
@@ -79,14 +81,43 @@ func Run[I, O any](ctx context.Context, definition workflow.Workflow[I, O], inpu
 	if err != nil {
 		return zero, err
 	}
-	events := newForwarder(client)
+	events := newForwarder(client, logf)
 	unsubscribe := engine.Subscribe(events.add)
 	defer unsubscribe()
 	defer events.close()
 
+	var wakes []workflow.Notification
 	for {
+		due, pollErr := client.WaitWake(ctx, time.Nanosecond)
+		if errors.Is(pollErr, workflow.ErrNotFound) {
+			return zero, pollErr
+		}
+		seen := make(map[string]bool, len(wakes))
+		for _, notification := range wakes {
+			seen[notification.ID] = true
+		}
+		for _, notification := range due {
+			if !seen[notification.ID] {
+				wakes = append(wakes, notification)
+				seen[notification.ID] = true
+			}
+		}
 		result, driveErr := engine.Drive(ctx, definition, input)
 		events.flush()
+		var ackErr error
+		if ctx.Err() == nil && (driveErr == nil || result.Status == workflow.Failed) {
+			var remaining []workflow.Notification
+			for _, notification := range wakes {
+				ackCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+				err := client.Ack(ackCtx, notification.ID)
+				cancel()
+				if err != nil {
+					remaining = append(remaining, notification)
+					ackErr = errors.Join(ackErr, err)
+				}
+			}
+			wakes = remaining
+		}
 		report := Report{Status: string(result.Status), Pending: result.Pending}
 		if driveErr != nil {
 			report.Error = driveErr.Error()
@@ -102,6 +133,18 @@ func Run[I, O any](ctx context.Context, definition workflow.Workflow[I, O], inpu
 			logf("[wfdebug] report failed: %v", err)
 		}
 		cancel()
+		if ackErr != nil && ctx.Err() == nil {
+			if errors.Is(ackErr, workflow.ErrNotFound) {
+				return result, ackErr
+			}
+			logf("[wfdebug] wake acknowledgement failed, retrying: %v", ackErr)
+			select {
+			case <-ctx.Done():
+				return result, ctx.Err()
+			case <-time.After(options.RetryDelay):
+			}
+			continue
+		}
 
 		switch {
 		case ctx.Err() != nil:
@@ -111,6 +154,8 @@ func Run[I, O any](ctx context.Context, definition workflow.Workflow[I, O], inpu
 			return result, nil
 		case result.Status == workflow.Failed:
 			logf("[wfdebug] run %s FAILED: %v", runID, driveErr)
+			return result, driveErr
+		case errors.Is(driveErr, workflow.ErrNotFound):
 			return result, driveErr
 		case driveErr != nil:
 			logf("[wfdebug] run %s retryable error, re-driving in %s: %v", runID, options.RetryDelay, driveErr)
@@ -126,26 +171,42 @@ func Run[I, O any](ctx context.Context, definition workflow.Workflow[I, O], inpu
 			keys[i] = string(pending.Kind) + ":" + pending.Key
 		}
 		logf("[wfdebug] run %s SUSPENDED on %v", runID, keys)
-		if err := waitForWake(ctx, client); err != nil {
+		wakes, err = waitForWake(ctx, client, result.Pending)
+		if err != nil {
 			return result, err
 		}
 	}
 }
 
-// waitForWake blocks until at least one WAKE is due, then acknowledges every
-// due wake: a single Drive replays the whole definition and consumes them all.
-// waitForWake 会阻塞，直到至少一个 WAKE 到期，然后确认所有到期 wake：
-// 单次 Drive 会回放整个定义并消费它们。
-func waitForWake(ctx context.Context, client *Client) error {
+// Return wakes without acknowledging them; the next successful Drive owns ACK.
+// Recheck durable waits so a redundant worker cannot retain a stale suspension.
+// 返回唤醒但不确认，由下一次成功 Drive 确认。复核持久等待，
+// 避免冗余 worker 一直持有陈旧的挂起快照。
+func waitForWake(ctx context.Context, client *Client, pending []workflow.Pending) ([]workflow.Notification, error) {
 	for {
-		notifications, err := client.WaitWake(ctx, 20*time.Second)
-		if err != nil {
+		for _, wait := range pending {
+			record, err := client.Get(ctx, wait.Key)
 			if ctx.Err() != nil {
-				return ctx.Err()
+				return nil, ctx.Err()
+			}
+			if errors.Is(err, workflow.ErrNotFound) {
+				return nil, err
+			}
+			if err == nil && record != nil && record.Status != workflow.Suspended {
+				return nil, nil
+			}
+		}
+		notifications, err := client.WaitWake(ctx, 2*time.Second)
+		if err != nil {
+			if errors.Is(err, workflow.ErrNotFound) {
+				return nil, err
+			}
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
 			}
 			select {
 			case <-ctx.Done():
-				return ctx.Err()
+				return nil, ctx.Err()
 			case <-time.After(time.Second):
 			}
 			continue
@@ -153,12 +214,7 @@ func waitForWake(ctx context.Context, client *Client) error {
 		if len(notifications) == 0 {
 			continue
 		}
-		for _, notification := range notifications {
-			if err = client.Ack(ctx, notification.ID); err != nil && ctx.Err() != nil {
-				return ctx.Err()
-			}
-		}
-		return nil
+		return notifications, nil
 	}
 }
 
@@ -168,6 +224,7 @@ func waitForWake(ctx context.Context, client *Client) error {
 // 且必须快速返回。
 type forwarder struct {
 	client *Client
+	logf   func(string, ...any)
 	mu     sync.Mutex
 	buffer []json.RawMessage
 	signal chan chan struct{}
@@ -175,8 +232,8 @@ type forwarder struct {
 	wg     sync.WaitGroup
 }
 
-func newForwarder(client *Client) *forwarder {
-	f := &forwarder{client: client, signal: make(chan chan struct{}, 1), done: make(chan struct{})}
+func newForwarder(client *Client, logf func(string, ...any)) *forwarder {
+	f := &forwarder{client: client, logf: logf, signal: make(chan chan struct{}, 1), done: make(chan struct{})}
 	f.wg.Add(1)
 	go f.loop()
 	return f
@@ -185,9 +242,15 @@ func newForwarder(client *Client) *forwarder {
 func (f *forwarder) add(_ context.Context, event workflow.Event) {
 	raw, err := json.Marshal(event)
 	if err != nil {
+		f.logf("[wfdebug] event encoding failed, timeline incomplete: %v", err)
 		return
 	}
 	f.mu.Lock()
+	if len(f.buffer) >= 4096 {
+		f.mu.Unlock()
+		f.logf("[wfdebug] event buffer full, timeline incomplete")
+		return
+	}
 	f.buffer = append(f.buffer, raw)
 	f.mu.Unlock()
 }
@@ -200,9 +263,29 @@ func (f *forwarder) send() {
 	if len(batch) == 0 {
 		return
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	_ = f.client.PushEvents(ctx, batch)
+	var err error
+	for attempt := 0; attempt < 3; attempt++ {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		err = f.client.PushEvents(ctx, batch)
+		cancel()
+		if err == nil {
+			return
+		}
+		f.logf("[wfdebug] event forwarding failed: %v", err)
+		if errors.Is(err, workflow.ErrNotFound) {
+			return
+		}
+	}
+	f.mu.Lock()
+	f.buffer = append(batch, f.buffer...)
+	overflow := len(f.buffer) > 4096
+	if overflow {
+		f.buffer = f.buffer[:4096]
+	}
+	f.mu.Unlock()
+	if overflow {
+		f.logf("[wfdebug] event buffer full, timeline incomplete")
+	}
 }
 
 func (f *forwarder) loop() {
@@ -241,4 +324,10 @@ func (f *forwarder) close() {
 		close(f.done)
 	}
 	f.wg.Wait()
+	f.mu.Lock()
+	pending := len(f.buffer)
+	f.mu.Unlock()
+	if pending > 0 {
+		f.logf("[wfdebug] %d events could not be forwarded, timeline incomplete", pending)
+	}
 }

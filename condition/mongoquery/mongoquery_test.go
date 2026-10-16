@@ -8,6 +8,7 @@ import (
 
 	"github.com/k0923/go/condition"
 	"github.com/k0923/go/condition/mongoquery"
+	"github.com/k0923/go/condition/rule"
 )
 
 type item struct {
@@ -99,40 +100,36 @@ func fixture() []order {
 }
 
 var rules = map[string]string{
-	"le sub":           `{"op":"le","args":[{"op":"sub","args":[{"field":"amount"},{"field":"id"}]},{"value":120}]}`,
-	"le string":        `{"op":"le","args":[{"value":"SG"},{"field":"country"}]}`,
-	"compare":          `{"op":"and","args":[{"op":"ge","args":[{"field":"amount"},{"value":100}]},{"op":"lt","args":[{"field":"country"},{"value":"SG"}]}]}`,
-	"flipped":          `{"op":"lt","args":[{"value":100},{"field":"amount"}]}`,
-	"bool field":       `{"op":"or","args":[{"field":"vip"},{"op":"eq","args":[{"field":"vip"},{"value":false}]}]}`,
-	"bool eq expr":     `{"op":"eq","args":[{"field":"vip"},{"op":"gt","args":[{"field":"amount"},{"value":50}]}]}`,
-	"not":              `{"op":"not","args":[{"op":"in","args":[{"field":"country"},{"value":["CN","SG"]}]}]}`,
-	"regex meta":       `{"op":"contains","args":[{"field":"note"},{"value":".5*"}]}`,
-	"starts_with":      `{"op":"starts_with","args":[{"field":"note"},{"value":"^g"}]}`,
-	"ends_with":        `{"op":"ends_with","args":[{"field":"note"},{"value":"(b)"}]}`,
-	"ends_with field":  `{"op":"ends_with","args":[{"field":"country"},{"field":"note"}]}`,
-	"dollar literal":   `{"op":"any","args":[{"field":"tags"},{"op":"ne","args":[{"field":"$"},{"value":"$note"}]}]}`,
-	"dollar str expr":  `{"op":"or","args":[{"op":"eq","args":[{"field":"note"},{"field":"country"}]},{"op":"starts_with","args":[{"field":"note"},{"value":"$x"}]}]}`,
-	"field vs field":   `{"op":"ge","args":[{"field":"note"},{"field":"country"}]}`,
-	"arith":            `{"op":"gt","args":[{"op":"div","args":[{"op":"mul","args":[{"field":"amount"},{"value":3}]},{"value":2}]},{"op":"add","args":[{"field":"id"},{"value":0.5}]}]}`,
-	"in empty":         `{"op":"in","args":[{"field":"country"},{"value":[]}]}`,
-	"not_in empty":     `{"op":"not_in","args":[{"field":"country"},{"value":[]}]}`,
-	"tag member":       `{"op":"in","args":[{"value":"sale"},{"field":"tags"}]}`,
-	"tag not member":   `{"op":"not_in","args":[{"value":"new"},{"field":"tags"}]}`,
-	"len":              `{"op":"ge","args":[{"op":"len","args":[{"field":"items"}]},{"value":2}]}`,
-	"len tags zero":    `{"op":"eq","args":[{"op":"len","args":[{"field":"tags"}]},{"value":0}]}`,
-	"any item":         `{"op":"any","args":[{"field":"items"},{"op":"and","args":[{"op":"eq","args":[{"field":"category"},{"value":"book"}]},{"op":"gt","args":[{"field":"price"},{"value":50}]}]}]}`,
-	"all items":        `{"op":"all","args":[{"field":"items"},{"op":"lt","args":[{"field":"price"},{"value":60}]}]}`,
-	"none items":       `{"op":"none","args":[{"field":"items"},{"op":"in","args":[{"field":"category"},{"value":["food","toy"]}]}]}`,
-	"all items expr":   `{"op":"all","args":[{"field":"items"},{"op":"lt","args":[{"op":"mul","args":[{"field":"price"},{"value":2}]},{"value":100}]}]}`,
-	"all tags":         `{"op":"all","args":[{"field":"tags"},{"op":"ne","args":[{"field":"$"},{"value":"NEW"}]}]}`,
-	"any scores":       `{"op":"any","args":[{"field":"scores"},{"op":"ge","args":[{"field":"$"},{"value":90}]}]}`,
-	"none tags prefix": `{"op":"none","args":[{"field":"tags"},{"op":"starts_with","args":[{"field":"$"},{"value":"ne"}]}]}`,
-	"empty and/or":     `{"op":"or","args":[{"op":"and"},{"op":"or"}]}`,
-	"mixed native+expr": `{"op":"and","args":[
-		{"op":"or","args":[{"field":"vip"},{"op":"ge","args":[{"field":"amount"},{"value":150}]}]},
-		{"op":"not_in","args":[{"field":"country"},{"value":["US"]}]},
-		{"op":"gt","args":[{"op":"len","args":[{"field":"items"}]},{"op":"len","args":[{"field":"tags"}]}]},
-		{"op":"none","args":[{"field":"tags"},{"op":"eq","args":[{"field":"$"},{"value":"gift"}]}]}]}`,
+	"le sub":            `{"type":"number","x":{"type":"arith","x":"amount","opt":"sub","y":{"type":"field","name":"id"}},"opt":"lte","y":120}`,
+	"le string":         `{"type":"string","x":{"type":"literal","value":"SG"},"opt":"lte","y":{"type":"field","name":"country"}}`,
+	"compare":           `{"type":"and","items":[{"type":"number","x":"amount","opt":"gte","y":100},{"type":"string","x":"country","opt":"lt","y":"SG"}]}`,
+	"flipped":           `{"type":"number","x":100,"opt":"lt","y":{"type":"field","name":"amount"}}`,
+	"bool field":        `{"type":"or","items":[{"type":"boolean","x":"vip","opt":"eq","y":true},{"type":"boolean","x":"vip","opt":"eq","y":false}]}`,
+	"bool eq expr":      `{"type":"boolean","x":"vip","opt":"ne","y":false}`,
+	"not":               `{"type":"not","x":{"type":"string","x":"country","opt":"in","y":["CN","SG"]}}`,
+	"regex meta":        `{"type":"string","x":"note","opt":"contains","y":".5*"}`,
+	"starts_with":       `{"type":"string","x":"note","opt":"starts_with","y":"^g"}`,
+	"ends_with":         `{"type":"string","x":"note","opt":"ends_with","y":"(b)"}`,
+	"ends_with field":   `{"type":"string","x":"country","opt":"ends_with","y":{"type":"field","name":"note"}}`,
+	"dollar literal":    `{"type":"array","x":"tags","opt":"any","y":{"type":"string","x":"$","opt":"ne","y":"$note"}}`,
+	"dollar str expr":   `{"type":"or","items":[{"type":"string","x":"note","opt":"eq","y":{"type":"field","name":"country"}},{"type":"string","x":"note","opt":"starts_with","y":"$x"}]}`,
+	"field vs field":    `{"type":"string","x":"note","opt":"gte","y":{"type":"field","name":"country"}}`,
+	"arith":             `{"type":"number","x":{"type":"arith","x":{"type":"arith","x":"amount","opt":"mul","y":3},"opt":"div","y":2},"opt":"gt","y":{"type":"arith","x":"id","opt":"add","y":0.5}}`,
+	"in empty":          `{"type":"string","x":"country","opt":"in","y":[]}`,
+	"not_in empty":      `{"type":"string","x":"country","opt":"nin","y":[]}`,
+	"tag member":        `{"type":"string","x":{"type":"literal","value":"sale"},"opt":"in","y":{"type":"field","name":"tags"}}`,
+	"tag not member":    `{"type":"string","x":{"type":"literal","value":"new"},"opt":"nin","y":{"type":"field","name":"tags"}}`,
+	"len":               `{"type":"number","x":{"type":"len","x":"items"},"opt":"gte","y":2}`,
+	"len tags zero":     `{"type":"number","x":{"type":"len","x":"tags"},"opt":"eq","y":0}`,
+	"any item":          `{"type":"array","x":"items","opt":"any","y":{"type":"and","items":[{"type":"string","x":"category","opt":"eq","y":"book"},{"type":"number","x":"price","opt":"gt","y":50}]}}`,
+	"all items":         `{"type":"array","x":"items","opt":"all","y":{"type":"number","x":"price","opt":"lt","y":60}}`,
+	"none items":        `{"type":"array","x":"items","opt":"none","y":{"type":"string","x":"category","opt":"in","y":["food","toy"]}}`,
+	"all items expr":    `{"type":"array","x":"items","opt":"all","y":{"type":"number","x":{"type":"arith","x":"price","opt":"mul","y":2},"opt":"lt","y":100}}`,
+	"all tags":          `{"type":"array","x":"tags","opt":"all","y":{"type":"string","x":"$","opt":"ne","y":"NEW"}}`,
+	"any scores":        `{"type":"array","x":"scores","opt":"any","y":{"type":"number","x":"$","opt":"gte","y":90}}`,
+	"none tags prefix":  `{"type":"array","x":"tags","opt":"none","y":{"type":"string","x":"$","opt":"starts_with","y":"ne"}}`,
+	"empty and/or":      `{"type":"or","items":[{"type":"and","items":[]},{"type":"or","items":[]}]}`,
+	"mixed native+expr": `{"type":"and","items":[{"type":"or","items":[{"type":"boolean","x":"vip","opt":"eq","y":true},{"type":"number","x":"amount","opt":"gte","y":150}]},{"type":"string","x":"country","opt":"nin","y":["US"]},{"type":"number","x":{"type":"len","x":"items"},"opt":"gt","y":{"type":"len","x":"tags"}},{"type":"array","x":"tags","opt":"none","y":{"type":"string","x":"$","opt":"eq","y":"gift"}}]}`,
 }
 
 // TestDifferential compares in-memory evaluation with the generated filter
@@ -168,12 +165,7 @@ func TestDifferential(t *testing.T) {
 }
 
 func TestNativeOperatorsPreferred(t *testing.T) {
-	typed, _ := schema().CheckJSON([]byte(`{"op":"and","args":[
-		{"op":"ge","args":[{"field":"amount"},{"value":100}]},
-		{"op":"in","args":[{"field":"country"},{"value":["CN","SG"]}]},
-		{"op":"starts_with","args":[{"field":"note"},{"value":"a.b"}]},
-		{"op":"any","args":[{"field":"items"},{"op":"gt","args":[{"field":"price"},{"value":50}]}]},
-		{"op":"gt","args":[{"op":"len","args":[{"field":"tags"}]},{"value":1}]}]}`))
+	typed, _ := schema().CheckJSON([]byte(`{"type":"and","items":[{"type":"number","x":"amount","opt":"gte","y":100},{"type":"string","x":"country","opt":"in","y":["CN","SG"]},{"type":"string","x":"note","opt":"starts_with","y":"a.b"},{"type":"array","x":"items","opt":"any","y":{"type":"number","x":"price","opt":"gt","y":50}},{"type":"number","x":{"type":"len","x":"tags"},"opt":"gt","y":1}]}`))
 	f, err := mongoquery.Filter(typed, opts)
 	if err != nil {
 		t.Fatal(err)
@@ -218,25 +210,27 @@ func FuzzDifferential(f *testing.F) {
 	})
 }
 
-// TestEveryOperatorCovered fails when an operator is added to condition but
-// no differential rule exercises it here.
+// TestEveryOperatorCovered fails when an operator is added to the rule
+// package but no differential rule exercises it here.
 func TestEveryOperatorCovered(t *testing.T) {
-	seen := map[condition.Operator]bool{}
-	var walk func(*condition.TypedNode)
-	walk = func(n *condition.TypedNode) {
-		seen[n.Op] = true
-		for _, a := range n.Args {
-			walk(a)
-		}
-	}
+	seen := map[rule.Op]bool{}
 	for _, src := range rules {
-		typed, err := schema().CheckJSON([]byte(src))
+		r, err := rule.Parse([]byte(src))
 		if err != nil {
 			t.Fatal(err)
 		}
-		walk(typed)
+		rule.Walk(r, func(n rule.Node) {
+			switch n := n.(type) {
+			case *rule.Compare:
+				seen[n.Op] = true
+			case *rule.Quant:
+				seen[n.Op] = true
+			case *rule.Arith:
+				seen[n.Op] = true
+			}
+		})
 	}
-	for _, op := range condition.Operators() {
+	for _, op := range rule.Ops() {
 		if !seen[op] {
 			t.Errorf("no differential rule uses %s", op)
 		}

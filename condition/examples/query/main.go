@@ -3,17 +3,17 @@
 //
 // One JSON rule (rule.json), three consumers:
 //
-//	                       ┌─> Compile  -> Condition[Order]  (in-memory Match)
-//	rule.json -> Check ────┼─> sqlquery.Where   -> WHERE ... + args
-//	         (TypedNode)   └─> mongoquery.Filter -> {"$and": [...]}
+//	                                ┌─> Build  -> Condition[Order]  (in-memory Match)
+//	rule.json -> Parse -> Check ────┼─> sqlquery.Where   -> WHERE ... + args
+//	                    (*Checked)  └─> mongoquery.Filter -> {"$and": [...]}
 //
-// Check validates once against the Schema and produces a TypedNode; every
-// backend consumes that same TypedNode, so they cannot disagree about what a
+// Check validates once against the Schema and produces a *Checked; every
+// backend consumes that same *Checked, so they cannot disagree about what a
 // rule means. The SQL is executed against an in-memory SQLite database and
 // compared with in-memory matching to show the results are identical.
 //
 // 同一份 JSON 规则（rule.json）供三方使用：
-// Check 基于 Schema 校验一次并生成 TypedNode；所有后端都消费同一个 TypedNode，
+// Check 基于 Schema 校验一次并生成 *Checked；所有后端都消费同一个 *Checked，
 // 因此不会对规则含义产生分歧。示例会在内存 SQLite 中执行生成的 SQL，
 // 并与内存匹配结果比对，证明两者一致。
 package main
@@ -101,17 +101,14 @@ func main() {
 
 	// 1. Check once. All configuration errors would surface here.
 	// 1. 只校验一次，所有配置错误都会在这里暴露。
-	typed, err := schema.CheckJSON(ruleJSON)
+	checked, err := schema.CheckJSON(ruleJSON)
 	if err != nil {
 		panic(err)
 	}
 
 	// 2. In memory: e.g. validating an order in a request handler.
 	// 2. 内存求值：例如在请求处理中校验一笔订单。
-	match, err := schema.CompileJSON(ruleJSON)
-	if err != nil {
-		panic(err)
-	}
+	match := schema.Build(checked)
 	var inMemory []int
 	for _, o := range orders {
 		if ok, _ := match.Match(o); ok {
@@ -122,7 +119,7 @@ func main() {
 
 	// 3. SQL: list fields are backed by child tables via Relations.
 	// 3. SQL：列表字段通过 Relations 映射到子表。
-	where, args, err := sqlquery.Where(typed, sqlquery.Options{
+	where, args, err := sqlquery.Where(checked, sqlquery.Options{
 		Dialect: sqlquery.SQLite,
 		Table:   "o",
 		Columns: map[string]string{"amount": "total_amount"},
@@ -143,7 +140,7 @@ func main() {
 
 	// PostgreSQL can keep scalar lists as array columns: no Relation needed.
 	// PostgreSQL 可以把标量列表存为数组列，无需配置 Relation。
-	pgWhere, pgArgs, err := sqlquery.Where(typed, sqlquery.Options{
+	pgWhere, pgArgs, err := sqlquery.Where(checked, sqlquery.Options{
 		Dialect: sqlquery.Postgres,
 		Table:   "o",
 		Relations: map[string]sqlquery.Relation{
@@ -161,7 +158,7 @@ func main() {
 	//    Paths remap schema names to document paths.
 	// 4. MongoDB：filter 是普通 map，可直接传给 collection.Find。
 	//    Paths 用于把 Schema 字段名映射为文档路径。
-	filter, err := mongoquery.Filter(typed, mongoquery.Options{Paths: map[string]string{
+	filter, err := mongoquery.Filter(checked, mongoquery.Options{Paths: map[string]string{
 		"items": "lines", "items.price": "unit_price",
 	}})
 	if err != nil {

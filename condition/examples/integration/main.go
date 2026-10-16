@@ -32,11 +32,9 @@ type Request struct {
 
 // RouteConfig is a typical business config. The rule stays raw until it is
 // compiled, so decoding is strict (unknown keys rejected) and errors carry a
-// JSON path. Do not decode it straight into c.Node with json.Unmarshal: that
-// path silently ignores misspelt keys.
+// JSON path.
 // RouteConfig 是典型的业务配置。规则在编译前保持原始 JSON，
 // 这样解码是严格的（拒绝未知字段），错误也带有 JSON 路径。
-// 不要用 json.Unmarshal 直接解码到 c.Node：那样会静默忽略拼错的字段名。
 type RouteConfig struct {
 	Name    string          `json:"name"`
 	Backend string          `json:"backend"`
@@ -70,18 +68,18 @@ func requestSchema() *c.Schema[Request] {
 }
 
 const config = `[
-  {"name": "canary", "backend": "v2", "rule": {"op": "and", "args": [
-    {"op": "starts_with", "args": [{"field": "path"}, {"value": "/api/"}]},
-    {"op": "lt", "args": [{"field": "user_bucket"}, {"value": 10}]}
+  {"name": "canary", "backend": "v2", "rule": {"type": "and", "items": [
+    {"type": "string", "x": "path", "opt": "starts_with", "y": "/api/"},
+    {"type": "number", "x": "user_bucket", "opt": "lt", "y": 10}
   ]}},
-  {"name": "mobile-weekend", "backend": "mobile", "rule": {"op": "and", "args": [
-    {"op": "in", "args": [{"field": "client"}, {"value": ["ios", "android"]}]},
-    {"field": "is_weekend"}
+  {"name": "mobile-weekend", "backend": "mobile", "rule": {"type": "and", "items": [
+    {"type": "string", "x": "client", "opt": "in", "y": ["ios", "android"]},
+    {"type": "boolean", "x": "is_weekend", "opt": "eq", "y": true}
   ]}},
   {"name": "admin", "backend": "internal", "rule":
-    {"op": "any", "args": [{"field": "path_segments"}, {"op": "eq", "args": [{"field": "$"}, {"value": "admin"}]}]}
+    {"type": "array", "x": "path_segments", "opt": "any", "y": {"type": "string", "x": "$", "opt": "eq", "y": "admin"}}
   },
-  {"name": "default", "backend": "v1", "rule": {"value": true}}
+  {"name": "default", "backend": "v1", "rule": {"type": "and"}}
 ]`
 
 func main() {
@@ -125,7 +123,7 @@ func main() {
 
 	// A broken config fails at load time, naming the route and the JSON path.
 	// 错误的配置在加载时即失败，并指出路由名称与 JSON 路径。
-	_, err = loadRoutes([]byte(`[{"name":"typo","backend":"x","rule":{"op":"lt","args":[{"field":"user_buckt"},{"value":10}]}}]`), requestSchema())
+	_, err = loadRoutes([]byte(`[{"name":"typo","backend":"x","rule":{"type":"number","x":"user_buckt","opt":"lt","y":10}}]`), requestSchema())
 	fmt.Println("load error:", err)
 }
 

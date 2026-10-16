@@ -2,16 +2,18 @@ promotion(o1) = true
 promotion(o2) = true 
 promotion(o3) = false 
 promotion(o4) = false 
-serialised: {"op":"and","args":[{"op":"eq","args":[{"field":"vip"},{"value":false}]},{"op":"eq","args":[{"op":"len","args":[{"field":"coupons"}]},{"value":0}]},{"op":"gt","args":[{"op":"mul","args":[{"field":"amount"},{"value":0.9}]},{"value":100}]}]}
+serialised: {"type":"and","items":[{"type":"boolean","x":"vip","opt":"eq","y":false},{"type":"number","x":{"type":"len","x":"coupons"},"opt":"eq","y":0},{"type":"number","x":{"type":"arith","x":"amount","opt":"mul","y":0.9},"opt":"gt","y":100}]}
 built rule(amount=120) = true
-unknown field   path=$.args[1]          unknown field: "amout"
-type mismatch   path=$                  type mismatch: gt on string and number
-unknown op      path=$                  unknown operator: "xor"
-wrong arity     path=$                  wrong number of arguments: not wants 1, got 0
-div by zero     path=$.args[0].args[1]  condition: division by zero
-parent field    path=$.args[1]          unknown field: "vip"
-misspelt key    decode error: condition: decode node: json: unknown field "opt"
-not a bool      path=$                  type mismatch: want bool, got number
-mixed list      path=$.args[1]          type mismatch: list mixes numbers and strings
-trailing input  decode error: condition: decode node: unexpected trailing data
+unknown field   path=$.items[1].x unknown field: "amout"
+field type      path=$.x          type mismatch: want number, got string
+literal type    path=$.y          type mismatch: want string, got 1
+unknown type    path=$.type       unknown type or opt: "xor"
+opt for type    path=$.opt        unknown type or opt: "gt" not allowed for type "boolean"
+missing key     path=$            invalid node: type "not" needs "x"
+div by zero     path=$.x.y        condition: division by zero
+parent field    path=$.y.x        unknown field: "vip"
+misspelt key    path=$.op         invalid node: unknown key for type "number"
+not a cond      path=$            type mismatch: want a condition, got "len"
+mixed list      path=$.y          type mismatch: want string list, got ["CN",1]
+trailing input  path=$            invalid node: unexpected trailing data
 errors.Is(err, ErrUnknownField) = true

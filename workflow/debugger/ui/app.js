@@ -14,6 +14,8 @@ const state = {
   statusFilter: 'ALL',
   eventFilter: 'ALL',
   drafts: {},
+  draftsByRun: new Map(),
+  detailRequest: 0,
   drawerKey: null,
 }
 
@@ -219,11 +221,16 @@ function runItem(r) {
 
 async function selectRun(id) {
   if (state.current !== id) {
+    for (const el of $$('[data-draft]', $('#p-waits'))) state.drafts[el.dataset.draft] = el.value
+    if (state.current) state.draftsByRun.set(state.current, state.drafts)
+    $('#p-waits').replaceChildren()
+    closeDrawer()
+    state.detailRequest++
     state.current = id
     state.detail = null
     state.events = []
     state.lastEventId = 0
-    state.drafts = {}
+    state.drafts = state.draftsByRun.get(id) || {}
     state.waitSignature = null
   }
   $('#empty').classList.toggle('hidden', !!id)
@@ -236,19 +243,24 @@ async function selectRun(id) {
 async function refreshDetail() {
   const id = state.current
   if (!id) return
+  const request = ++state.detailRequest
+  const after = state.lastEventId
   try {
     const [detail, events] = await Promise.all([
       api(runPath(id)),
-      api(runPath(id, `/events?after=${state.lastEventId}&limit=2000`)),
+      api(runPath(id, `/events?after=${after}&limit=2000`)),
     ])
-    if (id !== state.current) return
+    if (id !== state.current || request !== state.detailRequest) return
     state.detail = detail
     if (events.length) {
-      state.events.push(...events)
-      state.lastEventId = events[events.length - 1].id
+      const seen = new Set(state.events.map(event => event.id))
+      state.events.push(...events.filter(event => !seen.has(event.id) && seen.add(event.id)))
+      state.events.sort((a, b) => a.id - b.id)
+      state.lastEventId = Math.max(state.lastEventId, ...events.map(event => event.id))
     }
     renderDetail()
   } catch (err) {
+    if (id !== state.current || request !== state.detailRequest) return
     if (/not found/i.test(err.message)) {
       location.hash = ''
       toast('Run 已被删除', 'warn')
@@ -494,7 +506,7 @@ function renderWaits() {
   state.waitSignature = signature
   // Preserve drafts the user is typing across live refreshes.
   // 在实时刷新期间保留用户正在输入的草稿。
-  for (const el of $$('[data-draft]')) state.drafts[el.dataset.draft] = el.value
+  for (const el of $$('[data-draft]', $('#p-waits'))) state.drafts[el.dataset.draft] = el.value
   if (!waits.length) {
     $('#p-waits').innerHTML = `<div class="text-center py-14 px-4">
       <div class="mx-auto h-10 w-10 rounded-xl bg-slate-800 grid place-items-center mb-3"><svg class="h-5 w-5 text-slate-500" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M5 13l4 4L19 7"/></svg></div>
@@ -616,7 +628,9 @@ function closeDrawer() {
 // ---------- 操作 ----------
 
 async function doSubmit(key) {
+  const run = state.current
   const el = $(`[data-draft="${CSS.escape(key)}"]`)
+  if (!el || !state.detail || state.detail.run.id !== run) return
   const errEl = $(`[data-jsonerr="${CSS.escape(key)}"]`)
   let value
   try {
@@ -628,7 +642,8 @@ async function doSubmit(key) {
     return
   }
   try {
-    const res = await api(runPath(state.current, '/submit'), { method: 'POST', body: { key, response: value } })
+    const res = await api(runPath(run, '/submit'), { method: 'POST', body: { key, response: value } })
+    if (run !== state.current) return
     delete state.drafts[key]
     toast(res.OK ? `已提交 ${key}，worker 将重新 Drive` : `${key} 已被处理，本次提交被忽略`, res.OK ? 'ok' : 'warn')
   } catch (err) { toast(err.message, 'err') }

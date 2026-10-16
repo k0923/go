@@ -46,11 +46,7 @@ func BenchmarkMatchCompiled(b *testing.B) {
 		String("name", func(r rec) string { return r.Name }).
 		String("city", func(r rec) string { return r.City })
 	s.List("children", func(r rec) []rec { return r.Children }, s)
-	c, err := s.CompileJSON([]byte(`{"op":"and","args":[
-		{"op":"ge","args":[{"field":"age"},{"value":18}]},
-		{"op":"starts_with","args":[{"field":"name"},{"value":"al"}]},
-		{"op":"in","args":[{"field":"city"},{"value":["a","b","c","d","e","f","g","h","i","j","k","l","m","n","o","p","q","r","s","bj"]}]},
-		{"op":"any","args":[{"field":"children"},{"op":"lt","args":[{"field":"age"},{"value":3}]}]}]}`))
+	c, err := s.CompileJSON([]byte(`{"type":"and","items":[{"type":"number","x":"age","opt":"gte","y":18},{"type":"string","x":"name","opt":"starts_with","y":"al"},{"type":"string","x":"city","opt":"in","y":["a","b","c","d","e","f","g","h","i","j","k","l","m","n","o","p","q","r","s","bj"]},{"type":"array","x":"children","opt":"any","y":{"type":"number","x":"age","opt":"lt","y":3}}]}`))
 	if err != nil {
 		b.Fatal(err)
 	}

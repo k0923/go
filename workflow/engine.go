@@ -149,15 +149,60 @@ func (f *FlowContext) remember(err *error) {
 	if f.scope != nil {
 		f.scope.errs = append(f.scope.errs, *err)
 	}
-	var pending *SuspendedError
-	if errors.As(*err, &pending) {
-		e.pending[pending.Pending.Key] = pending.Pending
+	if !collectExecutionError(*err, e.pending) {
 		return
 	}
 	e.errs = append(e.errs, *err)
 	// Waiting is a normal outcome. Actual errors cancel ongoing sibling IO.
 	// 等待是正常结果。实际错误会取消正在进行的兄弟 IO。
 	e.cancel()
+}
+
+// Collect every suspension without discarding other leaves of a joined error.
+// 收集所有挂起点，同时保留合并错误中的其他错误。
+func collectExecutionError(err error, pending map[string]Pending) bool {
+	if err == nil {
+		return false
+	}
+	switch value := err.(type) {
+	case *SuspendedError:
+		pending[value.Pending.Key] = value.Pending
+		return false
+	case *PanicError, *retryableExecutionError:
+		return true
+	case interface{ Unwrap() []error }:
+		failed := false
+		for _, cause := range value.Unwrap() {
+			if collectExecutionError(cause, pending) {
+				failed = true
+			}
+		}
+		return failed
+	case interface{ Unwrap() error }:
+		return collectExecutionError(value.Unwrap(), pending)
+	default:
+		return true
+	}
+}
+
+// Only committed Action failures (or explicit orchestration failures) terminate.
+// 只有已提交的 Action 失败或显式编排失败才会终止流程。
+func terminalExecutionError(err error) bool {
+	switch value := err.(type) {
+	case *PanicError, *retryableExecutionError:
+		return false
+	case *PermanentError, *ReplayError:
+		return true
+	case interface{ Unwrap() []error }:
+		for _, cause := range value.Unwrap() {
+			if terminalExecutionError(cause) {
+				return true
+			}
+		}
+	case interface{ Unwrap() error }:
+		return terminalExecutionError(value.Unwrap())
+	}
+	return false
 }
 
 func (e *Engine) observe(ctx context.Context, key, phase string, started time.Time, err error) {
@@ -238,9 +283,7 @@ func (e *Engine) Drive[I, O any](ctx context.Context, workflow Workflow[I, O], i
 	sort.Slice(result.Pending, func(i, j int) bool { return result.Pending[i].Key < result.Pending[j].Key })
 	switch {
 	case err != nil:
-		var permanent *PermanentError
-		var replay *ReplayError
-		if errors.As(err, &permanent) || errors.As(err, &replay) {
+		if terminalExecutionError(err) {
 			result.Status = Failed
 		}
 	case len(result.Pending) > 0:
@@ -356,7 +399,11 @@ func (f *FlowContext) runAction[I, O any](key string, action Action[I, O], input
 		var actionErr error
 		output, actionErr = invoke(func() (O, error) { return action.Run(actionCtx, input) })
 		if contextErr := actionCtx.Err(); contextErr != nil {
-			return errors.Join(actionErr, contextErr)
+			return &retryableExecutionError{errors.Join(actionErr, contextErr)}
+		}
+		var panicErr *PanicError
+		if errors.As(actionErr, &panicErr) {
+			return &retryableExecutionError{actionErr}
 		}
 		var permanent *PermanentError
 		if actionErr != nil && !errors.As(actionErr, &permanent) {
@@ -371,6 +418,11 @@ func (f *FlowContext) runAction[I, O any](key string, action Action[I, O], input
 			if marshalErr != nil {
 				return marshalErr
 			}
+			var normalized O
+			if decodeErr := json.Unmarshal(record.Result, &normalized); decodeErr != nil {
+				return decodeErr
+			}
+			output = normalized
 			record.Status = Completed
 		}
 		record.EndedAt = e.options.Now()
@@ -379,7 +431,7 @@ func (f *FlowContext) runAction[I, O any](key string, action Action[I, O], input
 		// 提交期间续租仍保持活跃。存储边界仍会原子验证当前 generation、过期时间和记录版本。
 		committed, commitErr := e.store.Commit(executionCtx, token, record, record.Version)
 		if commitErr != nil {
-			return errors.Join(actionErr, &OperationError{key, "Commit", commitErr})
+			return &retryableExecutionError{errors.Join(actionErr, &OperationError{key, "Commit", commitErr})}
 		}
 		actionStatus, recordVersion = record.Status, committed.Version
 		return actionErr

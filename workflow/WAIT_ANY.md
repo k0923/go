@@ -95,6 +95,16 @@ FailWait(context.Context, memberKey string, version int64, message string) (bool
 
 自定义存储必须持久化组归属、请求、失败列表和赢家，并升级原有 Resolve：对组成员的完成要原子选择赢家、取消败者和登记消息。仅实现两个新方法而不升级 Resolve 不满足契约。MemoryInfrastructure 提供完整参考实现。
 
+`WaitRequest.Error` 非空表示候选编码失败，仍须按原顺序持久化该候选的
+Key、Kind、Duration、Until 和失败状态；不为它登记 REQUEST/定时 WAKE，
+并将它计入 Failures。全部候选失败时保存 FAILED 组并登记组 WAKE。
+存储必须先验证完整候选集合，包括失败候选的种类、唯一 key 与归属。
+回放时比较完整有序定义以及 Error 是否为空，错误消息文本不参与身份比较。
+自定义 WaitAny 适配器必须同步支持该字段，不能继续过滤失败候选。
+
+旧实现已登记的组若曾省略编码失败候选，升级后完整定义会返回 ErrChanged；
+部署前需处理这些在途实例或保留对应历史执行版本，不能静默改变等待组。
+
 旧适配器和普通 WaitFor/Action 接入不受影响；在旧适配器上调用 WaitAny 返回 ErrWaitAnyUnsupported。CancelNotification 只由新增 WaitAny 产生；接入这项能力的投递消费方需处理 CANCEL。普通 WaitFor 的既有 REQUEST/WAKE 规则保持不变。
 
 WaitAnyResult 包含赢家 Key、Kind、Response 和可选 Failures。WaitAnyState 是适配器使用的快照，包含 Status、WinnerKey、WinnerKind、Response、Pending 和 Failures。所有返回快照必须深拷贝。等待历史只能由同一实例作用域下的基础设施访问。支持混合信号的适配器需保存 Kind、Duration、Until，并实现定时触发语义；既有接口签名保持不变。
