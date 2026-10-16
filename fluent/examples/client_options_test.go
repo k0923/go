@@ -6,7 +6,7 @@ import (
 	"net/http"
 	"time"
 
-	fluent "github.com/k0923/go/fluent/v2"
+	fluent "github.com/k0923/go/fluent"
 )
 
 // ExampleNew demonstrates the recommended way to create a reusable Client.
@@ -21,7 +21,7 @@ func Example_clientNew() {
 	defer closeServer()
 
 	client, err := fluent.New(
-		fluent.WithBaseURL(srv.URL+"/api/v1"),
+		fluent.WithBaseURL(srv.URL+"/api"),
 		fluent.WithUserAgent("orders/1.0"),
 		fluent.WithHeader("X-App", "checkout"),
 		fluent.WithTimeout(10*time.Second),
@@ -35,7 +35,7 @@ func Example_clientNew() {
 	}
 
 	// Output:
-	// /api/v1/health
+	// /api/health
 	// orders/1.0
 	// checkout
 }
@@ -51,7 +51,7 @@ func Example_typicalClientCall() {
 	defer closeServer()
 
 	api := fluent.MustNew(
-		fluent.WithBaseURL(srv.URL+"/api/v1"),
+		fluent.WithBaseURL(srv.URL+"/api"),
 		fluent.WithUserAgent("order-svc/1.4"),
 		fluent.WithRetry(fluent.RetryPolicy{MaxAttempts: 3, Backoff: fluent.ConstantBackoff(0)}),
 		fluent.WithMiddleware(fluent.Logging(slog.New(slog.DiscardHandler))),
@@ -71,7 +71,7 @@ func Example_typicalClientCall() {
 	fmt.Printf("%s:%s\n", user.ID, user.Name)
 
 	// Output:
-	// /api/v1/users/u%2F42
+	// /api/users/u%2F42
 	// order-svc/1.4
 	// u/42:Bob
 }
@@ -80,7 +80,7 @@ func Example_typicalClientCall() {
 // configuration errors should fail fast during initialization.
 func Example_clientMustNew() {
 	client := fluent.MustNew(
-		fluent.WithBaseURL("https://api.example.com/v1"),
+		fluent.WithBaseURL("https://api.example.com/api"),
 		fluent.WithHeaders(http.Header{
 			"X-App": {"billing"},
 		}),

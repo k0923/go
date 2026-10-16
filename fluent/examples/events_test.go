@@ -8,7 +8,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	fluent "github.com/k0923/go/fluent/v2"
+	fluent "github.com/k0923/go/fluent"
 )
 
 type chatChunk struct {

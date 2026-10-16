@@ -7,7 +7,7 @@ import (
 	"net/http"
 	"strings"
 
-	fluent "github.com/k0923/go/fluent/v2"
+	fluent "github.com/k0923/go/fluent"
 )
 
 // Example_middlewareAttempt shows that middleware runs for every attempt.
@@ -90,7 +90,7 @@ func Example_middlewareLogging() {
 }
 
 // ExampleRoundTripperFunc builds a fully in-memory client without httptest.
-// This is the lightest way to test code that depends on fluent/v2.
+// This is the lightest way to test code that depends on fluent.
 func ExampleRoundTripperFunc() {
 	httpClient := &http.Client{
 		Transport: fluent.RoundTripperFunc(func(req *http.Request) (*http.Response, error) {
@@ -114,31 +114,24 @@ func ExampleRoundTripperFunc() {
 	// Mock
 }
 
-// ExampleJSON_strict switches from the v1-compatible DefaultCodec to strict json/v2 behavior.
-// With JSON(), field matching is case-sensitive.
+// ExampleJSON_strict shows that the default JSON codec is case-sensitive.
+// This avoids accidentally binding fields with misspelled or differently cased names.
 func ExampleJSON_strict() {
 	srv, closeServer := exampleServer(func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, `{"ID":"u1","NAME":"Upper"}`)
 	})
 	defer closeServer()
 
-	compatible := fluent.MustNew(fluent.WithBaseURL(srv.URL))
-	strict := fluent.MustNew(fluent.WithBaseURL(srv.URL), fluent.WithCodec(fluent.JSON()))
+	client := fluent.MustNew(fluent.WithBaseURL(srv.URL))
 
-	v1Value, err := compatible.Get("/user").Decode[userDTO](nilContext())
-	if err != nil {
-		panic(err)
-	}
-	v2Value, err := strict.Get("/user").Decode[userDTO](nilContext())
+	value, err := client.Get("/user").Decode[userDTO](nilContext())
 	if err != nil {
 		panic(err)
 	}
 
-	fmt.Println(v1Value.Name)
-	fmt.Printf("%q\n", v2Value.Name)
+	fmt.Printf("%q\n", value.Name)
 
 	// Output:
-	// Upper
 	// ""
 }
 

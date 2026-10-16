@@ -1,9 +1,9 @@
-// Package examples contains runnable examples for github.com/k0923/go/fluent/v2.
+// Package examples contains runnable examples for github.com/k0923/go/fluent.
 //
-// These examples intentionally live in a separate package and import fluent/v2
+// These examples intentionally live in a separate package and import fluent
 // the same way application code does. Run them with:
 //
-//	go test ./fluent/v2/examples
+//	go test ./fluent/examples
 //
 // The files are grouped by feature:
 //

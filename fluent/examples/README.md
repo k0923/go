@@ -1,11 +1,11 @@
-# fluent/v2 Examples
+# fluent Examples
 
-This package contains runnable Go examples for `github.com/k0923/go/fluent/v2`.
+This package contains runnable Go examples for `github.com/k0923/go/fluent`.
 
 Run all examples:
 
 ```bash
-go test ./fluent/v2/examples
+go test ./fluent/examples
 ```
 
 ## Navigation

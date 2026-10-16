@@ -35,7 +35,7 @@ func newTestClient(t *testing.T, h http.HandlerFunc, opts ...Option) *Client {
 	srv := httptest.NewTestServer(t, h)
 	t.Cleanup(srv.Close)
 	hc := srv.Client() // 内存网络下 URL 在首次调用 Client() 后才设置
-	c, err := New(append([]Option{WithBaseURL(srv.URL + "/v1"), WithHTTPClient(hc)}, opts...)...)
+	c, err := New(append([]Option{WithBaseURL(srv.URL + "/api"), WithHTTPClient(hc)}, opts...)...)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -44,7 +44,7 @@ func newTestClient(t *testing.T, h http.HandlerFunc, opts ...Option) *Client {
 
 func TestDecodeWithPathQueryAndHeaders(t *testing.T) {
 	c := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.EscapedPath() != "/v1/users/a%2Fb" {
+		if r.URL.EscapedPath() != "/api/users/a%2Fb" {
 			t.Errorf("path = %q", r.URL.EscapedPath())
 		}
 		if got := r.URL.Query()["tag"]; len(got) != 2 {
@@ -108,7 +108,7 @@ func TestStatusErrorWithBusinessDecoder(t *testing.T) {
 		t.Fatalf("business error = %v", biz)
 	}
 	fe, _ := errors.AsType[*Error](err)
-	if !strings.Contains(string(fe.Body), "USER_NOT_FOUND") || !strings.HasSuffix(fe.URL, "/v1/users/1") {
+	if !strings.Contains(string(fe.Body), "USER_NOT_FOUND") || !strings.HasSuffix(fe.URL, "/api/users/1") {
 		t.Fatalf("Error = %+v", fe)
 	}
 }
@@ -147,18 +147,13 @@ func TestNoContent(t *testing.T) {
 	}
 }
 
-func TestDefaultCodecIsV1Compatible(t *testing.T) {
+func TestDefaultCodecIsStrict(t *testing.T) {
 	c := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprint(w, `{"ID":"1","NAME":"bob"}`)
 	})
 	u, err := c.Get("/x").Decode[user](t.Context())
-	if err != nil || u.Name != "bob" {
-		t.Fatalf("u=%+v err=%v, default codec must match case-insensitively like v1", u, err)
-	}
-	strict, _ := c.With(WithCodec(JSON()))
-	u, err = strict.Get("/x").Decode[user](t.Context())
 	if err != nil || u.Name != "" {
-		t.Fatalf("u=%+v err=%v, JSON() must be case-sensitive", u, err)
+		t.Fatalf("u=%+v err=%v, default codec must be case-sensitive", u, err)
 	}
 }
 
@@ -422,7 +417,7 @@ func TestMiddlewareOrderAndAttempt(t *testing.T) {
 }
 
 func TestWithDoesNotAffectParent(t *testing.T) {
-	parent := MustNew(WithBaseURL("http://a.example/v1"), WithHeader("X-A", "1"))
+	parent := MustNew(WithBaseURL("http://a.example/api"), WithHeader("X-A", "1"))
 	child, err := parent.With(WithHeader("X-B", "2"), WithBaseURL("http://b.example"))
 	if err != nil {
 		t.Fatal(err)

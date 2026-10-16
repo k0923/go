@@ -9,7 +9,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	fluent "github.com/k0923/go/fluent/v2"
+	fluent "github.com/k0923/go/fluent"
 )
 
 type userDTO struct {
@@ -68,7 +68,7 @@ func Example_requestQueryStruct() {
 	})
 	defer closeServer()
 
-	client := fluent.MustNew(fluent.WithBaseURL(srv.URL + "/api/v1"))
+	client := fluent.MustNew(fluent.WithBaseURL(srv.URL + "/api"))
 	users, err := client.Get("/users").
 		Queries(listQuery{Page: 1, Tags: []string{"vip", "new"}}).
 		Decode[[]userDTO](nilContext())

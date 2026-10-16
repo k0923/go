@@ -3,8 +3,7 @@ package fluent
 import (
 	"io"
 
-	jsonv1 "encoding/json"
-	"encoding/json/v2"
+	json "encoding/json/v2"
 )
 
 // Codec 负责请求体编码与响应体解码。
@@ -19,15 +18,14 @@ type jsonCodec struct {
 	opts json.Options
 }
 
-// JSON 返回基于 encoding/json/v2 的编解码器，opts 会透传给 Marshal/UnmarshalRead。
-// 不传 opts 时使用 v2 的严格语义（字段名大小写敏感、拒绝重复键、nil slice 编码为 []）。
+// JSON 返回标准库 JSON 编解码器，opts 会透传给 Marshal/UnmarshalRead。
+// 不传 opts 时使用严格语义（字段名大小写敏感、拒绝重复键、nil slice 编码为 []）。
 func JSON(opts ...json.Options) Codec {
 	return jsonCodec{opts: json.JoinOptions(opts...)}
 }
 
-// DefaultCodec 使用 v1 兼容语义（字段名大小写不敏感等），从 v1 迁移时行为不会悄然改变。
-// 新服务建议显式使用 WithCodec(JSON()) 以获得 v2 的严格语义。
-var DefaultCodec = JSON(jsonv1.DefaultOptionsV1())
+// DefaultCodec 是默认 JSON 编解码器。
+var DefaultCodec = JSON()
 
 func (jsonCodec) ContentType() string { return "application/json" }
 

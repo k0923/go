@@ -41,5 +41,5 @@
 - [x] WaitFor/Sleep 信号描述与混合 WaitAny
 - [x] 定时截止时间稳定、超时结算、赢家 Kind 及兼容旧 WaitCase
 - [x] 7 个新增场景及混合示例通过，旧 WaitAny 测试保持通过
-- [x] workflow/lease race 和 vet 通过；全仓 fluent/v2 编译错误已记录
+- [x] workflow/lease race 和 vet 通过；全仓 fluent 包编译状态已记录
 - [x] 类型注释、使用文档和验证报告已更新

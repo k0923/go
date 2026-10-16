@@ -12,7 +12,7 @@
 // 典型用法：
 //
 //	c := fluent.MustNew(
-//		fluent.WithBaseURL("https://api.example.com/v1"),
+//		fluent.WithBaseURL("https://api.example.com/api"),
 //		fluent.WithRetry(fluent.RetryPolicy{MaxAttempts: 3}),
 //	)
 //	user, err := c.Get("/users/{id}").Path("id", "42").Decode[User](ctx)

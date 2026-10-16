@@ -243,7 +243,7 @@ func EventsOf[T any](events iter.Seq2[Event, error], codec Codec, skip func(Even
 
 // EventsOf 是 Events + 按 Client Codec 解码的便捷方法（Go 1.27 泛型方法）。
 //
-//	for chunk, err := range c.Post("/v1/chat/completions").JSON(req).EventsOf[ChatChunk](ctx, fluent.SkipData("[DONE]")) {
+//	for chunk, err := range c.Post("/chat/completions").JSON(req).EventsOf[ChatChunk](ctx, fluent.SkipData("[DONE]")) {
 func (r *Request) EventsOf[T any](ctx context.Context, skip func(Event) bool) iter.Seq2[T, error] {
 	return EventsOf[T](r.Events(ctx), r.client.codec, skip)
 }

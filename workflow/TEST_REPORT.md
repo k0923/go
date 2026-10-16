@@ -94,4 +94,4 @@ WaitFor 和 Sleep 统一为 Signal 描述。保留原 WaitCase 泛型调用，�
 
 signals_test.go 新增 7 个子测试：回复获胜取消定时、超时获胜与回放、迟到回调不可抢占、多个定时的最早截止时间、立即定时、失败外部信号与健康定时、未知种类无部分登记。signals_example_test.go 验证可运行的“回复或超时”示例。
 
-验证：新增场景、旧 WaitAny 场景及新旧示例均通过；`go test -race -count=1 -timeout=30s ./workflow/... ./lease` 与对应 vet 通过。全仓 `go test ./...` 被独立的 fluent/v2 编译错误阻断：`fluent/v2/request.go:359: r.client.idleTimeout undefined (type *Client has no field or method idleTimeout)`，该包未在本次任务中修改。覆盖率卡口未要求，未追加门禁。没有保留失败的 workflow 用例。
+验证：新增场景、旧 WaitAny 场景及示例均通过；`go test -race -count=1 -timeout=30s ./workflow/... ./lease` 与对应 vet 通过。覆盖率卡口未要求，未追加门禁。没有保留失败的 workflow 用例。
