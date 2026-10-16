@@ -1,0 +1,14 @@
+adult:                 alice=true bob=false
+rich:                  alice=true bob=false
+not banned:            alice=true bob=false
+name < email:          alice=true bob=true
+corp mail:             alice=true bob=false
+level starts with go:  alice=true bob=false
+vip level:             alice=true bob=false
+is admin:              alice=true bob=false
+not in empty set:      alice=true bob=true
+can buy:               alice=true bob=false
+not(can buy):          alice=false bob=true
+even id:               alice=false bob=true
+gmail user:            alice=false bob=true
+flag off:              result=false tracked calls=0

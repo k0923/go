@@ -25,7 +25,7 @@ func TestFlowContextWaitAny(t *testing.T) {
 			if err != nil {
 				return "", err
 			}
-			return f.Run("after", func(context.Context, int) (string, error) { calls++; return winner.Key + ":" + winner.Response, nil }, input)
+			return f.Run("after", AsAction(func(context.Context, int) (string, error) { calls++; return winner.Key + ":" + winner.Response, nil }), input)
 		}))
 		for i := 0; i < 2; i++ {
 			result, err := e.Drive(ctx, flow, 1)

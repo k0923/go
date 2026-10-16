@@ -2,15 +2,15 @@
 
 ## 决策
 
-Action 采用普通函数，Flow 保留具名接口，Workflow 用根定义包装 Flow。Context 不再通过三层嵌入继承能力，执行引擎显式接收基础设施；根输入、子流程输入和 Action 输入都显式传递。
+Action 采用标准 Run 接口，并提供 ActionFn/AsAction 函数适配；Flow 保留具名接口，Workflow 由 NewWorkflow 构造并保存私有顶层处理函数。独立 WorkflowContext 只提供 Flow 调用；FlowContext 保持非泛型，只提供 Action、信号与检查点原语。两种上下文不互相嵌入。外部客户端与 Repository 注入 Action，Context 不承载业务扩展能力。执行引擎显式接收基础设施；根输入、Flow 输入和 Action 输入都显式传递。
 
 ```mermaid
 flowchart TD
     Caller["调度方：实例隔离、版本路由、重试"] --> Engine["Engine.Drive：根输入及驱动结果"]
-    Definition["Workflow：Name + Version + Flow"] --> Engine
-    Engine --> Flow["Flow.Run：确定性编排"]
-    Flow --> Context["FlowContext：命名空间、等待、检查点"]
-    Flow --> Child["子 Flow：RunFlow / GoFlow"]
+    Definition["Workflow：Name + Version + 私有入口"] --> Engine
+    Engine --> Root["WorkflowContext：顶层编排"]
+    Root --> Flow["Flow：仅由顶层 RunFlow / GoFlow 调用"]
+    Flow --> Context["FlowContext：命名空间、Action、等待、检查点"]
     Context --> Action["Action：标准 context + input → output, error"]
     Context --> Wait["WaitFor / Sleep：独立等待快照"]
     Action --> Commit["租约 fencing + Record CAS"]
@@ -27,11 +27,11 @@ flowchart TD
 
 | 原设计问题 | 新设计 |
 | --- | --- |
-| WorkflowContext → FlowContext → ActionContext，公开能力与实际租约范围不一致 | 一种 FlowContext，显式 Context()，Action 无编排 context |
+| WorkflowContext → FlowContext → ActionContext，公开能力与实际租约范围不一致 | 独立 WorkflowContext/FlowContext，不继承能力；Action 使用标准 context |
 | Action 挂起导致从头重跑副作用 | 等待在 Flow，副作用通过独立 Action Run 提交 |
-| 根 RunFlow 接收却不使用 input | Workflow 泛型定义，Drive 显式传入根 Flow |
+| 根 RunFlow 接收却不使用 input | Workflow 泛型定义，Drive 显式传入顶层 handler |
 | 同步、异步、Loop 分叉维护错误和状态 | 同一个 runAction；Go 复用，Loop 每 attempt 复用 |
-| 子 Flow 只允许从 WorkflowContext 启动 | 任意 FlowContext 均可递归挂载子 Flow |
+| Flow 递归挂载导致层级混乱 | FlowContext 无 RunFlow/GoFlow；WorkflowContext 无 Action/信号方法，编译期隔离 |
 | panic 混用业务失败、存储故障、挂起和冲突 | 普通 error、Permanent、SuspendedError 和驱动 Result |
 | 事件 CAS 未携带租约导致旧 owner 写入 | Commit 同时验证当前 lease generation、expiry 和 record version |
 | 更新挂起状态与信号登记不同事务 | 等待原语单独 Put，等待记录和消息一次原子提交 |
@@ -43,7 +43,7 @@ flowchart TD
 
 数学纯函数要求没有副作用、隐藏输入或可变状态。当前库必须支持 HTTP、数据库和消息，因此把所有 Action 宣称为纯函数会与用途矛盾。
 
-选定方案是“函数化接口 + 明确纯度契约”：
+选定方案是“标准接口 + 函数适配器 + 明确纯度契约”：
 
 1. Action 的可调用签名是标准 context、明确输入和输出；取消和 trace 仍需 context，因此保留 context 参数。
 2. 轻量纯函数在 Flow 中直接执行，不生成存储记录；昂贵纯计算可由 Pure 适配后持久化。
@@ -51,7 +51,7 @@ flowchart TD
 4. Now/UUID 从 Flow 检查点获取后作为 input 传递，避免 Action 中引入重试相关非确定值。
 5. 不提供 Action 访问 Flow 的后门；不得闭包捕获 FlowContext、可变流程局部变量或共享业务状态。
 
-收益是 IO 函数可不经引擎独立测试，普通客户端方法可以直接挂载，无需为了 Run 方法建立适配类型；调度能力由类型边界约束。限制是 Go 类型系统无法证明函数纯度、捕获状态或数据不可变，工程规范和代码检查仍然必要。
+收益是具名 Action 显式持有窄依赖，并可独立测试；普通函数和客户端方法通过 AsAction 适配，保持类型推断；调度能力由类型边界约束。限制是 Go 类型系统无法证明函数纯度、捕获状态或数据不可变，工程规范和代码检查仍然必要。
 
 ## 执行与一致性
 
@@ -68,6 +68,10 @@ Action 路径：读取 → 完成/失败回放 → lease.Runner 申请租约 →
 ## 并发政策
 
 框架注册的异步分支归属于单次 Drive；Drive 会等待全部分支退出，错误取消兄弟 IO。挂起只登记 Pending，不取消兄弟，避免独立分支完成结果被无意义中断。Future 允许多个调用方等待同一结果，未 Wait 的错误仍由 Drive 接收。
+
+WorkflowContext 只拥有 RunFlow/GoFlow，FlowContext 只拥有 Action 和信号方法。没有 topLevel 标记，也没有运行期权限错误；Flow 内的跨流程框架调用直接编译失败。Workflow 不暴露执行方法，也不实现 Flow，只通过 Engine.Drive 进入。允许的框架调用图只有“顶层 → Flow → Action”。普通 Go 方法调用和闭包捕获仍需遵守 CALL_HIERARCHY 中的编码边界。
+
+每个 RunFlow/GoFlow 使用独立 flowScope 跟踪 Flow 中的异步 Action 和错误，Flow 返回前汇合 scope。Loop 和 WaitAny 的内部命名空间继承当前 scope，不创建可跨流程调用的上下文。scope 的可变状态使用 execution.mu 保护；等待时不持锁，关闭 scope 后拒绝继续注册执行点。全局 execution.wg 继续保证 Drive 没有残留分支。
 
 这个选择优先保证驱动结束时没有残留执行。挂起通知的返回延迟可能等于最长在途 Action 的耗时；需要短时响应时给 IO 设置 timeout，或由外部调度拆分长任务。不能安全杀死不响应 context 的 Go 函数，使用约束必须明确。
 

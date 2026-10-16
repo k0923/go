@@ -9,6 +9,7 @@
 // Then drive a workflow against it:
 //
 //	result, err := debugger.Run(ctx, definition, input, debugger.Options{})
+//
 // Package debugger 提供一个本地、由 HTTP + SQLite 支持的 workflow Infrastructure，
 // 并带有 Web UI。一个 server 可承载多个隔离运行；每个运行拥有自己的记录、租约、
 // 通知、等待组和事件历史。
@@ -23,6 +24,7 @@
 package debugger
 
 import (
+	"context"
 	"encoding/json"
 	"time"
 
@@ -40,6 +42,17 @@ const (
 	RunCreated  = "CREATED"
 	RunRetrying = "RETRYING"
 )
+
+// Delivery is the debugger client-side queue API used by the worker loop.
+// A consumer must ACK only after durable handoff. On ErrConflict or transient
+// drive errors it retries the Wake message. Duplicate delivery is expected.
+// Delivery 是 debugger 客户端侧供 worker 循环使用的队列 API。消费者只能在持久化
+// 交接后 ACK。遇到 ErrConflict 或暂时性 drive 错误时会重试 Wake 消息。
+// 重复投递是预期行为。
+type Delivery interface {
+	Pending(context.Context, time.Time) ([]workflow.Notification, error)
+	Ack(context.Context, string) error
+}
 
 // RunSpec registers a run. An empty ID generates one. Reusing an ID resumes
 // the run: Drive replays durable records already stored on the server.

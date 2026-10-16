@@ -2,7 +2,6 @@ package workflow
 
 import (
 	"context"
-	"time"
 
 	"github.com/k0923/go/lease"
 )
@@ -38,14 +37,4 @@ type Infrastructure interface {
 	// Resolve 检查 suspended 状态、kind 和版本；并原子地提交响应以及一个独立的 Wake 通知。
 	// 已解析时不执行操作并返回 false。过期版本返回 ErrConflict。
 	Resolve(context.Context, string, int64, []byte) (bool, error)
-}
-
-// Delivery is optional: production deployments can expose their own queue API.
-// A consumer must ACK only after durable handoff. On ErrConflict or transient
-// drive errors it retries the Wake message. Duplicate delivery is expected.
-// Delivery 是可选接口：生产部署可以暴露自己的队列 API。消费者只能在持久化交接后 ACK。
-// 遇到 ErrConflict 或暂时性 drive 错误时会重试 Wake 消息。重复投递是预期行为。
-type Delivery interface {
-	Pending(context.Context, time.Time) ([]Notification, error)
-	Ack(context.Context, string) error
 }

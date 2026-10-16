@@ -23,21 +23,21 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	definition := workflow.Workflow[string, string]{
-		Name: "approval", Version: "1",
-		Flow: workflow.FlowFunc[string, string](func(f *workflow.FlowContext, input string) (string, error) {
-			winner, err := f.WaitAny[string]("providers",
-				workflow.WaitCase[string]{Key: "primary", Request: input},
-				workflow.WaitCase[string]{Key: "secondary", Request: input},
-			)
-			if err != nil {
-				return "", err
-			}
-			// Downstream work starts without waiting for the other response.
-			// 下游工作会立即开始，而不会等待另一个响应。
-			return f.Run("continue", workflow.Pure(func(answer string) string { return "continued: " + answer }), winner.Response)
-		}),
-	}
+	flow := workflow.FlowFunc[string, string](func(f *workflow.FlowContext, input string) (string, error) {
+		winner, err := f.WaitAny[string]("providers",
+			workflow.WaitCase[string]{Key: "primary", Request: input},
+			workflow.WaitCase[string]{Key: "secondary", Request: input},
+		)
+		if err != nil {
+			return "", err
+		}
+		// Downstream work starts without waiting for the other response.
+		// 下游工作会立即开始，而不会等待另一个响应。
+		return f.Run("continue", workflow.Pure(func(answer string) string { return "continued: " + answer }), winner.Response)
+	})
+	definition := workflow.NewWorkflow("approval", "1", func(w *workflow.WorkflowContext, input string) (string, error) {
+		return w.RunFlow("main", flow, input)
+	})
 	waiting, err := engine.Drive(ctx, definition, "order_123")
 	if err != nil {
 		return err
@@ -63,7 +63,7 @@ func run() error {
 	go func() {
 		defer providers.Done()
 		<-primaryListening
-		record, err := store.Get(providerCtx, "providers|secondary")
+		record, err := store.Get(providerCtx, "main|providers|secondary")
 		if err == nil {
 			_, err = engine.ResolveSignal(providerCtx, record.Key, record.Version, "secondary approved")
 		}
@@ -78,7 +78,7 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	loser, err := store.Get(ctx, "providers|primary")
+	loser, err := store.Get(ctx, "main|providers|primary")
 	if err != nil {
 		return err
 	}

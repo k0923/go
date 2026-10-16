@@ -1,4 +1,4 @@
-package condition
+package legacy
 
 import (
 	. "github.com/k0923/go/json"

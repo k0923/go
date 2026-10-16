@@ -62,7 +62,9 @@ func (f *fixture) engine(t *testing.T, run string) (*workflow.Engine, *Client) {
 }
 
 func definition[I, O any](flow workflow.FlowFunc[I, O]) workflow.Workflow[I, O] {
-	return workflow.Workflow[I, O]{Name: "test", Version: "v1", Flow: flow}
+	return workflow.NewWorkflow("test", "v2", func(w *workflow.WorkflowContext, input I) (O, error) {
+		return w.RunFlow("main", flow, input)
+	})
 }
 
 func TestWaitForSubmitOverHTTP(t *testing.T) {
@@ -71,7 +73,7 @@ func TestWaitForSubmitOverHTTP(t *testing.T) {
 	ctx := context.Background()
 	calls := 0
 	flow := definition(func(fc *workflow.FlowContext, in int) (string, error) {
-		n, err := fc.Run("double", func(context.Context, int) (int, error) { calls++; return in * 2, nil }, in)
+		n, err := fc.Run("double", workflow.AsAction(func(context.Context, int) (int, error) { calls++; return in * 2, nil }), in)
 		if err != nil {
 			return "", err
 		}
@@ -82,7 +84,7 @@ func TestWaitForSubmitOverHTTP(t *testing.T) {
 		return answer["by"], nil
 	})
 	result, err := engine.Drive(ctx, flow, 21)
-	if err != nil || result.Status != workflow.Suspended || result.Pending[0].Key != "approval" {
+	if err != nil || result.Status != workflow.Suspended || result.Pending[0].Key != "main|approval" {
 		t.Fatalf("%+v %v", result, err)
 	}
 	detail, err := client.Detail(ctx)
@@ -91,21 +93,21 @@ func TestWaitForSubmitOverHTTP(t *testing.T) {
 	}
 	var request *RecordView
 	for i := range detail.Records {
-		if detail.Records[i].Key == "approval" {
+		if detail.Records[i].Key == "main|approval" {
 			request = &detail.Records[i]
 		}
 	}
 	if request == nil || string(request.Input) != `{"n":42}` || request.Status != workflow.Suspended {
 		t.Fatalf("request not visible: %+v", request)
 	}
-	if ok, err := client.Submit(ctx, "approval", map[string]string{"by": "alice"}); !ok || err != nil {
+	if ok, err := client.Submit(ctx, "main|approval", map[string]string{"by": "alice"}); !ok || err != nil {
 		t.Fatalf("submit %t %v", ok, err)
 	}
-	if ok, err := client.Submit(ctx, "approval", map[string]string{"by": "mallory"}); ok || err != nil {
+	if ok, err := client.Submit(ctx, "main|approval", map[string]string{"by": "mallory"}); ok || err != nil {
 		t.Fatalf("second submit must be ignored: %t %v", ok, err)
 	}
 	wakes, err := client.WaitWake(ctx, time.Second)
-	if err != nil || len(wakes) != 1 || wakes[0].Key != "approval" {
+	if err != nil || len(wakes) != 1 || wakes[0].Key != "main|approval" {
 		t.Fatalf("wake %+v %v", wakes, err)
 	}
 	result, err = engine.Drive(ctx, flow, 21)
@@ -127,7 +129,7 @@ func TestLoopSleepAndFireOverHTTP(t *testing.T) {
 	ctx := context.Background()
 	calls := 0
 	flow := definition(func(fc *workflow.FlowContext, _ int) (poll, error) {
-		return fc.Loop("poll", func(context.Context, int) (poll, error) { calls++; return poll{N: calls}, nil },
+		return fc.Loop("poll", workflow.AsAction(func(context.Context, int) (poll, error) { calls++; return poll{N: calls}, nil }),
 			0, workflow.LoopOptions{Interval: time.Hour, MaxAttempts: 3})
 	})
 	for i := 0; i < 3; i++ {
@@ -139,7 +141,7 @@ func TestLoopSleepAndFireOverHTTP(t *testing.T) {
 	if wakes, _ := client.WaitWake(ctx, 10*time.Millisecond); len(wakes) != 0 {
 		t.Fatalf("sleep must not be due: %+v", wakes)
 	}
-	if err := client.FireSleep(ctx, "poll|sleep_1"); err != nil {
+	if err := client.FireSleep(ctx, "main|poll|sleep_1"); err != nil {
 		t.Fatal(err)
 	}
 	if wakes, _ := client.WaitWake(ctx, time.Second); len(wakes) == 0 {
@@ -161,7 +163,7 @@ func TestSleepMaturesByClock(t *testing.T) {
 	}
 	f.advance(time.Minute)
 	wakes, err := client.WaitWake(ctx, time.Second)
-	if err != nil || len(wakes) != 1 || wakes[0].Key != "nap" {
+	if err != nil || len(wakes) != 1 || wakes[0].Key != "main|nap" {
 		t.Fatalf("%+v %v", wakes, err)
 	}
 	if result, err := engine.Drive(ctx, flow, 7); err != nil || result.Output != 7 {
@@ -181,14 +183,14 @@ func TestWaitAnyOverHTTP(t *testing.T) {
 	if err != nil || len(result.Pending) != 3 {
 		t.Fatalf("%+v %v", result, err)
 	}
-	if ok, err := engine.FailWait(ctx, "race|a", 1, errors.New("provider down")); !ok || err != nil {
+	if ok, err := engine.FailWait(ctx, "main|race|a", 1, errors.New("provider down")); !ok || err != nil {
 		t.Fatalf("fail %t %v", ok, err)
 	}
-	if ok, err := client.Submit(ctx, "race|b", "yes"); !ok || err != nil {
+	if ok, err := client.Submit(ctx, "main|race|b", "yes"); !ok || err != nil {
 		t.Fatalf("submit %t %v", ok, err)
 	}
 	result, err = engine.Drive(ctx, flow, 1)
-	if err != nil || result.Output.Key != "race|b" || result.Output.Response != "yes" || len(result.Output.Failures) != 1 {
+	if err != nil || result.Output.Key != "main|race|b" || result.Output.Response != "yes" || len(result.Output.Failures) != 1 {
 		t.Fatalf("%+v %v", result, err)
 	}
 	detail, _ := client.Detail(ctx)
@@ -196,10 +198,10 @@ func TestWaitAnyOverHTTP(t *testing.T) {
 	for _, r := range detail.Records {
 		status[r.Key] = r.Status
 	}
-	if status["race|timeout"] != workflow.Cancelled || status["race|a"] != workflow.Failed {
+	if status["main|race|timeout"] != workflow.Cancelled || status["main|race|a"] != workflow.Failed {
 		t.Fatalf("%+v", status)
 	}
-	if ok, err := client.Submit(ctx, "race|a", "late"); ok || err != nil {
+	if ok, err := client.Submit(ctx, "main|race|a", "late"); ok || err != nil {
 		t.Fatalf("late member %t %v", ok, err)
 	}
 }
@@ -226,7 +228,7 @@ func TestIdleWakePollDoesNotNotify(t *testing.T) {
 		t.Fatalf("read-only wake polls must not publish, got %q", run)
 	default:
 	}
-	if _, err := client.Submit(ctx, "approval", "ok"); err != nil {
+	if _, err := client.Submit(ctx, "main|approval", "ok"); err != nil {
 		t.Fatal(err)
 	}
 	select {
@@ -253,7 +255,7 @@ func TestRunsAreIsolated(t *testing.T) {
 	if _, err := b.Drive(ctx, flow, "B"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := clientA.Submit(ctx, "approval", "for-a"); err != nil {
+	if _, err := clientA.Submit(ctx, "main|approval", "for-a"); err != nil {
 		t.Fatal(err)
 	}
 	if wakes, _ := clientB.WaitWake(ctx, 10*time.Millisecond); len(wakes) != 0 {
@@ -276,11 +278,11 @@ func TestConcurrentEnginesExecuteActionOnce(t *testing.T) {
 	var calls atomic.Int32
 	release := make(chan struct{})
 	flow := definition(func(fc *workflow.FlowContext, in int) (int, error) {
-		return fc.Run("exclusive", func(context.Context, int) (int, error) {
+		return fc.Run("exclusive", workflow.AsAction(func(context.Context, int) (int, error) {
 			calls.Add(1)
 			<-release
 			return in + 1, nil
-		}, in)
+		}), in)
 	})
 	const workers = 4
 	errs := make(chan error, workers)
@@ -344,7 +346,7 @@ submit:
 			t.Fatalf("Run returned before submit: %+v", result)
 		default:
 		}
-		if ok, err := client.Submit(ctx, "approval", "approved"); ok && err == nil {
+		if ok, err := client.Submit(ctx, "main|approval", "approved"); ok && err == nil {
 			break submit
 		}
 		time.Sleep(20 * time.Millisecond)
@@ -391,7 +393,7 @@ func TestEndToEndTwoIsolatedRuns(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 	var polls sync.Map
-	flow := definition(func(fc *workflow.FlowContext, id string) (string, error) {
+	prepare := workflow.FlowFunc[string, string](func(fc *workflow.FlowContext, id string) (string, error) {
 		approval, err := fc.WaitFor[map[string]any]("approval", map[string]string{"order": id})
 		if err != nil {
 			return "", err
@@ -399,17 +401,26 @@ func TestEndToEndTwoIsolatedRuns(t *testing.T) {
 		if approval["approved"] != true {
 			return "", workflow.Permanent(errors.New("rejected"))
 		}
-		notice := fc.GoFlow("notify", workflow.FlowFunc[string, string](func(fc *workflow.FlowContext, id string) (string, error) {
+		return id, nil
+	})
+	flow := workflow.NewWorkflow("test", "v2", func(w *workflow.WorkflowContext, id string) (string, error) {
+		if _, err := w.RunFlow("prepare", prepare, id); err != nil {
+			return "", err
+		}
+		notice := w.GoFlow("notify", workflow.FlowFunc[string, string](func(fc *workflow.FlowContext, id string) (string, error) {
 			winner, err := fc.WaitAny[string]("channel",
 				workflow.WaitForSignal("email_ack", id), workflow.WaitForSignal("sms_ack", id),
 				workflow.SleepSignal("give_up", time.Hour))
 			return winner.Key + "=" + winner.Response, err
 		}), id)
-		ship, err := fc.Loop("ship", func(context.Context, string) (shipment, error) {
-			value, _ := polls.LoadOrStore(id, new(atomic.Int32))
-			n := int(value.(*atomic.Int32).Add(1))
-			return shipment{Attempt: n, Done_: n == 3}, nil
-		}, id, workflow.LoopOptions{Interval: time.Hour, MaxAttempts: 5})
+		shipping := workflow.FlowFunc[string, shipment](func(fc *workflow.FlowContext, id string) (shipment, error) {
+			return fc.Loop("ship", workflow.AsAction(func(context.Context, string) (shipment, error) {
+				value, _ := polls.LoadOrStore(id, new(atomic.Int32))
+				n := int(value.(*atomic.Int32).Add(1))
+				return shipment{Attempt: n, Done_: n == 3}, nil
+			}), id, workflow.LoopOptions{Interval: time.Hour, MaxAttempts: 5})
+		})
+		ship, err := w.RunFlow("shipping", shipping, id)
 		if err != nil {
 			return "", err
 		}
@@ -417,10 +428,10 @@ func TestEndToEndTwoIsolatedRuns(t *testing.T) {
 		if err != nil {
 			return "", err
 		}
-		if err = fc.Sleep("cooldown", time.Hour); err != nil {
-			return "", err
-		}
-		return fmt.Sprintf("%s shipped@%d %s", id, ship.Attempt, text), nil
+		cooldown := workflow.FlowFunc[string, string](func(fc *workflow.FlowContext, output string) (string, error) {
+			return output, fc.Sleep("cooldown", time.Hour)
+		})
+		return w.RunFlow("finish", cooldown, fmt.Sprintf("%s shipped@%d %s", id, ship.Attempt, text))
 	})
 	type outcome struct {
 		result workflow.Result[string]
@@ -465,15 +476,15 @@ func TestEndToEndTwoIsolatedRuns(t *testing.T) {
 	}
 	fire := func(c *Client, key string) func() error { return func() error { return c.FireSleep(ctx, key) } }
 
-	eventually("approve a", submit(a, "approval", map[string]any{"approved": true, "by": "alice"}))
-	eventually("reject b", submit(b, "approval", map[string]any{"approved": false}))
-	eventually("fire ship 1", fire(a, "ship|sleep_1"))
-	eventually("fire ship 2", fire(a, "ship|sleep_2"))
+	eventually("approve a", submit(a, "prepare|approval", map[string]any{"approved": true, "by": "alice"}))
+	eventually("reject b", submit(b, "prepare|approval", map[string]any{"approved": false}))
+	eventually("fire ship 1", fire(a, "shipping|ship|sleep_1"))
+	eventually("fire ship 2", fire(a, "shipping|ship|sleep_2"))
 	eventually("sms ack", submit(a, "notify|channel|sms_ack", "read"))
 	if ok, err := a.Submit(ctx, "notify|channel|email_ack", "late"); ok || err != nil {
 		t.Fatalf("late loser must be ignored: %t %v", ok, err)
 	}
-	eventually("fire cooldown", fire(a, "cooldown"))
+	eventually("fire cooldown", fire(a, "finish|cooldown"))
 
 	ra, rb := <-doneA, <-doneB
 	if ra.err != nil || ra.result.Output != "order-a shipped@3 notify|channel|sms_ack=read" {
@@ -496,7 +507,7 @@ func TestEndToEndTwoIsolatedRuns(t *testing.T) {
 		status[r.Key] = r.Status
 	}
 	if detailA.Run.Status != string(workflow.Completed) || status["notify|channel|email_ack"] != workflow.Cancelled ||
-		status["notify|channel|give_up"] != workflow.Cancelled || status["ship|attempt_2"] != workflow.Completed {
+		status["notify|channel|give_up"] != workflow.Cancelled || status["shipping|ship|attempt_2"] != workflow.Completed {
 		t.Fatalf("a: %s %+v", detailA.Run.Status, status)
 	}
 	if detailB.Run.Status != string(workflow.Failed) || detailB.Run.Error == "" || len(detailB.Records) != 2 {

@@ -14,9 +14,8 @@ func ExampleFlowContext_WaitAny() {
 	if err != nil {
 		panic(err)
 	}
-	definition := workflow.Workflow[string, string]{
-		Name: "approval", Version: "1",
-		Flow: workflow.FlowFunc[string, string](func(f *workflow.FlowContext, input string) (string, error) {
+	definition := exampleDefinition("approval", "1",
+		workflow.FlowFunc[string, string](func(f *workflow.FlowContext, input string) (string, error) {
 			winner, err := f.WaitAny[string]("providers",
 				workflow.WaitCase[string]{Key: "primary", Request: input},
 				workflow.WaitCase[string]{Key: "secondary", Request: input},
@@ -26,7 +25,7 @@ func ExampleFlowContext_WaitAny() {
 			}
 			return winner.Key + ": " + winner.Response, nil
 		}),
-	}
+	)
 	waiting, err := engine.Drive(ctx, definition, "order_123")
 	if err != nil {
 		panic(err)
@@ -34,14 +33,14 @@ func ExampleFlowContext_WaitAny() {
 	fmt.Println(waiting.Status, len(waiting.Pending))
 	// Both requests are durable and available for independent providers.
 	// 两个请求都是持久化的，并且可供独立提供方使用。
-	secondary, err := store.Get(ctx, "providers|secondary")
+	secondary, err := store.Get(ctx, "main|providers|secondary")
 	if err != nil {
 		panic(err)
 	}
 	if _, err = engine.ResolveSignal(ctx, secondary.Key, secondary.Version, "approved"); err != nil {
 		panic(err)
 	}
-	primary, err := store.Get(ctx, "providers|primary")
+	primary, err := store.Get(ctx, "main|providers|primary")
 	if err != nil {
 		panic(err)
 	}
@@ -54,5 +53,5 @@ func ExampleFlowContext_WaitAny() {
 	// Output:
 	// SUSPENDED 2
 	// primary: CANCELLED
-	// COMPLETED providers|secondary: approved
+	// COMPLETED main|providers|secondary: approved
 }

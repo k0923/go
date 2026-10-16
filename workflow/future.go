@@ -37,16 +37,22 @@ func (f *FlowContext) async[O any](key string, fn func(string) (O, error)) *Futu
 	}
 	ex := f.execution
 	ex.mu.Lock()
-	if ex.closed {
+	if ex.closed || (f.scope != nil && f.scope.closed) {
 		ex.mu.Unlock()
 		result.err = ErrInvalid
 		close(result.done)
 		return result
 	}
 	ex.wg.Add(1)
+	if f.scope != nil {
+		f.scope.wg.Add(1)
+	}
 	ex.mu.Unlock()
 	go func() {
 		defer ex.wg.Done()
+		if f.scope != nil {
+			defer f.scope.wg.Done()
+		}
 		result.output, result.err = invoke(func() (O, error) { return fn(resolved) })
 		f.remember(&result.err)
 		close(result.done)
@@ -58,11 +64,15 @@ func (f *FlowContext) Go[I, O any](key string, action Action[I, O], input I, opt
 	return f.async(key, func(resolved string) (O, error) { return f.runAction(resolved, action, input, options...) })
 }
 
-func (f *FlowContext) GoFlow[I, O any](key string, flow Flow[I, O], input I) *Future[O] {
+// GoFlow is available only to top-level orchestration. Its Future completes
+// after the called Flow and its async Actions exit.
+// GoFlow 仅属于顶层编排；Future 在 Flow 及其异步 Action 全部退出后完成。
+func (w *WorkflowContext) GoFlow[I, O any](key string, flow Flow[I, O], input I) *Future[O] {
+	f := w.state
 	return f.async(key, func(resolved string) (output O, err error) {
 		if flow == nil {
 			return output, ErrInvalid
 		}
-		return flow.Run(&FlowContext{execution: f.execution, prefix: resolved}, input)
+		return f.runChildFlow(resolved, flow, input)
 	})
 }

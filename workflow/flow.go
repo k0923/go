@@ -4,17 +4,19 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
 	"github.com/google/uuid"
 )
 
-// RunFlow creates a namespace, not another lease or workflow state.
-// A child Flow can itself RunFlow recursively.
-// RunFlow 创建的是命名空间，而不是另一个租约或工作流状态。
-// 子 Flow 本身也可以递归调用 RunFlow。
-func (f *FlowContext) RunFlow[I, O any](key string, flow Flow[I, O], input I) (output O, err error) {
+// RunFlow is available only to top-level orchestration. It creates a namespace,
+// not another lease or workflow state. A called Flow cannot invoke another Flow.
+// Returning includes joining the Flow's async Actions.
+// RunFlow 仅允许顶层编排调用；被调用的 Flow 不可继续调用 Flow。
+func (w *WorkflowContext) RunFlow[I, O any](key string, flow Flow[I, O], input I) (output O, err error) {
+	f := w.state
 	defer f.remember(&err)
 	resolved, err := f.claim(key)
 	if err != nil {
@@ -23,8 +25,24 @@ func (f *FlowContext) RunFlow[I, O any](key string, flow Flow[I, O], input I) (o
 	if flow == nil {
 		return output, ErrInvalid
 	}
-	child := &FlowContext{execution: f.execution, prefix: resolved}
-	return invoke(func() (O, error) { return flow.Run(child, input) })
+	return f.runChildFlow(resolved, flow, input)
+}
+
+func (f *FlowContext) runChildFlow[I, O any](resolved string, flow Flow[I, O], input I) (output O, err error) {
+	scope := &flowScope{}
+	child := &FlowContext{execution: f.execution, prefix: resolved, scope: scope}
+	output, err = invoke(func() (O, error) { return flow.Run(child, input) })
+	child.remember(&err) // Includes a handler error even if it launched no tasks.
+	scope.wg.Wait()
+	f.execution.mu.Lock()
+	scope.closed = true
+	err = errors.Join(scope.errs...)
+	f.execution.mu.Unlock()
+	if err != nil {
+		var zero O
+		return zero, err
+	}
+	return output, nil
 }
 
 // WaitFor registers a durable request in the Flow, outside any Action lease.
@@ -179,7 +197,7 @@ func (f *FlowContext) Loop[I any, O LoopOutput](key string, action Action[I, O],
 	if options.Interval <= 0 || options.MaxAttempts <= 0 {
 		return output, ErrInvalid
 	}
-	child := &FlowContext{execution: f.execution, prefix: resolved}
+	child := &FlowContext{execution: f.execution, prefix: resolved, scope: f.scope}
 	for attempt := 0; attempt < options.MaxAttempts; attempt++ {
 		if attempt > 0 {
 			if err = child.Sleep(fmt.Sprintf("sleep_%d", attempt), options.Interval); err != nil {

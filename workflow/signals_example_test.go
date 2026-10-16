@@ -15,9 +15,8 @@ func ExampleWaitForSignal() {
 	if err != nil {
 		panic(err)
 	}
-	flow := workflow.Workflow[string, string]{
-		Name: "reply_or_timeout", Version: "1",
-		Flow: workflow.FlowFunc[string, string](func(f *workflow.FlowContext, request string) (string, error) {
+	flow := exampleDefinition("reply_or_timeout", "1",
+		workflow.FlowFunc[string, string](func(f *workflow.FlowContext, request string) (string, error) {
 			winner, err := f.WaitAny[string]("signals",
 				workflow.WaitForSignal("reply", request),
 				workflow.SleepSignal("timeout", time.Hour),
@@ -30,13 +29,13 @@ func ExampleWaitForSignal() {
 			}
 			return winner.Response, nil
 		}),
-	}
+	)
 	waiting, err := engine.Drive(ctx, flow, "request")
 	if err != nil {
 		panic(err)
 	}
 	fmt.Println("waiting signals:", len(waiting.Pending))
-	record, err := store.Get(ctx, "signals|reply")
+	record, err := store.Get(ctx, "main|signals|reply")
 	if err != nil {
 		panic(err)
 	}
@@ -47,7 +46,7 @@ func ExampleWaitForSignal() {
 	if err != nil {
 		panic(err)
 	}
-	timeout, err := store.Get(ctx, "signals|timeout")
+	timeout, err := store.Get(ctx, "main|signals|timeout")
 	if err != nil {
 		panic(err)
 	}

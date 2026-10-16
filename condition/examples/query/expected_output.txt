@@ -1,0 +1,138 @@
+== in-memory matches: [1 2 3]
+
+== SQL (SQLite):
+SELECT id FROM orders AS o WHERE ("o"."status" IN (?, ?) AND "o"."total_amount" >= ? AND NOT ("o"."country" IN (?, ?)) AND ("o"."vip" OR EXISTS (SELECT 1 FROM "order_coupons" AS "t1" WHERE "t1".order_id = "o".id AND "t1"."code" = ?) OR ("o"."total_amount" - "o"."discount") > ?) AND NOT ((length("o"."email") >= length(?) AND substr("o"."email", length("o"."email") - length(?) + 1) = ?)) AND EXISTS (SELECT 1 FROM "order_items" AS "t2" WHERE "t2".order_id = "o".id AND ("t2"."category" IN (?, ?) AND "t2"."price" >= ? AND substr("t2"."sku", 1, length(?)) = ?)) AND NOT EXISTS (SELECT 1 FROM "order_items" AS "t3" WHERE "t3".order_id = "o".id AND NOT ("t3"."qty" > ?)) AND NOT EXISTS (SELECT 1 FROM "order_tags" AS "t4" WHERE "t4".order_id = "o".id AND "t4"."tag" = ?) AND (SELECT COUNT(*) FROM "order_items" AS "t5" WHERE "t5".order_id = "o".id) <= ?)
+args: ["paid" "shipped" 'd' "KP" "IR" "WELCOME10" 'Ǵ' "@test.local" "@test.local" "@test.local" "book" "music" '\x14' "BK-" "BK-" '\x00' "fraud" '\x14']
+sqlite matches: [1 2 3] | identical to in-memory: true
+
+== SQL (PostgreSQL, tags/coupons as text[]):
+("o"."status" IN ($1, $2) AND "o"."amount" >= $3 AND NOT ("o"."country" IN ($4, $5)) AND ("o"."vip" OR $6 = ANY("o"."coupons") OR ("o"."amount" - "o"."discount") > $7) AND NOT ("o"."email" LIKE $8 ESCAPE '\') AND EXISTS (SELECT 1 FROM "order_items" AS "t1" WHERE "t1".order_id = "o".id AND ("t1"."category" IN ($9, $10) AND "t1"."price" >= $11 AND "t1"."sku" LIKE $12 ESCAPE '\')) AND NOT EXISTS (SELECT 1 FROM "order_items" AS "t2" WHERE "t2".order_id = "o".id AND NOT ("t2"."qty" > $13)) AND NOT EXISTS (SELECT 1 FROM unnest("o"."tags") AS "t3"(v) WHERE "t3".v = $14) AND (SELECT COUNT(*) FROM "order_items" AS "t4" WHERE "t4".order_id = "o".id) <= $15)
+args: ["paid" "shipped" 'd' "KP" "IR" "WELCOME10" 'Ǵ' "%@test.local" "book" "music" '\x14' "BK-%" '\x00' "fraud" '\x14']
+
+== MongoDB filter:
+{
+  "$and": [
+    {
+      "status": {
+        "$in": [
+          "paid",
+          "shipped"
+        ]
+      }
+    },
+    {
+      "amount": {
+        "$gte": 100
+      }
+    },
+    {
+      "country": {
+        "$nin": [
+          "KP",
+          "IR"
+        ]
+      }
+    },
+    {
+      "$or": [
+        {
+          "vip": true
+        },
+        {
+          "coupons": {
+            "$eq": "WELCOME10"
+          }
+        },
+        {
+          "$expr": {
+            "$gt": [
+              {
+                "$subtract": [
+                  "$amount",
+                  "$discount"
+                ]
+              },
+              500
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "$nor": [
+        {
+          "email": {
+            "$regex": "@test\\.local\\z"
+          }
+        }
+      ]
+    },
+    {
+      "lines": {
+        "$elemMatch": {
+          "$and": [
+            {
+              "category": {
+                "$in": [
+                  "book",
+                  "music"
+                ]
+              }
+            },
+            {
+              "unit_price": {
+                "$gte": 20
+              }
+            },
+            {
+              "sku": {
+                "$regex": "\\ABK-"
+              }
+            }
+          ]
+        }
+      }
+    },
+    {
+      "lines": {
+        "$not": {
+          "$elemMatch": {
+            "$nor": [
+              {
+                "qty": {
+                  "$gt": 0
+                }
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "tags": {
+        "$not": {
+          "$elemMatch": {
+            "$eq": "fraud"
+          }
+        }
+      }
+    },
+    {
+      "$expr": {
+        "$lte": [
+          {
+            "$size": {
+              "$ifNull": [
+                "$lines",
+                {
+                  "$literal": []
+                }
+              ]
+            }
+          },
+          20
+        ]
+      }
+    }
+  ]
+}

@@ -1,0 +1,8 @@
+any line cheap:        big=true empty=false
+all lines A-*:         big=false empty=true
+no line qty > 50:      big=true empty=true
+has >= 3 lines:        big=true empty=false
+payable(big):          200
+payable >= 200:        big=true empty=false
+avg price(empty):      is ErrDivideByZero=true
+avg price > 20:        big=true empty=false

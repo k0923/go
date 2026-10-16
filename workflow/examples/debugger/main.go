@@ -98,9 +98,9 @@ func pause(ctx context.Context, d time.Duration) error {
 	}
 }
 
-var orderFlow = workflow.FlowFunc[Order, Summary](func(f *workflow.FlowContext, order Order) (Summary, error) {
+var prepareFlow = workflow.FlowFunc[Order, Summary](func(f *workflow.FlowContext, order Order) (Summary, error) {
 	summary := Summary{OrderID: order.ID}
-	if _, err := f.Run("validate", validate, order); err != nil {
+	if _, err := f.Run("validate", workflow.AsAction(validate), order); err != nil {
 		return summary, err
 	}
 	approval, err := f.WaitFor[Approval]("approval", map[string]any{
@@ -113,13 +113,20 @@ var orderFlow = workflow.FlowFunc[Order, Summary](func(f *workflow.FlowContext, 
 	if !approval.Approved {
 		return summary, workflow.Permanent(fmt.Errorf("rejected by %s: %s", approval.By, approval.Reason))
 	}
-	if summary.Payment, err = f.Run("charge", charge, order); err != nil {
+	if summary.Payment, err = f.Run("charge", workflow.AsAction(charge), order); err != nil {
 		return summary, err
 	}
+	return summary, nil
+})
 
+func orchestrateOrder(w *workflow.WorkflowContext, order Order) (Summary, error) {
+	summary, err := w.RunFlow("prepare", prepareFlow, order)
+	if err != nil {
+		return summary, err
+	}
 	// Shipment polling and customer notification progress concurrently.
 	// 物流轮询和客户通知会并发推进。
-	notice := f.GoFlow("notify", workflow.FlowFunc[string, string](func(f *workflow.FlowContext, id string) (string, error) {
+	notice := w.GoFlow("notify", workflow.FlowFunc[string, string](func(f *workflow.FlowContext, id string) (string, error) {
 		// Acks are typed in by hand in the debugger, so accept any JSON shape.
 		// ack 是在 debugger 中手动输入的，因此接受任意 JSON 形状。
 		winner, err := f.WaitAny[json.RawMessage]("channel",
@@ -136,16 +143,22 @@ var orderFlow = workflow.FlowFunc[Order, Summary](func(f *workflow.FlowContext, 
 		return winner.Key + ": " + string(winner.Response), nil
 	}), order.ID)
 
-	if summary.Shipment, err = f.Loop("ship", pollShipment, order.ID, workflow.LoopOptions{
-		Interval: 15 * time.Second, MaxAttempts: 5,
-	}); err != nil {
+	shipping := workflow.FlowFunc[string, Shipment](func(f *workflow.FlowContext, id string) (Shipment, error) {
+		return f.Loop("ship", workflow.AsAction(pollShipment), id, workflow.LoopOptions{
+			Interval: 15 * time.Second, MaxAttempts: 5,
+		})
+	})
+	if summary.Shipment, err = w.RunFlow("shipping", shipping, order.ID); err != nil {
 		return summary, err
 	}
 	if summary.Notice, err = notice.Wait(); err != nil {
 		return summary, err
 	}
-	return summary, f.Sleep("cooldown", 5*time.Second)
-})
+	cooldown := workflow.FlowFunc[Summary, Summary](func(f *workflow.FlowContext, summary Summary) (Summary, error) {
+		return summary, f.Sleep("cooldown", 5*time.Second)
+	})
+	return w.RunFlow("finish", cooldown, summary)
+}
 
 func main() {
 	server := flag.String("server", debugger.DefaultServer, "debugger server URL")
@@ -155,7 +168,7 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer stop()
 
-	definition := workflow.Workflow[Order, Summary]{Name: "order", Version: "v1", Flow: orderFlow}
+	definition := workflow.NewWorkflow("order", "v2", orchestrateOrder)
 	id := *run
 	if id == "" {
 		id = fmt.Sprintf("order-%d", time.Now().Unix()%100000)

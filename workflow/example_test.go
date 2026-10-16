@@ -19,7 +19,7 @@ func SubmitOrder(ctx context.Context, orderID string) (string, error) {
 }
 
 func (OrderFlow) Run(ctx *workflow.FlowContext, orderID string) (string, error) {
-	submitted, err := ctx.Run("submit", SubmitOrder, orderID)
+	submitted, err := ctx.Run("submit", workflow.AsAction(SubmitOrder), orderID)
 	if err != nil {
 		return "", err
 	}
@@ -32,18 +32,16 @@ func ExampleEngine_Drive() {
 	if err != nil {
 		panic(err)
 	}
-	order := workflow.Workflow[string, string]{
-		Name: "order",
-		Version: "1",
-		Flow: OrderFlow{},
-	}
+	order := workflow.NewWorkflow("order", "1", func(ctx *workflow.WorkflowContext, id string) (string, error) {
+		return ctx.RunFlow("order", OrderFlow{}, id)
+	})
 	ctx := context.Background()
 	first, err := engine.Drive(ctx, order, "order_123")
 	if err != nil {
 		panic(err)
 	}
 	fmt.Println(first.Status, first.Pending[0].Key)
-	request, err := store.Get(ctx, "approval")
+	request, err := store.Get(ctx, "order|approval")
 	if err != nil {
 		panic(err)
 	}
@@ -57,6 +55,12 @@ func ExampleEngine_Drive() {
 	}
 	fmt.Println(second.Status, second.Output)
 	// Output:
-	// SUSPENDED approval
+	// SUSPENDED order|approval
 	// COMPLETED approved
+}
+
+func exampleDefinition[I, O any](name, version string, flow workflow.Flow[I, O]) workflow.Workflow[I, O] {
+	return workflow.NewWorkflow(name, version, func(ctx *workflow.WorkflowContext, input I) (O, error) {
+		return ctx.RunFlow("main", flow, input)
+	})
 }

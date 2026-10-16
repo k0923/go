@@ -15,10 +15,11 @@ import (
 	"github.com/k0923/go/workflow"
 )
 
-// Client is a workflow.Infrastructure (plus Delivery and WaitAnyInfrastructure)
-// bound to ONE run on a debugger server. Create one Client per run.
+// Client is a workflow.Infrastructure (plus debugger Delivery and
+// WaitAnyInfrastructure) bound to ONE run on a debugger server. Create one
+// Client per run.
 // Client 是绑定到 debugger server 上单个运行的 workflow.Infrastructure
-// （另加 Delivery 和 WaitAnyInfrastructure）。每个运行应创建一个 Client。
+// （另加 debugger Delivery 和 WaitAnyInfrastructure）。每个运行应创建一个 Client。
 type Client struct {
 	base string
 	run  string
@@ -27,7 +28,7 @@ type Client struct {
 
 var (
 	_ workflow.Infrastructure        = (*Client)(nil)
-	_ workflow.Delivery              = (*Client)(nil)
+	_ Delivery                       = (*Client)(nil)
 	_ workflow.WaitAnyInfrastructure = (*Client)(nil)
 )
 

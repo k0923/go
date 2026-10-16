@@ -84,13 +84,32 @@ type execution struct {
 
 var localKey = regexp.MustCompile(`^[A-Za-z0-9_]+$`)
 
-// FlowContext is deliberately NOT context.Context. Context() is the only
-// standard context passed to external clients; workflow APIs live here.
-// FlowContext 有意不实现 context.Context。Context() 是唯一传给外部客户端的
-// 标准 context；工作流 API 位于这里。
+// flowScope joins asynchronous descendants before this Flow returns to its
+// caller. Mutable fields are protected by execution.mu.
+type flowScope struct {
+	wg     sync.WaitGroup
+	errs   []error
+	closed bool
+}
+
+// WorkflowContext is created only by Engine.Drive. Its private state is not
+// embedded: Action and signal methods are not promoted into orchestration.
+// WorkflowContext 仅由 Engine.Drive 创建。内部状态不采用嵌入，
+// 因此顶层编排不会获得 Action 和信号方法。
+type WorkflowContext struct {
+	state *FlowContext
+}
+
+func (w *WorkflowContext) Context() context.Context { return w.state.Context() }
+
+// FlowContext provides Action and signal primitives, but cannot call Flows.
+// Actions receive a standard context instead of either workflow context.
+// FlowContext 提供 Action 和信号原语，但不提供 Flow 调用能力；
+// Action 接收标准 context，不接收任一工作流上下文。
 type FlowContext struct {
 	execution *execution
 	prefix    string
+	scope     *flowScope
 }
 
 func (f *FlowContext) Context() context.Context { return f.execution.ctx }
@@ -107,7 +126,7 @@ func (f *FlowContext) claim(key string) (string, error) {
 	e := f.execution
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	if e.closed {
+	if e.closed || (f.scope != nil && f.scope.closed) {
 		return "", fmt.Errorf("%w: execution closed", ErrInvalid)
 	}
 	if err := e.ctx.Err(); err != nil {
@@ -127,6 +146,9 @@ func (f *FlowContext) remember(err *error) {
 	e := f.execution
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	if f.scope != nil {
+		f.scope.errs = append(f.scope.errs, *err)
+	}
 	var pending *SuspendedError
 	if errors.As(*err, &pending) {
 		e.pending[pending.Pending.Key] = pending.Pending
@@ -171,7 +193,7 @@ func (e *Engine) Drive[I, O any](ctx context.Context, workflow Workflow[I, O], i
 			StartedAt: eventStarted, Pending: result.Pending,
 		}, err)
 	}()
-	if ctx == nil || workflow.Flow == nil || !localKey.MatchString(workflow.Name) || workflow.Version == "" {
+	if ctx == nil || workflow.run == nil || !localKey.MatchString(workflow.Name) || workflow.Version == "" {
 		return result, ErrInvalid
 	}
 	if err = ctx.Err(); err != nil {
@@ -197,9 +219,10 @@ func (e *Engine) Drive[I, O any](ctx context.Context, workflow Workflow[I, O], i
 	defer cancel()
 	ex := &execution{engine: e, ctx: runCtx, cancel: cancel, keys: make(map[string]bool), pending: make(map[string]Pending)}
 	flowCtx := &FlowContext{execution: ex}
+	workflowCtx := &WorkflowContext{state: flowCtx}
 	started := e.options.Now()
 	e.observe(runCtx, workflow.Name, "drive_started", started, nil)
-	output, handlerErr := invoke(func() (O, error) { return workflow.Flow.Run(flowCtx, input) })
+	output, handlerErr := invoke(func() (O, error) { return workflow.run(workflowCtx, input) })
 	flowCtx.remember(&handlerErr)
 	ex.wg.Wait()
 	ex.mu.Lock()
@@ -251,7 +274,7 @@ func (f *FlowContext) runAction[I, O any](key string, action Action[I, O], input
 			StartedAt: eventStarted, Replayed: replayed, RecordVersion: recordVersion,
 		}, err)
 	}()
-	if action == nil || len(options) > 1 {
+	if invalidAction(action) || len(options) > 1 {
 		return output, ErrInvalid
 	}
 	var option ActionOptions
@@ -331,7 +354,7 @@ func (f *FlowContext) runAction[I, O any](key string, action Action[I, O], input
 			Status: Running, StartedAt: eventStarted, RecordVersion: record.Version,
 		}, nil)
 		var actionErr error
-		output, actionErr = invoke(func() (O, error) { return action(actionCtx, input) })
+		output, actionErr = invoke(func() (O, error) { return action.Run(actionCtx, input) })
 		if contextErr := actionCtx.Err(); contextErr != nil {
 			return errors.Join(actionErr, contextErr)
 		}

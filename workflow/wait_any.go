@@ -53,9 +53,9 @@ type WaitFailure struct {
 }
 
 type WaitAnyResult[R any] struct {
-	Key      string // resolved winner key, e.g. approval|primary
+	Key string // resolved winner key, e.g. approval|primary
 	// 已解析的赢家 key，例如 approval|primary。
-	Kind     Kind   // SleepKind winners have a zero Response, not a JSON payload
+	Kind Kind // SleepKind winners have a zero Response, not a JSON payload
 	// SleepKind 赢家的 Response 为零值，而不是 JSON 负载。
 	Response R
 	Failures []WaitFailure // isolated candidate errors; not a drive failure
@@ -144,7 +144,7 @@ func (f *FlowContext) WaitAny[R, Q any](key string, cases ...WaitCase[Q]) (resul
 	if len(cases) == 0 {
 		return result, fmt.Errorf("%w: empty waiting group", ErrInvalid)
 	}
-	child := &FlowContext{execution: f.execution, prefix: group}
+	child := &FlowContext{execution: f.execution, prefix: group, scope: f.scope}
 	// Validate every key before any external registration.
 	// 在任何外部注册发生前验证每个 key。
 	keys := make([]string, len(cases))

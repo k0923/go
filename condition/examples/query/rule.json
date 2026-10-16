@@ -1,0 +1,44 @@
+{
+  "op": "and",
+  "args": [
+    { "op": "in", "args": [{ "field": "status" }, { "value": ["paid", "shipped"] }] },
+    { "op": "ge", "args": [{ "field": "amount" }, { "value": 100 }] },
+    { "op": "not_in", "args": [{ "field": "country" }, { "value": ["KP", "IR"] }] },
+
+    {
+      "op": "or",
+      "args": [
+        { "field": "vip" },
+        { "op": "in", "args": [{ "value": "WELCOME10" }, { "field": "coupons" }] },
+        {
+          "op": "gt",
+          "args": [
+            { "op": "sub", "args": [{ "field": "amount" }, { "field": "discount" }] },
+            { "value": 500 }
+          ]
+        }
+      ]
+    },
+
+    { "op": "not", "args": [{ "op": "ends_with", "args": [{ "field": "email" }, { "value": "@test.local" }] }] },
+
+    {
+      "op": "any",
+      "args": [
+        { "field": "items" },
+        {
+          "op": "and",
+          "args": [
+            { "op": "in", "args": [{ "field": "category" }, { "value": ["book", "music"] }] },
+            { "op": "ge", "args": [{ "field": "price" }, { "value": 20 }] },
+            { "op": "starts_with", "args": [{ "field": "sku" }, { "value": "BK-" }] }
+          ]
+        }
+      ]
+    },
+
+    { "op": "all", "args": [{ "field": "items" }, { "op": "gt", "args": [{ "field": "qty" }, { "value": 0 }] }] },
+    { "op": "none", "args": [{ "field": "tags" }, { "op": "eq", "args": [{ "field": "$" }, { "value": "fraud" }] }] },
+    { "op": "le", "args": [{ "op": "len", "args": [{ "field": "items" }] }, { "value": 20 }] }
+  ]
+}

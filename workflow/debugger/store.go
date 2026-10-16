@@ -569,8 +569,8 @@ func (t *txn) complete(r *workflow.Record, group string, response []byte) error 
 	return t.enqueue(&c, workflow.WakeNotification, t.now)
 }
 
-// ---- workflow.Delivery ----
-// ---- workflow.Delivery 接口实现 ----
+// ---- debugger.Delivery ----
+// ---- debugger.Delivery 接口实现 ----
 
 func (s *Store) Pending(ctx context.Context, run string, now time.Time) (result []workflow.Notification, err error) {
 	err = s.tx(ctx, run, func(t *txn) error {

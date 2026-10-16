@@ -1,0 +1,17 @@
+promotion(o1) = true 
+promotion(o2) = true 
+promotion(o3) = false 
+promotion(o4) = false 
+serialised: {"op":"and","args":[{"op":"eq","args":[{"field":"vip"},{"value":false}]},{"op":"eq","args":[{"op":"len","args":[{"field":"coupons"}]},{"value":0}]},{"op":"gt","args":[{"op":"mul","args":[{"field":"amount"},{"value":0.9}]},{"value":100}]}]}
+built rule(amount=120) = true
+unknown field   path=$.args[1]          unknown field: "amout"
+type mismatch   path=$                  type mismatch: gt on string and number
+unknown op      path=$                  unknown operator: "xor"
+wrong arity     path=$                  wrong number of arguments: not wants 1, got 0
+div by zero     path=$.args[0].args[1]  condition: division by zero
+parent field    path=$.args[1]          unknown field: "vip"
+misspelt key    decode error: condition: decode node: json: unknown field "opt"
+not a bool      path=$                  type mismatch: want bool, got number
+mixed list      path=$.args[1]          type mismatch: list mixes numbers and strings
+trailing input  decode error: condition: decode node: unexpected trailing data
+errors.Is(err, ErrUnknownField) = true

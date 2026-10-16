@@ -129,7 +129,7 @@ func TestEngineEvents(t *testing.T) {
 				engine.Subscribe(collector.listen)
 				cause := errors.New("action failed")
 				flow := definition(FlowFunc[int, int](func(f *FlowContext, in int) (int, error) {
-					return f.Run("failure", func(ctx context.Context, _ int) (int, error) {
+					return f.Run("failure", AsAction(func(ctx context.Context, _ int) (int, error) {
 						switch scenario {
 						case "permanent":
 							return 0, Permanent(cause)
@@ -141,7 +141,7 @@ func TestEngineEvents(t *testing.T) {
 						default:
 							return 0, cause
 						}
-					}, in, ActionOptions{Timeout: 10 * time.Millisecond})
+					}), in, ActionOptions{Timeout: 10 * time.Millisecond})
 				}))
 				_, err := engine.Drive(context.Background(), flow, 0)
 				if err == nil {
@@ -248,7 +248,7 @@ func TestEngineEvents(t *testing.T) {
 		engine.Subscribe(collector.listen)
 		cause := &unformattableEventError{}
 		flow := definition(FlowFunc[int, int](func(f *FlowContext, input int) (int, error) {
-			return f.Run("action", func(context.Context, int) (int, error) { return 0, cause }, input)
+			return f.Run("action", AsAction(func(context.Context, int) (int, error) { return 0, cause }), input)
 		}))
 		_, err := engine.Drive(context.Background(), flow, 0)
 		if !errors.Is(err, cause) {

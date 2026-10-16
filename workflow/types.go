@@ -15,18 +15,8 @@ import (
 	"github.com/k0923/go/lease"
 )
 
-// Action is an ordinary callable; it has no workflow scheduling capabilities.
-// An IO action is not mathematically pure. Its external effects must be idempotent.
-// Action 是普通可调用对象；它不具备工作流调度能力。
-// IO action 在数学意义上并非纯函数，其外部副作用必须具备幂等性。
-type Action[I, O any] func(context.Context, I) (O, error)
-
-// Pure adapts a deterministic computation to an Action.
-// Pure 将确定性计算适配为 Action。
-func Pure[I, O any](fn func(I) O) Action[I, O] {
-	return func(_ context.Context, input I) (O, error) { return fn(input), nil }
-}
-
+// Flow composes Actions and signals using a context without Flow-call methods.
+// Flow 使用不含跨流程调用方法的上下文，组合 Action 和信号。
 type Flow[I, O any] interface {
 	Run(*FlowContext, I) (O, error)
 }
@@ -35,12 +25,22 @@ type FlowFunc[I, O any] func(*FlowContext, I) (O, error)
 
 func (f FlowFunc[I, O]) Run(ctx *FlowContext, input I) (O, error) { return f(ctx, input) }
 
-// Workflow names and versions the root definition; Flow is reusable orchestration.
-// Workflow 为根定义命名并标记版本；Flow 是可复用的编排。
+// Workflow is a named top-level definition whose entry is invoked by Engine.
+// Construct it with NewWorkflow; it does not implement Flow or expose Run.
+// Workflow 是由引擎调用的具名顶层定义，使用 NewWorkflow 构造；
+// 它不实现 Flow，也不公开 Run 方法。
 type Workflow[I, O any] struct {
 	Name    string
 	Version string
-	Flow    Flow[I, O]
+	run     func(*WorkflowContext, I) (O, error)
+}
+
+// NewWorkflow defines orchestration with access only to Flow-call primitives.
+// Engine.Drive validates the name, version and handler before executing it.
+// NewWorkflow 定义顶层编排，仅提供 Flow 调用原语；
+// Engine.Drive 会在执行前校验名称、版本和处理函数。
+func NewWorkflow[I, O any](name, version string, handler func(*WorkflowContext, I) (O, error)) Workflow[I, O] {
+	return Workflow[I, O]{Name: name, Version: version, run: handler}
 }
 
 type Status string

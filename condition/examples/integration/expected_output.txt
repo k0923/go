@@ -1,0 +1,6 @@
+user=1205 path=/api/orders        -> v2 (canary)
+user=1299 path=/api/orders        -> mobile (mobile-weekend)
+user=1299 path=/ops/admin/users   -> internal (admin)
+user=1299 path=/home              -> v1 (default)
+canary share over 8000 requests: 10%
+load error: route "typo": condition: $.args[0]: unknown field: "user_buckt"

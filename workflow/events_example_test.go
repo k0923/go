@@ -17,16 +17,15 @@ func ExampleEngine_Subscribe() {
 	}, workflow.ActionFinished, workflow.DriveFinished)
 	defer unsubscribe()
 
-	definition := workflow.Workflow[int, int]{
-		Name: "demo", Version: "1",
-		Flow: workflow.FlowFunc[int, int](func(ctx *workflow.FlowContext, input int) (int, error) {
+	definition := exampleDefinition("demo", "1",
+		workflow.FlowFunc[int, int](func(ctx *workflow.FlowContext, input int) (int, error) {
 			return ctx.Run("increment", workflow.Pure(func(n int) int { return n + 1 }), input)
 		}),
-	}
+	)
 	if _, err := engine.Drive(context.Background(), definition, 1); err != nil {
 		panic(err)
 	}
 	// Output:
-	// action_finished increment COMPLETED
+	// action_finished main|increment COMPLETED
 	// drive_finished demo COMPLETED
 }

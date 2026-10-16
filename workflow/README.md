@@ -6,28 +6,37 @@
 
 | 概念 | 职责 | API |
 | --- | --- | --- |
-| Workflow | 根流程名称、版本及可复用 Flow 定义 | `Workflow[I, O]{Name, Version, Flow}` |
+| Workflow | 名称、版本及由引擎执行的顶层编排定义 | `NewWorkflow(name, version, handler)` |
 | Flow | 确定性编排、显式传递输入输出 | `Run(*FlowContext, I) (O, error)` |
-| Action | 一次计算或外部操作，不持有编排能力 | `func(context.Context, I) (O, error)` |
+| Action | 一次计算或外部操作，不持有编排能力 | `Run(context.Context, I) (O, error)` 接口；函数用 `ActionFn` / `AsAction` 适配 |
 | Engine | 驱动、回放、租约、错误归类、观测 | `NewEngine`、`Drive`、`ResolveSignal` |
-| FlowContext | 命名空间及受控编排能力 | `Run`、`RunFlow`、`Go`、`GoFlow`、`WaitFor`、`Sleep`、`SleepUntil`、`Now`、`UUID`、`Loop` |
+| WorkflowContext | 仅顶层跨流程调用能力，由 Engine 创建 | `RunFlow`、`GoFlow`、`Context` |
+| FlowContext | Action、信号与检查点能力 | `Run`、`Go`、`WaitFor`、`WaitAny`、`Sleep`、`SleepUntil`、`Now`、`UUID`、`Loop` |
 | Infrastructure | 一个实例的原子存储与租约 | `Get`、`Put`、`Commit`、`Resolve`、`Claim`、`Renew`、`Release` |
 
-`FlowContext` 不实现 `context.Context`，也不嵌入 ActionContext。外部客户端只接收 `ctx.Context()` 或 Action 参数中的标准 context。Action 内没有等待、休眠、子流程或调度权限。
+`FlowContext` 不实现 `context.Context`，也不嵌入 ActionContext。客户端和 Repository 由 Action 持有，只在 Action.Run 内使用标准 context。FlowContext 不提供业务客户端、Repository 或依赖容器泛型。Action 内没有等待、休眠、子流程或调度权限。
 
-根输入真正传入 Flow。子 Flow 可以递归调用 `RunFlow`，每次挂载创建一个 key 命名空间；Flow 本身不申请租约。
+根输入传入 NewWorkflow 定义的处理函数，它接收独立 WorkflowContext，只能通过 `RunFlow` / `GoFlow` 调用 Flow。FlowContext 不含这两个方法，无法编译嵌套框架调用；顶层也不提供直接 Action 或等待原语。Workflow 不实现 Flow，没有公开 Run，执行入口由 Engine.Drive 管理。每次挂载创建一个 key 命名空间；Flow 本身不申请租约。完整权限矩阵和代码边界见 [CALL_HIERARCHY.md](CALL_HIERARCHY.md)。
 
 ## 使用
 
 ```go
-type OrderFlow struct {
+type SubmitOrderAction struct {
     Client OrderClient
 }
 
-// 方法表达式可以直接作为 Action；依赖在具名类型中显式注入。
+func (a SubmitOrderAction) Run(ctx context.Context, input SubmitRequest) (SubmitResponse, error) {
+    return a.Client.Submit(ctx, input)
+}
+
+type OrderFlow struct {
+    Submit workflow.Action[SubmitRequest, SubmitResponse]
+}
+
+// Flow 持有可执行步骤；外部依赖注入 Action。
 func (f OrderFlow) Run(ctx *workflow.FlowContext, input OrderInput) (OrderOutput, error) {
     prepared := prepareRequest(input) // 轻量纯计算直接执行
-    submitted, err := ctx.Run("submit", f.Client.Submit, prepared)
+    submitted, err := ctx.Run("submit", f.Submit, prepared)
     if err != nil {
         return OrderOutput{}, err
     }
@@ -45,11 +54,12 @@ engine, err := workflow.NewEngine(scopedInfrastructure, workflow.Options{
 if err != nil {
     return err
 }
-definition := workflow.Workflow[OrderInput, OrderOutput]{
-    Name: "order",
-    Version: "1",
-    Flow: OrderFlow{Client: client},
-}
+orderFlow := OrderFlow{Submit: SubmitOrderAction{Client: client}}
+definition := workflow.NewWorkflow("order", "1",
+    func(ctx *workflow.WorkflowContext, input OrderInput) (OrderOutput, error) {
+        return ctx.RunFlow("order", orderFlow, input)
+    },
+)
 result, err := engine.Drive(ctx, definition, input)
 ```
 
@@ -70,9 +80,18 @@ result, err := engine.Drive(ctx, definition, input)
 
 根 Workflow 的完成状态由本次驱动结果表达；内核不保存根输出或维护调度器的实例状态。外部系统负责状态和终止策略。已完成 Action、检查点和信号持久化回放。Record 是 CAS 快照，不是不可变事件日志。
 
-## Action 的函数化与纯函数边界
+## Action 接口与纯函数边界
 
-Action 已函数化，但函数签名不能证明数学意义上的纯度。
+Action 是标准 Run 接口；ActionFn 保留函数接入能力，但接口或函数签名都不能证明数学意义上的纯度。
+
+```go
+type Action[I, O any] interface {
+    Run(context.Context, I) (O, error)
+}
+
+// 普通函数和方法值通过 AsAction 推断类型。
+output, err := ctx.Run("step", workflow.AsAction(fn), input)
+```
 
 - 纯计算：相同输入产生相同输出，不修改输入、共享状态或外部资源。轻量计算直接调用；需要独立持久化结果的昂贵计算可用 `Pure(fn)` 适配。
 - IO Action：可以调用 HTTP、数据库、消息系统；必须响应标准 context 取消，并使用外部幂等机制。不得依赖 context 中的时间、随机数或 attempt 身份改变业务结果。
@@ -102,6 +121,30 @@ Action 已函数化，但函数签名不能证明数学意义上的纯度。
 
 Drive 在返回前汇合所有通过框架注册的分支，即使调用方未 Wait；错误会取消兄弟 IO，所有分支挂起点都被收集。挂起本身不取消兄弟分支，已启动的 Action 可继续完成；因此挂起返回可能等待长耗时 Action。为长 IO 设置 ActionOptions.Timeout。
 
+RunFlow 和 GoFlow 的完成边界包含被调用 Flow 的异步 Action，即使它忘记 Wait。Flow 中的等待返回挂起错误，顶层在检查错误后不能越过汇合点执行后续 Action。Flow 不可再创建其他 Flow。普通用户代码仍必须检查返回错误；框架无法阻止用户忽略错误后自行执行代码。
+
+并行子 Flow 应先全部启动，再等待结果：
+
+```go
+left := ctx.GoFlow("left", leftFlow, input)
+right := ctx.GoFlow("right", rightFlow, input)
+leftResult, err := left.Wait()
+if err != nil {
+    return Output{}, err
+}
+rightResult, err := right.Wait()
+if err != nil {
+    return Output{}, err
+}
+// 此处两侧 Flow 及其 Action 均已完成，可以组合结果并调用后续 Flow。
+```
+
+顶层可并行启动多个 Flow；每个 Flow 可独立等待 WaitFor、Sleep 或 WaitAny，并使用 Go 并行执行 Action。FlowContext 不提供 RunFlow/GoFlow，非法嵌套框架调用在编译期拒绝。WaitFor/Sleep 挂起时不保留阻塞监听 goroutine，而是登记持久记录并退出本次执行；下一次 Drive 重放并复用完成结果。Future.Wait 等待的是本次 Flow 执行结束，不是等待真实回调到达。
+
+多个独立 Workflow 实例必须各自绑定 Infrastructure 作用域（参考实现每个实例一个 MemoryInfrastructure）；同一作用域上的同名定义和相同输入表示同一实例的冗余驱动，不代表两个独立实例。业务回调和 WAKE 消费也必须路由到相同作用域，冲突或暂时错误保留消息重试。作用域内子 Flow 的 `left|reply`、`right|reply` 等完整 key 自动隔离。
+
+结构化并发只跟踪框架 Go/GoFlow 创建的分支。不要用原生 goroutine 异步调用或保存 FlowContext；跨 Future 建立循环等待会造成业务死锁。Action 与父 context 应设置合理的 timeout；大规模扇出由调用方/调度器控制并发，当前框架不提供自动并发上限。
+
 不允许使用原生 goroutine 在注册分支之外持续访问 FlowContext。不响应 context 的 Action 无法被 Go 安全强制终止，会阻塞汇合。这是明确的使用约束。
 
 `Loop` 对每个 attempt 独立持久化 Action 结果，间隔通过独立 Sleep 持久化。未到期重驱只回放旧结果，不推进 attempt。完成或次数耗尽后不会重复执行已提交的 attempt。`MaxAttempts > 0`、`Interval > 0`，生产中避免过短间隔。
@@ -113,7 +156,7 @@ WaitAny 的组合单位是 Signal 描述，也支持 `WaitForSignal(...)` 与 `S
 ## Key、版本、隔离
 
 - 局部 key 匹配 `^[A-Za-z0-9_]+$`，不能使用 `|` 或 `$`。
-- 挂载层级形成 `parent|child|action`；同一次驱动的 resolved key 不得重复。
+- 顶层挂载形成 `flow|action`；Loop/WaitAny 内部命名空间可形成 `flow|loop|attempt_0` 等 key，并不表示嵌套 Flow。同一次驱动的 resolved key 不得重复。
 - key 稳定且不能更名。Action input 的 JSON 内容变化会返回 `ErrChanged`。
 - 根名称、版本、输入绑定在 `$definition`。在同一实例上更换它们会拒绝执行；该机制不是自动历史代码迁移。部署保留旧版本路由，在途实例继续使用原版定义。
 - Infrastructure 必须绑定一个实例隔离范围。内核接口不增加 RunID、TenantID；跨实例隔离由实现或装饰器承担。MemoryInfrastructure 每个实例使用一个对象。
@@ -140,8 +183,8 @@ Infrastructure 的 `Put`、`Commit`、`Resolve` 都有原子契约；数据库�
 | 旧版 | 新版 |
 | --- | --- |
 | `WithInfrastructure`，未注入时内存降级 | 显式 `NewEngine(infrastructure, options)` |
-| 根 `RunFlow(ctx, handler, input)`，input 被忽略 | `engine.Drive(ctx, Workflow{...}, input)` |
-| `Action.Run(*ActionContext, input) output` | 普通函数或具名方法 `func(context.Context, input) (output, error)` |
+| 根 `RunFlow(ctx, handler, input)`，input 被忽略 | `engine.Drive(ctx, NewWorkflow(name, version, handler), input)` |
+| `Action.Run(*ActionContext, input) output` | `Action.Run(context.Context, input) (output, error)`，函数用 AsAction |
 | Action 内 `WaitFor` / `Sleep` | Flow 中独立调用，先完成 `Run` 再等待 |
 | `panic(error)` | 返回 error；需要永久失败显式 `Permanent` |
 | panic Signal / Conflict | `Result.Status` / `Pending` / `errors.Is(err, ErrConflict)` |
@@ -149,6 +192,10 @@ Infrastructure 的 `Put`、`Commit`、`Resolve` 都有原子契约；数据库�
 | Loop 单个快照滚动 Attempt | 每个 attempt 独立 Action，独立间隔 Sleep |
 
 旧、新 Record schema 和 key 命名不同，不支持直接读取旧事件继续执行。生产迁移需使用新实例存储范围，或编写并验证显式转换工具；不能直接切换旧在途实例的包引用。
+
+从本次重构中先前的函数式 Action 迁移：`ctx.Run(key, fn, input)` 改为 `ctx.Run(key, AsAction(fn), input)`，Go/Loop 同样适配；具名 Action 可直接传实例。这是源码接口变更，调用方需要更新。key、输入输出和 Record 格式保持不变，不能因为适配而更名执行点。nil 接口、nil ActionFn、typed-nil 实例和 Pure(nil) 均在执行前拒绝，不申请租约或写步骤记录。
+
+从先前共用 FlowContext 的顶层定义迁移：删除 `Workflow{Flow: root}`，改用 `NewWorkflow(name, version, rootHandler)`；rootHandler 接收 WorkflowContext，普通 Flow 继续接收 FlowContext。根原有的 Action/信号操作放入独立 Flow，由根调用。RunFlow/GoFlow 已从 FlowContext 移除，topLevel 和 ErrFlowCallForbidden 不再使用。若新增挂载前缀或拆平流程导致 key 变化，应提升定义版本并使用新实例范围，在途实例继续路由到旧代码。
 
 验证命令：
 
