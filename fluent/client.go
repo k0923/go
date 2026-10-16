@@ -4,7 +4,7 @@ import (
 	"net/http"
 )
 
-var DefaultClient = &client{}
+var DefaultClient = &client{RequestOptions: NewRequestOptions()}
 
 type Client interface {
 	Post(url string) Request

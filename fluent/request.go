@@ -4,15 +4,17 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"fmt"
 	"io"
 	"mime/multipart"
 	"net/http"
 	"net/url"
+	"slices"
 	"strings"
 	"time"
 )
 
+// Request 是链式构建的单次 HTTP 请求。
+// 构建阶段（各 setter）不是并发安全的；构建完成后 Build/Response/Send 可以并发调用。
 type Request interface {
 	Body(BodySupplier) Request
 	JsonBody(data interface{}) Request
@@ -37,6 +39,7 @@ type Request interface {
 	Headers(items ...interface{}) Request
 	Context(ctx context.Context) Request
 	Build() (*http.Request, error)
+	// Response 在重试耗尽时可能同时返回非 nil 的 response 和 error，调用方负责关闭 Body。
 	Response() (*http.Response, error)
 	Retry(strategy RetryStrategy) Request
 	PreProcessor(processor PreProcessor) Request
@@ -44,6 +47,12 @@ type Request interface {
 	GetContext() context.Context
 	Send() error
 }
+
+// bodyFunc 每次发送都会重新调用，返回请求体与需要覆盖的 Content-Type（为空则不覆盖）。
+type bodyFunc func() (body io.Reader, contentType string, err error)
+
+// discardLimit 是重试时丢弃旧响应前最多读取的字节数，读尽后连接才能复用。
+const discardLimit = 4 << 10
 
 func newRequest(url string, method string, options *RequestOptions) Request {
 	var newOptions RequestOptions
@@ -65,11 +74,11 @@ type request struct {
 	RequestOptions
 	url           string
 	method        string
-	queries       map[string][]string
+	queries       url.Values
 	forms         map[string]string
 	ctx           context.Context
 	resultHandler ResultHandler
-	bodySupplier  BodySupplier
+	body          bodyFunc
 }
 
 func (r *request) Retry(retryStrategy RetryStrategy) Request {
@@ -87,76 +96,97 @@ type Context struct {
 	ElapsedTime time.Duration
 }
 
-func (r *request) Response() (*http.Response, error) {
-	var sendFn func() (*http.Response, error)
-	maxCount := MaxRetryTimes
+func (r *request) context() context.Context {
+	if r.ctx == nil {
+		return context.Background()
+	}
+	return r.ctx
+}
 
+func (r *request) httpClient() *http.Client {
+	if r.RequestOptions.Client == nil {
+		return http.DefaultClient
+	}
+	return r.RequestOptions.Client
+}
+
+func (r *request) Response() (*http.Response, error) {
+	ctx := r.context()
 	var retryHandler RetryHandler
 	if r.RetryStrategy != nil {
 		retryHandler = r.RetryStrategy()
 	}
 
-	sendFn = func() (*http.Response, error) {
-		start := time.Now()
-		if request, err := r.Build(); err != nil {
-			return nil, err
-		} else {
-			if r.RequestOptions.PreProcessor != nil {
-				r.RequestOptions.PreProcessor(r.ctx, request)
-			}
-			resp, err := r.RequestOptions.Client.Do(request)
-			if r.RequestOptions.PostProcessor != nil {
-				r.RequestOptions.PostProcessor(Context{
-					Context:     r.ctx,
-					ElapsedTime: time.Since(start),
-				}, resp, err)
-			}
-			if maxCount > 0 {
-				maxCount--
-				if retryHandler != nil {
-					if result, needRetry := retryHandler(r.ctx, resp, err); result != nil && needRetry {
-						return sendFn()
-					} else {
-						err = result
-					}
-				}
-			}
+	for budget := MaxRetryTimes; ; budget-- {
+		resp, err := r.do(ctx)
+		if retryHandler == nil {
 			return resp, err
 		}
+		result, needRetry := retryHandler(ctx, resp, err)
+		if result == nil || !needRetry || budget == 0 {
+			return resp, result
+		}
+		discard(resp)
 	}
+}
 
-	return sendFn()
+// do 执行一次完整的发送：构建请求、前后置处理器、Client.Do。
+func (r *request) do(ctx context.Context) (*http.Response, error) {
+	start := time.Now()
+	req, err := r.build(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if r.RequestOptions.PreProcessor != nil {
+		r.RequestOptions.PreProcessor(ctx, req)
+	}
+	resp, err := r.httpClient().Do(req)
+	if r.RequestOptions.PostProcessor != nil {
+		r.RequestOptions.PostProcessor(Context{
+			Context:     ctx,
+			ElapsedTime: time.Since(start),
+		}, resp, err)
+	}
+	return resp, err
 }
 
 func (r *request) Build() (*http.Request, error) {
+	return r.build(r.context())
+}
+
+// build 只读取 request 的字段，不做任何写入，因此构建完成后可以并发调用。
+func (r *request) build(ctx context.Context) (*http.Request, error) {
 	var body io.Reader
+	var contentType string
 	var err error
-	if r.bodySupplier != nil {
-		if body, err = r.bodySupplier(); err != nil {
+	if r.body != nil {
+		if body, contentType, err = r.body(); err != nil {
 			return nil, err
 		}
 	}
-	if r.RequestOptions.Client == nil {
-		r.RequestOptions.Client = http.DefaultClient
-	}
-	var request *http.Request
-
-	if r.ctx == nil {
-		r.ctx = context.Background()
-	}
-	if request, err = http.NewRequestWithContext(r.ctx, r.method, r.url, body); err != nil {
+	request, err := http.NewRequestWithContext(ctx, r.method, r.url, body)
+	if err != nil {
+		// 流式请求体（如 FileBody 的 pipe）未被消费时必须关闭，否则写端 goroutine 泄漏。
+		if closer, ok := body.(io.Closer); ok {
+			closer.Close()
+		}
 		return nil, err
 	}
 	for k, v := range r.RequestOptions.Headers {
 		request.Header.Set(k, v)
 	}
-	q := request.URL.Query()
-	for k, values := range r.queries {
-		for _, v := range values {
-			q.Add(k, v)
-		}
+	if contentType != "" {
+		request.Header.Set("Content-Type", contentType)
 	}
-	request.URL.RawQuery = q.Encode()
+	if len(r.queries) > 0 {
+		q := request.URL.Query()
+		for k, values := range r.queries {
+			for _, v := range values {
+				q.Add(k, v)
+			}
+		}
+		request.URL.RawQuery = q.Encode()
+	}
 	for k, v := range r.RequestOptions.Cookies {
 		request.AddCookie(&http.Cookie{Name: k, Value: v, HttpOnly: true})
 	}
@@ -167,14 +197,26 @@ func (r *request) Build() (*http.Request, error) {
 func (r *request) Send() error {
 	response, err := r.Response()
 	if err != nil {
+		discard(response)
 		return err
 	}
-	if response != nil && r.resultHandler != nil {
-		defer response.Body.Close()
-		return r.resultHandler(r.ctx, response)
+	if response == nil {
+		return nil
 	}
-
+	defer response.Body.Close()
+	if r.resultHandler != nil {
+		return r.resultHandler(r.context(), response)
+	}
 	return nil
+}
+
+// discard 读尽并关闭不再使用的响应，使底层连接可以复用。
+func discard(resp *http.Response) {
+	if resp == nil || resp.Body == nil {
+		return
+	}
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, discardLimit))
+	_ = resp.Body.Close()
 }
 
 func (r *request) Context(ctx context.Context) Request {
@@ -183,11 +225,18 @@ func (r *request) Context(ctx context.Context) Request {
 }
 
 func (r *request) GetContext() context.Context {
-	return r.ctx
+	return r.context()
 }
 
 func (r *request) Body(supplier BodySupplier) Request {
-	r.bodySupplier = supplier
+	if supplier == nil {
+		r.body = nil
+		return r
+	}
+	r.body = func() (io.Reader, string, error) {
+		body, err := supplier()
+		return body, "", err
+	}
 	return r
 }
 
@@ -236,14 +285,13 @@ func (r *request) Result(handler ResultHandler) Request {
 
 func (r *request) FormBody() Request {
 	r.RequestOptions.Headers["Content-Type"] = "application/x-www-form-urlencoded"
-	r.bodySupplier = func() (io.Reader, error) {
-		form := make(url.Values)
+	return r.Body(func() (io.Reader, error) {
+		form := make(url.Values, len(r.forms))
 		for k, v := range r.forms {
 			form.Set(k, v)
 		}
 		return strings.NewReader(form.Encode()), nil
-	}
-	return r
+	})
 }
 
 func (r *request) Form(key string, value interface{}) Request {
@@ -264,7 +312,8 @@ func (r *request) Query(key string, value interface{}) Request {
 }
 
 func (r *request) QueryArray(key string, values []string) Request {
-	r.queries[key] = values
+	// 拷贝一份，避免调用方后续修改切片影响已构建的请求。
+	r.queries[key] = slices.Clone(values)
 	return r
 }
 
@@ -314,41 +363,39 @@ func (r *request) Headers(items ...interface{}) Request {
 }
 
 func (r *request) FileBody(body FileBody) Request {
-	r.bodySupplier = func() (io.Reader, error) {
+	r.body = func() (io.Reader, string, error) {
 		pipeReader, pipeWriter := io.Pipe()
 		writer := multipart.NewWriter(pipeWriter)
 		go func() {
-			defer pipeWriter.Close()
-			defer writer.Close()
-			part, err := writer.CreateFormFile(body.FileFieldName, body.FileName)
-			if err != nil {
-				fmt.Println(err.Error())
-				return
-			}
-			reader, err := body.ReaderSupplier()
-			if err != nil {
-				fmt.Printf("fail to get file body with err:%v\n", err)
-				return
-			}
-			if closer, ok := reader.(io.Closer); ok {
-				defer closer.Close()
-			}
-			_, err = io.Copy(part, reader)
-			if err != nil {
-				fmt.Println(err.Error())
-				return
-			}
-			fmt.Println(r.forms)
-			for k, v := range r.forms {
-				_ = writer.WriteField(k, v)
-			}
+			// 任何一步失败都通过 CloseWithError 传给读端，最终由 Client.Do 返回给调用方。
+			pipeWriter.CloseWithError(writeMultipart(writer, body, r.forms))
 		}()
-
-		r.RequestOptions.Headers["Content-Type"] = writer.FormDataContentType()
-		return pipeReader, nil
+		return pipeReader, writer.FormDataContentType(), nil
 	}
-
 	return r
+}
+
+func writeMultipart(writer *multipart.Writer, body FileBody, forms map[string]string) error {
+	part, err := writer.CreateFormFile(body.FileFieldName, body.FileName)
+	if err != nil {
+		return err
+	}
+	reader, err := body.ReaderSupplier()
+	if err != nil {
+		return err
+	}
+	if closer, ok := reader.(io.Closer); ok {
+		defer closer.Close()
+	}
+	if _, err = io.Copy(part, reader); err != nil {
+		return err
+	}
+	for k, v := range forms {
+		if err = writer.WriteField(k, v); err != nil {
+			return err
+		}
+	}
+	return writer.Close()
 }
 
 type FileBody struct {

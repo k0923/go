@@ -1,509 +1,158 @@
-# Workflow 流程开发规范
+# Workflow
 
-本规范基于 `github.com/k0923/go/workflow` 包当前代码编写，适用于使用该包开发可重放、可恢复、可并发调度的业务流程。
+一个以 Go 代码表达编排、以持久化快照回放执行结果的工作流内核。需要本仓库的 Go 1.27.1 工具链（使用泛型方法）。
 
-## 核心模型
+## 核心 API
 
-`workflow` 是一个基于事件溯源和租约的轻量流程运行时：
-
-- 流程代码每次执行都会从入口重新跑一遍。
-- 已完成的 Action、Loop、Checkpoint 会从事件中回放结果，不再重复执行副作用。
-- 挂起点通过 `WaitForSignalEvent` 或 `SleepSignalEvent` 持久化，外部系统完成信号后再次驱动 `RunFlow`。
-- 并发执行通过事件版本 CAS 和租约 Generation fencing 收敛。
-- 根流程和子流程本身不申请流程级租约；真正持有租约的是 `Run`、`Go` 和 `Loop` 这些执行单元。
-
-运行时不维护流程级 `State`。流程是否完成、失败、挂起，主要由事件状态决定。
-
-## 上下文与能力边界
-
-运行时有三类上下文：
-
-| 上下文 | 角色 | 能力 |
+| 概念 | 职责 | API |
 | --- | --- | --- |
-| `WorkflowContext` | 根流程上下文 | 继承 `FlowContext`，可运行 Action、Go、Loop、子 Flow |
-| `FlowContext` | 流程/子流程上下文 | `Run`、`Go`、`Loop`，并继承 `ActionContext` 的等待与检查点能力 |
-| `ActionContext` | Action 内上下文 | `WaitFor`、`Sleep`、`SleepUntil`、`Now`、`UUID`、`GetKey` |
+| Workflow | 根流程名称、版本及可复用 Flow 定义 | `Workflow[I, O]{Name, Version, Flow}` |
+| Flow | 确定性编排、显式传递输入输出 | `Run(*FlowContext, I) (O, error)` |
+| Action | 一次计算或外部操作，不持有编排能力 | `func(context.Context, I) (O, error)` |
+| Engine | 驱动、回放、租约、错误归类、观测 | `NewEngine`、`Drive`、`ResolveSignal` |
+| FlowContext | 命名空间及受控编排能力 | `Run`、`RunFlow`、`Go`、`GoFlow`、`WaitFor`、`Sleep`、`SleepUntil`、`Now`、`UUID`、`Loop` |
+| Infrastructure | 一个实例的原子存储与租约 | `Get`、`Put`、`Commit`、`Resolve`、`Claim`、`Renew`、`Release` |
 
-约束：
+`FlowContext` 不实现 `context.Context`，也不嵌入 ActionContext。外部客户端只接收 `ctx.Context()` 或 Action 参数中的标准 context。Action 内没有等待、休眠、子流程或调度权限。
 
-- `ActionContext` 不持有租约；租约管理在 `FlowContext.Run`、`Go`、`Loop` 内完成。
-- `Go` 是异步版 `Run`，会复用 `Run` 的事件执行逻辑。
-- 子流程通过 `WorkflowContext.RunFlow` 启动，只做 key 命名空间隔离，不申请父/子流程级租约。
-- Action 内不要再直接编排子 Flow；Action 只表达一个原子业务步骤。
+根输入真正传入 Flow。子 Flow 可以递归调用 `RunFlow`，每次挂载创建一个 key 命名空间；Flow 本身不申请租约。
 
-## 快速示例
+## 使用
 
 ```go
-package order
-
-import (
-	"context"
-	"encoding/json"
-	"time"
-
-	"github.com/k0923/go/workflow"
-)
-
-type ActionFunc[Input any, Output any] func(*workflow.ActionContext, Input) Output
-
-func (f ActionFunc[Input, Output]) Run(ctx *workflow.ActionContext, input Input) Output {
-	return f(ctx, input)
+type OrderFlow struct {
+    Client OrderClient
 }
 
-type ApprovalOutput struct {
-	Value string
+// 方法表达式可以直接作为 Action；依赖在具名类型中显式注入。
+func (f OrderFlow) Run(ctx *workflow.FlowContext, input OrderInput) (OrderOutput, error) {
+    prepared := prepareRequest(input) // 轻量纯计算直接执行
+    submitted, err := ctx.Run("submit", f.Client.Submit, prepared)
+    if err != nil {
+        return OrderOutput{}, err
+    }
+    approved, err := ctx.WaitFor[Approval]("approval", submitted)
+    if err != nil {
+        return OrderOutput{}, err
+    }
+    return buildOutput(submitted, approved), nil
 }
 
-func RunOrder(ctx context.Context, infra workflow.Infrastructure, orderID string) string {
-	ctx = workflow.WithInfrastructure(ctx, infra)
-
-	return workflow.RunFlow(ctx, func(ctx *workflow.WorkflowContext) string {
-		prepared := ctx.Run(
-			"prepare_order",
-			ActionFunc[string, string](func(actionCtx *workflow.ActionContext, input string) string {
-				createdAt := actionCtx.Now("created_at")
-				return input + "|" + createdAt.Format(time.RFC3339Nano)
-			}),
-			orderID,
-			workflow.ActionRunOption{},
-		)
-
-		approval := ctx.Run(
-			"approval",
-			ActionFunc[string, ApprovalOutput](func(actionCtx *workflow.ActionContext, input string) ApprovalOutput {
-				resp := actionCtx.WaitFor[string, string](
-					"callback",
-					workflow.WaitForOption[string]{Request: input},
-				)
-				return ApprovalOutput{Value: resp}
-			}),
-			prepared,
-			workflow.ActionRunOption{},
-		)
-
-		return approval.Value
-	}, struct{}{})
+engine, err := workflow.NewEngine(scopedInfrastructure, workflow.Options{
+    LeaseTTL: 30 * time.Second,
+    Observer: observer,
+})
+if err != nil {
+    return err
 }
-
-func CompleteApproval(ctx context.Context, infra workflow.Infrastructure, key string, response string) error {
-	event, err := infra.GetEvent(ctx, key)
-	if err != nil {
-		return err
-	}
-	wait := event.(*workflow.WaitForSignalEvent)
-	raw, err := json.Marshal(response)
-	if err != nil {
-		return err
-	}
-	wait.Response = raw
-	wait.SetStatus(workflow.FlowStatusCompleted)
-	_, err = infra.UpdateEvent(ctx, wait)
-	return err
+definition := workflow.Workflow[OrderInput, OrderOutput]{
+    Name: "order",
+    Version: "1",
+    Flow: OrderFlow{Client: client},
 }
+result, err := engine.Drive(ctx, definition, input)
 ```
 
-说明：
+完整可执行例子见 `example_test.go`：提交 → 挂起 → 完成回调 → 恢复。
 
-- `RunFlow` 的第三个参数当前不会注入到 `WorkflowContext`，业务入参应显式传给 `Run`、`Go`、`Loop`。不要依赖闭包捕获可变业务状态传递流程数据。
-- 外部信号完成后没有单独的 `ResumeRun` API；应更新对应信号事件，然后再次调用同一个 `RunFlow`。
-- 不注入 `Infrastructure` 时会默认使用 `DebugInfrastructure`，仅适合调试和测试。
+## 返回语义
 
-## Flow / Action 实现规范
+`Drive` 不使用 panic 表达控制流。
 
-`Flow` 和 `Action` 接口用于定义稳定的执行边界，不只是为了适配 Go 语法。生产流程应优先使用具名类型实现接口，避免把业务步骤写成大量匿名闭包。
-
-推荐：
-
-- 每个业务步骤使用具名 `Action` 类型表达，例如 `SubmitTaskAction`、`PollTaskAction`。
-- `Action` 可以持有无状态依赖，例如 client、logger、静态配置和编解码器。
-- `Action` 不应持有本次执行的可变业务状态；跨步骤传值只能通过 input/output、事件和信号完成。
-- `Flow` 负责声明编排关系，`Action` 负责一个原子副作用或纯计算步骤。
-- AI 生成生产流程代码时，应优先生成具名 `Flow` / `Action` 类型，而不是匿名闭包。
-
-不推荐：
-
-- 在 `RunFlow` handler 或 `ActionFunc` 闭包中捕获并修改外部变量。
-- 用包级变量、内存 map、闭包局部变量保存流程进度。
-- 让多个 `Action` 通过共享对象字段传递本次流程状态。
-- 在闭包里隐藏外部依赖，导致测试、回放和审计时无法看清输入输出边界。
-
-闭包适合测试、文档示例或一次性调试 helper。即使使用闭包，也只能捕获只读依赖，不能捕获会影响流程分支或副作用结果的可变状态。
-
-具名 `Action` 示例：
-
-```go
-type SubmitTaskAction struct {
-	Client MediaKitClient
-}
-
-func (action SubmitTaskAction) Run(ctx *workflow.ActionContext, input SubmitTaskInput) SubmitTaskOutput {
-	output, err := action.Client.Submit(ctx, input)
-	if err != nil {
-		panic(err)
-	}
-	return output
-}
-```
-
-## Run 使用边界
-
-`Run` 会写入事件、申请租约，并在恢复时读取已完成结果。它适合保护外部副作用和需要持久化的昂贵步骤，但不应被当成普通函数调用的替代品。
-
-应该使用 `Run` / `Go`：
-
-- HTTP、DB 写入、发消息、提交任务等外部副作用。
-- 昂贵且希望完成后直接回放的计算。
-- 需要失败持久化、租约互斥或跨 worker 防重复执行的步骤。
-
-不应该使用 `Run`：
-
-- 构造请求体、拼接 URL、字段映射、状态归一化等轻量纯函数。
-- 只依赖当前 input 和已完成 output，且每次重算成本很低的确定性逻辑。
-- 不产生外部副作用，也不需要独立事件状态的中间变量。
-
-这类轻量纯函数应直接在 `Flow.Run` 中调用。流程恢复时重复计算即可，成本通常远低于额外事件读写和租约开销。
-
-```go
-request := buildSubmitRequest(input)
-
-submit := flowCtx.Run(
-	"submit_task",
-	SubmitTaskAction{Client: client},
-	SubmitTaskInput{Request: request},
-	workflow.ActionRunOption{},
-)
-
-taskURL := buildTaskURL(submit.TaskID)
-```
-
-## Key 规范
-
-Key 是事件的持久化身份，必须稳定。
-
-规则：
-
-- 同一个执行点必须使用固定 key。
-- 同一个 Workflow 实例内，所有最终展开后的 key 必须全局唯一。这里的执行点包括 Workflow/Flow 挂载点、`Run`、`Go`、`Loop`、`WaitFor`、`Sleep`、`Now`、`UUID`。
-- 用户自定义 key 只能使用英文字母、数字和下划线，建议匹配 `^[A-Za-z0-9_]+$`。不要使用短横线、空格、点号、斜杠、冒号、中文或其他特殊字符。
-- 用户自定义 key 绝对不能包含 `|`。`|` 是运行时内部命名空间分隔符，只能由框架在最终 key 中生成。
-- key 上线后不要改名。改名等同于创建新事件，旧副作用可能无法回放。
-- 不同事件类型不能复用同一个最终 key。否则可能错误回放，或在事件类型转换时触发系统错误。
-- 推荐使用简短业务语义，如 `prepare_order`、`approval`、`callback`。
-- `Flow` / `Action` 可以定义局部 key；复用时由挂载 key 形成实例命名空间：
-  - 根上 `ctx.Run("approval", ...)` 的事件 key 是 `approval`。
-  - 在 `approval` Action 内 `actionCtx.WaitFor("callback", ...)` 的事件 key 是 `approval|callback`。
-  - 子流程 `ctx.RunFlow("child", ...)` 内的 `flowCtx.Run("step", ...)` 是 `child|step`。
-  - Loop 第 N 次尝试的 ActionContext key 是 `{loopKey}|{attempt}`，从 0 开始。
-  - Loop sleep key 是 `{loopKey}|sleep|{attempt}`，从 1 开始。
-
-正确复用示例：
-
-```go
-ctx.RunFlow("front_video", enhanceFlow, frontInput, workflow.FlowRunOption{})
-ctx.RunFlow("back_video", enhanceFlow, backInput, workflow.FlowRunOption{})
-```
-
-如果 `enhanceFlow` 内部都使用 `submit`、`poll` 这些局部 key，最终 key 会展开为：
-
-```text
-front_video|submit
-front_video|poll
-back_video|submit
-back_video|poll
-```
-
-错误示例：
-
-```go
-ctx.RunFlow("video", enhanceFlow, frontInput, workflow.FlowRunOption{})
-ctx.RunFlow("video", enhanceFlow, backInput, workflow.FlowRunOption{})
-```
-
-这两个调用会落到同一个实例命名空间，第二个调用会复用第一个调用的事件，不会被视为两个独立流程实例。
-
-同一 Workflow 实例内也不要写出会展开成同一个最终 key 的路径：
-
-```go
-ctx.Run("approval", actionA, input, workflow.ActionRunOption{})
-ctx.Loop("approval", actionB, input, workflow.LoopRunOption{})
-```
-
-上面两个执行点最终 key 都是 `approval`，但事件类型不同，会造成冲突。
-
-不要手写和运行时内部格式冲突的 key，尤其是包含 `|` 或 `|sleep|` 的 key。`|` 当前是运行时命名空间分隔符，不应出现在用户自定义 key 中。
-
-## 重放确定性
-
-流程代码会被重复执行，因此开发时必须保证重放确定性。
-
-必须遵守：
-
-- 所有外部副作用只能放在 `Action.Run` 内，并通过 `FlowContext.Run` 或 `Go` 调用。
-- 需要当前时间时使用 `actionCtx.Now(key)`。
-- 需要 UUID 时使用 `actionCtx.UUID(key)`。
-- Action 输入、输出、WaitFor Request/Response、Loop 输出必须能被 `encoding/json` 序列化。
-- 长耗时 IO 必须监听 `actionCtx.Done()` 或使用 `actionCtx` 作为 context，以便租约续租失败时及时退出。
-- Action 业务失败可以 `panic(error)`；运行时会将非 `ContextError` 包装为 `BizError` 并持久化失败事件。
-
-禁止：
-
-- 在 `RunFlow` handler 顶层直接执行 HTTP、DB 写入、发消息等副作用。
-- 在 Action 外直接调用 `time.Now()`、随机数、UUID 并影响流程分支。
-- 依赖包级变量、闭包可变变量、内存缓存保存流程进度。
-- 在业务代码中 `recover` 运行时 panic。运行时使用 panic 表达挂起信号、冲突和错误传播。
-- 启动 `Go` 后不调用 `Wait()`。`Go` 是异步执行，`Wait()` 是汇合点。
-
-## 编排原语
-
-### Run
-
-`Run` 表示一个原子 Action：
-
-```go
-output := flowCtx.Run("step", action, input, workflow.ActionRunOption{})
-```
-
-首次执行时，运行时会：
-
-1. 申请 key 对应的租约。
-2. 写入 `StepResultEvent`，状态为 `RUNNING`。
-3. 执行 Action。
-4. 成功则写入 Result 并置为 `COMPLETED`。
-5. 失败则写入 Error 并置为 `FAILED`。
-6. 遇到 WaitFor/Sleep 信号则置为 `SUSPENDED`，释放租约并向上抛出信号。
-
-重放时：
-
-- `COMPLETED`：直接返回持久化 Result。
-- `FAILED`：抛出 `LegacyBizError`，Action 不再执行。
-- `RUNNING` / `SUSPENDED`：尝试重新申请租约继续执行。
-
-### Go
-
-`Go` 是异步版 `Run`：
-
-```go
-result := flowCtx.Go("async", action, input)
-// 可以继续做其他编排
-value := result.Wait()
-```
-
-规则：
-
-- `Go` 使用 `StepResultEvent`，不引入额外的 AsyncEvent。
-- 已完成结果会直接回放，Action 不会重复执行。
-- 多个 `Go` 分支可以并行，但每个分支 key 必须唯一。
-- 分支内如果挂起，`Wait()` 会重新抛出信号，当前驱动结束；外部完成信号后再次运行 `RunFlow`。
-
-### RunFlow
-
-根入口：
-
-```go
-output := workflow.RunFlow(ctx, handler, input)
-```
-
-子流程：
-
-```go
-result := ctx.RunFlow("child", childFlow, input, workflow.FlowRunOption{})
-value := result.Wait()
-```
-
-规则：
-
-- 根 `RunFlow` 创建 key 为空的 `WorkflowContext`。
-- 子流程以 `ctx.apiKey(key)` 作为命名空间前缀。
-- 流程本身不申请租约，避免父流程租约阻塞子流程；租约只在子流程内部的 Action/Loop 上发生。
-
-### WaitFor
-
-`WaitFor` 用于等待外部信号：
-
-```go
-resp := actionCtx.WaitFor[string, string](
-	"callback",
-	workflow.WaitForOption[string]{Request: "review"},
-)
-```
-
-首次执行时会写入 `WaitForSignalEvent`：
-
-- key 为当前 Action key 拼接子 key，例如 `approval|callback`。
-- `Request` 会被 JSON 持久化。
-- 状态为 `SUSPENDED`，随后以信号 panic 结束当前驱动。
-
-外部系统完成后，应：
-
-1. 读取该 `WaitForSignalEvent`。
-2. 填充 `Response`。
-3. 将状态改为 `COMPLETED`。
-4. 使用 `UpdateEvent` 做版本 CAS 更新。
-5. 再次调用同一个 `RunFlow`。
-
-### Sleep / SleepUntil
-
-`Sleep` 和 `SleepUntil` 用于定时挂起：
-
-```go
-actionCtx.Sleep("backoff", 30*time.Second)
-actionCtx.SleepUntil("deadline", deadline)
-```
-
-规则：
-
-- 首次执行写入 `SleepSignalEvent`，状态为 `SUSPENDED`。
-- 未到期时会抛出信号，当前驱动结束。
-- 到期后再次运行 `RunFlow`，运行时会将 sleep 事件置为 `COMPLETED` 并继续执行。
-- `duration <= 0` 或 `until` 已经过期时会立即完成。
-
-### Now / UUID
-
-`Now` 和 `UUID` 都是 Checkpoint：
-
-```go
-createdAt := actionCtx.Now("created_at")
-id := actionCtx.UUID("id")
-```
-
-首次调用写入 `CheckpointEvent`，重放时返回第一次生成的值。不要用 `time.Now()` 或 `uuid.NewString()` 直接参与流程决策。
-
-### Loop
-
-`Loop` 用于有限次数轮询：
-
-```go
-type PollOutput struct {
-	Value string
-	DoneValue bool
-}
-
-func (o PollOutput) Done() bool { return o.DoneValue }
-
-out := flowCtx.Loop(
-	"poll",
-	pollAction,
-	input,
-	workflow.LoopOption{Interval: 5 * time.Second, MaxAttempts: 3},
-)
-```
-
-规则：
-
-- `LoopOutput` 必须实现 `Done() bool`。
-- `Interval` 不能小于 5 秒。
-- `MaxAttempts` 必须大于 0。
-- attempt 从 0 开始，ActionContext key 为 `{loopKey}|{attempt}`。
-- 当 `Done()` 为 false 时，Loop 事件进入 `SUSPENDED`，并创建 `{loopKey}|sleep|{attempt}` 的 sleep 事件。
-- 超过最大次数会将 Loop 事件置为 `FAILED`，错误为 `loop max attempts exceeded: N`。
-
-## 事件模型
-
-当前支持的事件类型：
-
-| 事件 | 来源 | 类型标识 | 负载 |
-| --- | --- | --- | --- |
-| `StepResultEvent` | `Run` / `Go` | `STEP_RESULT` | Result |
-| `WaitForSignalEvent` | `WaitFor` | `WAIT_FOR_SIGNAL` | Request / Response |
-| `CheckpointEvent` | `Now` / `UUID` | `CHECKPOINT` | Data |
-| `SleepSignalEvent` | `Sleep` / `SleepUntil` / Loop 间隔 | `SLEEP` | Until |
-| `LoopEvent` | `Loop` | `LOOP` | Result / Attempt |
-
-版本规则：
-
-- `AddEvent` 成功后版本置为 1。
-- `UpdateEvent` 必须基于当前版本 CAS，成功后版本 +1。
-- key 已存在、版本不匹配、租约冲突等并发冲突应返回 `(nil, nil)` 或 `false, nil`，不要返回 error。
-- 存储故障、序列化错误、上下文取消等才返回 error。
-
-## 租约规范
-
-执行租约定义在 `lease.go`：
-
-- TTL 固定为 30 秒。
-- 后台续租间隔为剩余 TTL 的 1/3。
-- `ClaimLease` 返回 `(nil, nil)` 表示被其他 worker 持有。
-- `RenewLease` 返回 `(nil, nil)` 表示租约过期或 Generation 不匹配。
-- `ReleaseLease` 返回 `false, nil` 表示租约不存在或 Generation 不匹配。
-
-运行时行为：
-
-- Claim 冲突会转成 `ConflictError`。
-- Renew / Release 冲突会让本次执行结果作废，并以 `ConflictError` 收敛。
-- Claim 过程中的基础设施错误会上报 `OnError`，并向上抛出 `InfrastructureError`。
-- Renew / Release 的基础设施错误会上报 `OnError`，通常表现为当前执行被中断、等待下次驱动。
-
-生产实现必须使用存储层原子 CAS，不能用非原子的“先读后写”模拟。
-
-## Infrastructure 实现契约
-
-`Infrastructure` 必须实现：
-
-```go
-type Infrastructure interface {
-	LeaseInfrastructure
-	AddEvent(ctx context.Context, event Event) (Event, error)
-	GetEvent(ctx context.Context, key string) (Event, error)
-	UpdateEvent(ctx context.Context, event Event) (Event, error)
-	OnError(err error)
-}
-```
-
-要求：
-
-- `GetEvent` 不存在时返回 `(nil, nil)`。
-- `AddEvent` key 已存在时返回 `(nil, nil)`。
-- `UpdateEvent` key 不存在或版本不匹配时返回 `(nil, nil)`。
-- 返回给调用方的事件必须是深拷贝，尤其是 `json.RawMessage`。
-- 必须支持所有内置事件类型的序列化与反序列化。
-- 所有方法必须响应 `ctx.Err()`。
-- `OnError(nil)` 应该是 no-op；`OnError` 不应 panic，也不应长时间阻塞。
-- `DebugInfrastructure` 仅用于测试和调试，不作为生产持久化方案。
-
-## 错误分类
-
-| 错误 | 含义 | 处理 |
+| 返回 | 含义 | 调度处理 |
 | --- | --- | --- |
-| `ConflictError` | 租约冲突、版本冲突、等待中的信号 | 正常并发结果，通常等待下次驱动 |
-| `ContextError` | context 已取消或超时 | 停止当前执行，必要时重驱 |
-| `BizError` | 首次执行业务失败 | 事件置为 FAILED，修正业务数据或新建实例 |
-| `LegacyBizError` | 重放命中已失败事件 | 说明失败已持久化，不会重复执行 Action |
-| `SystemError` | API 使用错误、事件类型不符、未知状态 | 修代码或修数据 |
-| `InfrastructureError` | 存储/租约基础设施错误 | 由 `OnError` 观测并告警 |
-| `MarshalError` / `UnMarshalError` | JSON 编解码失败 | 修正负载类型或脏数据 |
-| `UnknownError` | panic 了非 error 值 | 修业务代码 |
+| `Completed`，nil error | 本次编排完成 | 使用 Output |
+| `Suspended`，nil error | 存在一个或多个挂起点 | 等待持久化请求/唤醒消息 |
+| `Running`，非 nil error | 当前执行未完成，可能是 IO、存储、取消、冲突或代码故障 | 根据 error 重试、退避或告警 |
+| `Failed`，非 nil error | 显式 Permanent 错误或持久化失败回放 | 按业务策略终止或人工处理 |
 
-业务代码应优先返回或 panic `error`，不要 panic 字符串或任意对象。
+所有调用都遵循 Go 的 error 返回惯例。编排函数应在错误或挂起时立即返回。引擎另外登记框架 API 返回的错误和挂起点，避免忽略错误后误报成功；这个兜底不阻止错误后的业务代码继续执行。
 
-## 推荐调度方式
+根 Workflow 的完成状态由本次驱动结果表达；内核不保存根输出或维护调度器的实例状态。外部系统负责状态和终止策略。已完成 Action、检查点和信号持久化回放。Record 是 CAS 快照，不是不可变事件日志。
 
-一次完整恢复链路通常是：
+## Action 的函数化与纯函数边界
 
-1. 创建或找到流程实例对应的 `Infrastructure`。
-2. 调用 `RunFlow`。
-3. 如果抛出 `Signal`：
-   - `WaitForSignalEvent`：把 Request 暴露给外部审批/回调系统。
-   - `SleepSignalEvent`：按 Until 建定时任务或由扫描器定期检查。
-4. 外部条件满足后更新对应事件。
-5. 再次调用同一个 `RunFlow`。
-6. 如果命中已完成事件，结果会回放；如果命中已失败事件，会返回持久化失败。
+Action 已函数化，但函数签名不能证明数学意义上的纯度。
 
-多 worker 可以同时驱动同一流程实例，未抢到租约的一方会以 `ConflictError` 退出。不要把这种冲突作为业务错误告警。
+- 纯计算：相同输入产生相同输出，不修改输入、共享状态或外部资源。轻量计算直接调用；需要独立持久化结果的昂贵计算可用 `Pure(fn)` 适配。
+- IO Action：可以调用 HTTP、数据库、消息系统；必须响应标准 context 取消，并使用外部幂等机制。不得依赖 context 中的时间、随机数或 attempt 身份改变业务结果。
+- Action 不持有工作流状态，不捕获可变编排状态，不调用 Flow API。无状态客户端依赖可以通过具名方法接收器绑定。
+- 输出、输入及信号负载必须可 JSON 编解码。指针与可变对象不能在并行分支之间不加保护地共享。
+- 流程时间和 UUID 在 Flow 中通过 `Now(key)` / `UUID(key)` 检查点获取，再作为 Action input 传入。
 
-## 开发检查清单
+结果持久化之前发生故障，IO Action 可能重复执行。`ActionKey(ctx)` 在一个绑定实例内稳定，外部幂等键应组合为“实例标识 + ActionKey”，不要包含租约 Generation。引擎不承诺外部副作用 exactly-once。
 
-- [ ] 同一个 Workflow 实例内，每个 Workflow/Flow 挂载点、`Run`、`Go`、`Loop`、`WaitFor`、`Sleep`、`Now`、`UUID` 的最终展开 key 稳定且唯一。
-- [ ] 用户自定义 key 匹配 `^[A-Za-z0-9_]+$`，不包含 `|`、短横线、空格、斜杠、冒号、中文或其他特殊字符。
-- [ ] 生产流程优先使用具名 `Flow` / `Action`，闭包 helper 仅用于测试、示例或调试。
-- [ ] 轻量纯函数不包 `Run`；只对外部副作用、昂贵计算或需要事件状态的步骤使用 `Run` / `Go`。
-- [ ] 所有外部副作用都在 Action 内。
-- [ ] Action 不通过闭包、包级变量或共享字段保存本次流程状态。
-- [ ] Action 外没有会影响流程分支的非确定性调用。
-- [ ] 时间和 UUID 使用 `Now` / `UUID` 检查点。
-- [ ] Action 输入输出和事件负载都可 JSON 序列化。
-- [ ] WaitFor 的外部完成逻辑使用 `UpdateEvent` 做版本 CAS。
-- [ ] Sleep/Loop 的恢复由到期扫描或定时任务再次驱动 `RunFlow`。
-- [ ] `LoopOption.Interval >= 5s` 且 `MaxAttempts > 0`。
-- [ ] `Go` 返回的 `IResult` 在明确汇合点调用了 `Wait()`。
-- [ ] 生产 `Infrastructure` 区分“冲突返回 nil”和“故障返回 error”。
-- [ ] `OnError` 已接入日志/监控，且不会 panic。
+普通 Action error 只结束本次驱动，Record 保持 RUNNING，下次驱动可重试。业务确定性失败用 `Permanent(err)`；成功提交 FAILED 后回放返回 `ReplayError`。序列化后的错误不能保留 Go sentinel 身份；需要稳定错误码时把它定义在业务负载中。panic 会转为带堆栈的 `PanicError`，作为可诊断故障返回，不直接持久化成业务失败。
+
+## 挂起与唤醒
+
+`WaitFor` 和 `Sleep` 是 Flow 原语，不在 Action 租约内部：
+
+1. `Put` 原子插入等待快照和投递登记，insert-if-absent 返回已有快照。
+2. 普通信号产生 REQUEST 消息；休眠产生按 Until 可见的 WAKE 消息。
+3. 外部请求完成后调用 `ResolveSignal(ctx, key, version, response)`，原子提交响应及独立 WAKE 消息。
+4. 旧 REQUEST 的延迟确认不会消耗新 WAKE。重复回调保留第一个结果，陈旧 version 返回 `ErrConflict`，注册前到达返回 `ErrNotFound`，调用方负责重试或 inbox 缓存。
+5. WAKE 消费方重新 Drive，成功处理或再次挂起后确认；遇到租约冲突或暂时错误必须重试消息，不得静默确认。
+
+驱动的 Pending 是观察快照，可能落后于已经提交的回调。调度必须以持久化投递为准。这个契约避免“持旧快照挂起时，唯一唤醒已经被消耗”的窗口。
+
+## 并发与 Loop
+
+`Go` 异步执行 Action，`GoFlow` 异步运行一个 Flow。Future 支持重复、并发 Wait，并支持 `WaitContext` 取消等待。取消等待不等于取消任务。
+
+Drive 在返回前汇合所有通过框架注册的分支，即使调用方未 Wait；错误会取消兄弟 IO，所有分支挂起点都被收集。挂起本身不取消兄弟分支，已启动的 Action 可继续完成；因此挂起返回可能等待长耗时 Action。为长 IO 设置 ActionOptions.Timeout。
+
+不允许使用原生 goroutine 在注册分支之外持续访问 FlowContext。不响应 context 的 Action 无法被 Go 安全强制终止，会阻塞汇合。这是明确的使用约束。
+
+`Loop` 对每个 attempt 独立持久化 Action 结果，间隔通过独立 Sleep 持久化。未到期重驱只回放旧结果，不推进 attempt。完成或次数耗尽后不会重复执行已提交的 attempt。`MaxAttempts > 0`、`Interval > 0`，生产中避免过短间隔。
+
+`WaitAny[Response](groupKey, cases...)` 支持多个 WaitFor 同时等待，首个成功回调原子确定赢家并取消其余成员，后续 Drive 立即继续。`FailWait` 可隔离单个候选失败；外部消费者通过新增 CANCEL 通知清理监听资源。该功能需要可选 `WaitAnyInfrastructure`，MemoryInfrastructure 已支持。完整双等待场景、原子存储契约与运行命令见 [WAIT_ANY.md](WAIT_ANY.md)。
+
+WaitAny 的组合单位是 Signal 描述，也支持 `WaitForSignal(...)` 与 `SleepSignal(...)` / `SleepUntilSignal(...)` 混合等待，实现“外部响应或超时先到”。赢家 Kind 区分触发来源；Sleep 获胜不要求业务响应。`ctx.Sleep` 等单独等待 API 保留，旧 WaitCase 用法继续兼容。
+
+## Key、版本、隔离
+
+- 局部 key 匹配 `^[A-Za-z0-9_]+$`，不能使用 `|` 或 `$`。
+- 挂载层级形成 `parent|child|action`；同一次驱动的 resolved key 不得重复。
+- key 稳定且不能更名。Action input 的 JSON 内容变化会返回 `ErrChanged`。
+- 根名称、版本、输入绑定在 `$definition`。在同一实例上更换它们会拒绝执行；该机制不是自动历史代码迁移。部署保留旧版本路由，在途实例继续使用原版定义。
+- Infrastructure 必须绑定一个实例隔离范围。内核接口不增加 RunID、TenantID；跨实例隔离由实现或装饰器承担。MemoryInfrastructure 每个实例使用一个对象。
+- Lease 提交原子检查当前存储的到期时间及 Generation，并校验 Record.Version。客户端 context 取消只负责尽快中止，存储 fencing 才是拒绝旧 owner 写入的最终保证。
+
+## 扩展与观测
+
+通用租约生命周期位于独立的 `github.com/k0923/go/lease` 包，workflow 复用 `lease.Runner`。`workflow.Lease` 是 `lease.Token` 的类型别名，Infrastructure 嵌入 `lease.Infrastructure`。其他框架可直接使用 Runner，lease 不依赖 workflow。租约错误返回 `*lease.Error`，支持 `errors.Is/As`；`workflow.ErrConflict` 复用 `lease.ErrConflict`。续租持续到结果提交完成，再停止续租并释放。
+
+Options 支持 LeaseTTL、Action timeout、CleanupTimeout、Observer、时钟注入。默认租约 30 秒、清理超时 5 秒。续租按 TTL/3 调度；存储层决定实际到期。测试时钟必须同时注入 Engine 与测试存储，生产应保证时钟一致。
+
+Observer 可记录 drive_started、drive_finished、action_started、action_finished、action_replayed、suspended。它可能被并发调用，应线程安全、快速返回；观察器 panic 被隔离，防止已提交操作因为监控故障被重试。需要持久化审计轨迹时由 Observer 或存储实现单独维护。
+
+新增的 `Engine.Subscribe(listener, types...)` 支持多个外部监听者、类型过滤和幂等退订；结构化 Event 包含执行关联 ID、状态、版本、耗时、挂起列表及错误信息。旧 Observer 的签名与阶段保持不变。完整触发规则、事件结构、兼容性和交付边界见 [EVENTS.md](EVENTS.md)，可执行示例见 `events_example_test.go`。
+
+Infrastructure 的 `Put`、`Commit`、`Resolve` 都有原子契约；数据库适配器应使用事务、原子 CAS 或等价机制。`Delivery` 是可选接口，生产实现可以暴露自己的 MQ/outbox。通知载体需携带或绑定实例路由，内核 Notification 只保存实例内的 key。
+
+当前提供 MemoryInfrastructure 和契约测试，没有生产数据库/MQ适配器、自动后台调度、取消实例、补偿事务或热迁移功能。
+
+## 从旧版迁移
+
+旧版源码及测试完整保留在 `workflow/legacy`，仅用于兼容和历史对照；旧版已知问题没有被新版 API 修复。
+
+| 旧版 | 新版 |
+| --- | --- |
+| `WithInfrastructure`，未注入时内存降级 | 显式 `NewEngine(infrastructure, options)` |
+| 根 `RunFlow(ctx, handler, input)`，input 被忽略 | `engine.Drive(ctx, Workflow{...}, input)` |
+| `Action.Run(*ActionContext, input) output` | 普通函数或具名方法 `func(context.Context, input) (output, error)` |
+| Action 内 `WaitFor` / `Sleep` | Flow 中独立调用，先完成 `Run` 再等待 |
+| `panic(error)` | 返回 error；需要永久失败显式 `Permanent` |
+| panic Signal / Conflict | `Result.Status` / `Pending` / `errors.Is(err, ErrConflict)` |
+| 直接 UpdateEvent 完成信号 | `ResolveSignal`，原子响应与唤醒登记 |
+| Loop 单个快照滚动 Attempt | 每个 attempt 独立 Action，独立间隔 Sleep |
+
+旧、新 Record schema 和 key 命名不同，不支持直接读取旧事件继续执行。生产迁移需使用新实例存储范围，或编写并验证显式转换工具；不能直接切换旧在途实例的包引用。
+
+验证命令：
+
+```sh
+go test -race ./workflow/...
+go vet ./workflow/...
+```
