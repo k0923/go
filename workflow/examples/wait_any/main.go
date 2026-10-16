@@ -1,4 +1,5 @@
 // Run with: go run ./workflow/examples/wait_any
+// 运行方式：go run ./workflow/examples/wait_any
 package main
 
 import (
@@ -33,6 +34,7 @@ func run() error {
 				return "", err
 			}
 			// Downstream work starts without waiting for the other response.
+			// 下游工作会立即开始，而不会等待另一个响应。
 			return f.Run("continue", workflow.Pure(func(answer string) string { return "continued: " + answer }), winner.Response)
 		}),
 	}
@@ -44,6 +46,8 @@ func run() error {
 
 	// Two independent external listeners. The durable wait mechanism itself
 	// creates no goroutines. These mocks demonstrate cleanup of provider IO.
+	// 两个独立的外部监听器。持久化等待机制本身不会创建 goroutine。
+	// 这些 mock 展示了如何清理提供方 IO。
 	providerCtx, cancelProviders := context.WithCancel(ctx)
 	var providers sync.WaitGroup
 	defer func() { cancelProviders(); providers.Wait() }()
@@ -54,6 +58,7 @@ func run() error {
 		defer providers.Done()
 		close(primaryListening)
 		<-providerCtx.Done() // primary never replies; cancel its listener
+		// primary 永不回复；取消其监听器。
 	}()
 	go func() {
 		defer providers.Done()

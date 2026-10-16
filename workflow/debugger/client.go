@@ -17,6 +17,8 @@ import (
 
 // Client is a workflow.Infrastructure (plus Delivery and WaitAnyInfrastructure)
 // bound to ONE run on a debugger server. Create one Client per run.
+// Client 是绑定到 debugger server 上单个运行的 workflow.Infrastructure
+// （另加 Delivery 和 WaitAnyInfrastructure）。每个运行应创建一个 Client。
 type Client struct {
 	base string
 	run  string
@@ -30,6 +32,7 @@ var (
 )
 
 // NewClient binds to an existing or new run ID. An empty server uses DefaultServer.
+// NewClient 绑定到一个已有或新的 run ID。server 为空时使用 DefaultServer。
 func NewClient(server, run string) (*Client, error) {
 	if server == "" {
 		server = DefaultServer
@@ -43,6 +46,7 @@ func NewClient(server, run string) (*Client, error) {
 func (c *Client) RunID() string { return c.run }
 
 // URL is the UI page of this run.
+// URL 是该运行的 UI 页面。
 func (c *Client) URL() string { return c.base + "/#/runs/" + url.PathEscape(c.run) }
 
 var codeErrors = map[string]error{}
@@ -55,6 +59,8 @@ func init() {
 
 // remoteError keeps the server message while matching the original sentinel
 // with errors.Is, so the engine classifies conflicts and changes correctly.
+// remoteError 保留服务端消息，同时通过 errors.Is 匹配原始哨兵错误，
+// 使引擎能正确分类 conflict 和 changed。
 type remoteError struct {
 	sentinel error
 	message  string
@@ -184,6 +190,7 @@ func (c *Client) FailWait(ctx context.Context, key string, version int64, messag
 }
 
 // ---- debugger API ----
+// ---- debugger API 接口 ----
 
 func (c *Client) register(ctx context.Context, spec RunSpec) (RunInfo, error) {
 	var info RunInfo
@@ -215,16 +222,19 @@ func (c *Client) post(ctx context.Context, path string, body, out any) error {
 }
 
 // Report records the outcome of one Drive for the UI.
+// Report 为 UI 记录一次 Drive 的结果。
 func (c *Client) Report(ctx context.Context, report Report) error {
 	return c.call(ctx, http.MethodPost, "/report", report, nil)
 }
 
 // PushEvents forwards engine events to the server timeline.
+// PushEvents 将引擎事件转发到服务端时间线。
 func (c *Client) PushEvents(ctx context.Context, events []json.RawMessage) error {
 	return c.call(ctx, http.MethodPost, "/events", events, nil)
 }
 
 // Submit answers a pending WaitFor, exactly like the UI's JSON form.
+// Submit 回答一个 pending WaitFor，行为与 UI 的 JSON 表单完全一致。
 func (c *Client) Submit(ctx context.Context, key string, response any) (bool, error) {
 	raw, err := json.Marshal(response)
 	if err != nil {
@@ -236,11 +246,13 @@ func (c *Client) Submit(ctx context.Context, key string, response any) (bool, er
 }
 
 // FireSleep completes a pending Sleep immediately.
+// FireSleep 立即完成一个 pending Sleep。
 func (c *Client) FireSleep(ctx context.Context, key string) error {
 	return c.call(ctx, http.MethodPost, "/fire", submitRequest{Key: key}, nil)
 }
 
 // Detail returns the run snapshot shown by the UI.
+// Detail 返回 UI 展示的运行快照。
 func (c *Client) Detail(ctx context.Context) (*RunDetail, error) {
 	var detail RunDetail
 	err := c.call(ctx, http.MethodGet, "", nil, &detail)
@@ -248,6 +260,7 @@ func (c *Client) Detail(ctx context.Context) (*RunDetail, error) {
 }
 
 // WaitWake blocks until a WAKE notification is due or timeout elapses.
+// WaitWake 会阻塞，直到 WAKE 通知到期或超时结束。
 func (c *Client) WaitWake(ctx context.Context, timeout time.Duration) ([]workflow.Notification, error) {
 	var out notificationsResponse
 	err := c.call(ctx, http.MethodGet, "/wake?timeout="+url.QueryEscape(timeout.String()), nil, &out)

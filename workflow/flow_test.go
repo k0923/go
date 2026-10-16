@@ -39,6 +39,7 @@ func TestFlowContextWaitFor(t *testing.T) {
 		t.Fatalf("%t %v", ok, err)
 	}
 	// Delayed acknowledgement of the original request must not consume its wake.
+	// 对原始请求的延迟确认不能消费它的 wake。
 	if err := store.Ack(context.Background(), requests[0].ID); err != nil { t.Fatal(err) }
 	messages, _ := store.Pending(context.Background(), time.Now())
 	if len(messages) != 1 || messages[0].Purpose != WakeNotification { t.Fatal(messages) }

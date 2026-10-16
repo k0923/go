@@ -33,6 +33,7 @@ func ExampleFlowContext_WaitAny() {
 	}
 	fmt.Println(waiting.Status, len(waiting.Pending))
 	// Both requests are durable and available for independent providers.
+	// 两个请求都是持久化的，并且可供独立提供方使用。
 	secondary, err := store.Get(ctx, "providers|secondary")
 	if err != nil {
 		panic(err)

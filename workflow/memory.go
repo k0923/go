@@ -11,6 +11,8 @@ import (
 
 // MemoryInfrastructure is a concurrency-safe reference implementation.
 // Use one instance per run. It is not a production durable database.
+// MemoryInfrastructure 是并发安全的参考实现。每次运行使用一个实例。
+// 它不是生产级持久化数据库。
 type MemoryInfrastructure struct {
 	mu          sync.Mutex
 	records     map[string]*Record
@@ -212,6 +214,7 @@ func (m *MemoryInfrastructure) Resolve(ctx context.Context, key string, version 
 }
 
 // Caller holds m.mu; shared by external callbacks and due Sleep signals.
+// 调用方持有 m.mu；外部回调和到期的 Sleep 信号共享此逻辑。
 func (m *MemoryInfrastructure) completeWaitRecord(r *Record, response []byte) {
 	key := r.Key
 	c := copyRecord(r)

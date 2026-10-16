@@ -29,6 +29,11 @@ const (
 // ExecutionID identifies ONE Drive invocation, including rejected invocations.
 // ResolveSignal outside Drive has no ExecutionID; correlate it by scoped key.
 // Sequence orders production within one Engine, not concurrent callback delivery.
+// Event 是带版本、可 JSON 序列化的观测记录，不是持久化 outbox 消息。它不包含
+// 输入/输出负载。错误文本来自调用方；应用必须避免在错误消息中包含密钥。
+// ExecutionID 标识一次 Drive 调用，包括被拒绝的调用。Drive 外部的 ResolveSignal
+// 没有 ExecutionID；需要通过带作用域的 key 关联。Sequence 仅对一个 Engine 内的
+// 事件生产排序，不对并发回调投递排序。
 type Event struct {
 	SchemaVersion   int           `json:"schema_version"`
 	ID              string        `json:"id"`
@@ -52,6 +57,8 @@ type Event struct {
 
 // EventError contains transportable diagnostic data. It does not retain the
 // original Go error or claim that sentinel identities survive JSON encoding.
+// EventError 包含可传输的诊断数据。它不保留原始 Go 错误，也不声明哨兵错误身份
+// 能跨 JSON 编码保留。
 type EventError struct {
 	Category  string `json:"category"`
 	Message   string `json:"message"`
@@ -61,6 +68,8 @@ type EventError struct {
 // EventListener must be concurrency-safe and return promptly. Delivery is
 // synchronous, so events are captured before the emitting API returns.
 // Panics are isolated independently for each listener.
+// EventListener 必须并发安全并快速返回。投递是同步的，因此事件会在发出事件的
+// API 返回前被捕获。每个 listener 的 panic 会被独立隔离。
 type EventListener func(context.Context, Event)
 
 type eventSubscription struct {
@@ -81,6 +90,10 @@ type eventHub struct {
 // inside a callback. A delivery already snapshotted may finish after unsubscribe.
 // No historical events are replayed. A nil listener is a harmless no-op.
 // Separate registrations are separate subscriptions, even for the same function.
+// Subscribe 注册一个 listener，可选按事件类型过滤。不传类型表示接收所有事件。
+// 返回的取消订阅函数是幂等的，并且可在回调内部安全调用。已经截取快照的投递
+// 可能会在取消订阅后完成。历史事件不会回放。nil listener 是无害的空操作。
+// 即使是同一个函数，独立注册也会成为独立订阅。
 func (e *Engine) Subscribe(listener EventListener, types ...EventType) func() {
 	if listener == nil {
 		return func() {}
@@ -117,6 +130,7 @@ type eventContext struct{ executionID, name, version string }
 
 func (e *Engine) emit(ctx context.Context, event Event, err error) {
 	// Even formatting an application-defined error must not break execution.
+	// 即使格式化应用自定义错误，也不能破坏执行。
 	defer func() { _ = recover() }()
 	event.SchemaVersion = 1
 	event.EngineID = e.eventID
@@ -143,6 +157,7 @@ func (e *Engine) emit(ctx context.Context, event Event, err error) {
 			continue
 		}
 		// Prevent one listener from corrupting another listener's snapshot.
+		// 防止一个 listener 破坏另一个 listener 的快照。
 		copyEvent := event
 		copyEvent.Pending = append([]Pending(nil), event.Pending...)
 		if event.Error != nil {
@@ -160,6 +175,8 @@ func describeEventError(err error) (result *EventError) {
 	result = &EventError{Category: "execution", Message: "error description unavailable"}
 	// User-defined Error/Is/As methods may panic. Retain a diagnostic event
 	// with fallback text rather than skipping delivery to every subscriber.
+	// 用户定义的 Error/Is/As 方法可能 panic。应保留带兜底文本的诊断事件，
+	// 而不是跳过对所有订阅者的投递。
 	defer func() { _ = recover() }()
 	result.Message = err.Error()
 	var operation *OperationError

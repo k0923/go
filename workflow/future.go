@@ -4,6 +4,8 @@ import "context"
 
 // Future supports repeated and concurrent Wait. Closing done publishes the
 // immutable output and error to every waiter; no waiter consumes a channel value.
+// Future 支持重复和并发 Wait。关闭 done 会向所有等待者发布不可变的输出和错误；
+// 没有任何等待者会消费通道值。
 type Future[O any] struct {
 	done   chan struct{}
 	output O

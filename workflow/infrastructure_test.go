@@ -148,6 +148,7 @@ func TestEngineInfrastructureFailure(t *testing.T) {
 		e := testEngine(t, store, Options{})
 		flow := definition(FlowFunc[int, string](func(f *FlowContext, in int) (string, error) { return f.WaitFor[string]("signal", in) }))
 		// Initialize the definition first, then reject only signal writes.
+		// 先初始化定义，然后只拒绝 signal 写入。
 		first, err := e.Drive(context.Background(), flow, 0)
 		if err != nil || first.Status != Suspended { t.Fatalf("%+v %v", first, err) }
 		cause := errors.New("registration unavailable")

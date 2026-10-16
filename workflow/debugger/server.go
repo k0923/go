@@ -23,6 +23,8 @@ var runIDPattern = regexp.MustCompile(`^[A-Za-z0-9_.-]{1,128}$`)
 
 // Server exposes the Store over HTTP: Infrastructure RPC for workers, a JSON
 // API and SSE stream for the UI, and the UI itself.
+// Server 通过 HTTP 暴露 Store：面向 worker 的 Infrastructure RPC、面向 UI 的
+// JSON API 和 SSE 流，以及 UI 本身。
 type Server struct {
 	store *Store
 	mux   *http.ServeMux
@@ -70,6 +72,7 @@ func writeJSON(w http.ResponseWriter, status int, value any) {
 }
 
 // errorCodes is ordered: a joined error reports its most specific sentinel.
+// errorCodes 是有序的：joined error 会报告其最具体的哨兵错误。
 var errorCodes = []struct {
 	code   string
 	err    error
@@ -186,6 +189,8 @@ func (s *Server) report(w http.ResponseWriter, r *http.Request, run string) {
 
 // wake long-polls for due WAKE notifications of one run. It returns as soon
 // as one is due, when a scheduled one matures, or after the timeout.
+// wake 对单个运行的到期 WAKE 通知进行长轮询。当有通知到期、计划通知成熟、
+// 或超时后立即返回。
 func (s *Server) wake(w http.ResponseWriter, r *http.Request, run string) {
 	timeout, err := time.ParseDuration(r.URL.Query().Get("timeout"))
 	if err != nil || timeout <= 0 || timeout > time.Minute {
@@ -296,6 +301,7 @@ func (s *Server) redrive(w http.ResponseWriter, r *http.Request, run string) {
 }
 
 // stream pushes the IDs of changed runs; the UI refetches what it shows.
+// stream 推送发生变化的运行 ID；UI 会重新拉取当前展示的内容。
 func (s *Server) stream(w http.ResponseWriter, r *http.Request) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
@@ -419,6 +425,7 @@ func (s *Server) infra(w http.ResponseWriter, r *http.Request, run string) {
 }
 
 // ListenAndServe opens the database and serves until ctx is cancelled.
+// ListenAndServe 打开数据库并提供服务，直到 ctx 被取消。
 func ListenAndServe(ctx context.Context, addr, dbPath string) error {
 	store, err := OpenStore(dbPath)
 	if err != nil {

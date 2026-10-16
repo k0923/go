@@ -100,6 +100,8 @@ func copyWaitAnyState(state WaitAnyState) *WaitAnyState {
 
 // settleWaitGroup runs under the same storage lock as Resolve. This makes
 // winner selection, loser cancellation, message cleanup and wake atomic.
+// settleWaitGroup 在与 Resolve 相同的存储锁下运行。这会使赢家选择、失败方取消、
+// 消息清理和 wake 保持原子性。
 func (m *MemoryInfrastructure) settleWaitGroup(groupKey string, winner *Record) {
 	group := m.waitGroups[groupKey]
 	group.state.Status = Completed
@@ -165,6 +167,7 @@ func (m *MemoryInfrastructure) FailWait(ctx context.Context, key string, version
 	if len(group.state.Pending) == 0 {
 		group.state.Status = Failed
 		// Preserve a durable wake even when every member failed.
+		// 即使每个成员都失败，也保留一个持久化 wake。
 		id := fmt.Sprintf("%s|%s|failed", groupKey, WakeNotification)
 		m.messages[id] = Notification{ID: id, Key: groupKey, Purpose: WakeNotification, AvailableAt: m.now()}
 	}
@@ -178,6 +181,8 @@ func pendingRecord(record *Record) Pending {
 // A due timer is resolved under the same lock used by callbacks. Among due
 // timers choose the earliest deadline, breaking ties by declaration order.
 // No resident timer/goroutine is required: its durable WAKE schedules a Drive.
+// 到期计时器会在回调使用的同一把锁下解析。在已到期的计时器中选择最早截止时间，
+// 并按声明顺序打破平局。不需要常驻 timer/goroutine：其持久化 WAKE 会调度一次 Drive。
 func (m *MemoryInfrastructure) advanceWaitGroup(key string) {
 	group := m.waitGroups[key]
 	if group.state.Status != Suspended {

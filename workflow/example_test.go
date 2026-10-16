@@ -12,6 +12,8 @@ type OrderFlow struct{}
 // SubmitOrder is an ordinary named function and can be tested independently.
 // A real HTTP implementation would forward a stable run ID + ActionKey(ctx)
 // to the remote service's idempotency mechanism.
+// SubmitOrder 是普通具名函数，可被独立测试。真实 HTTP 实现会把稳定的 run ID
+// 和 ActionKey(ctx) 转发给远端服务的幂等机制。
 func SubmitOrder(ctx context.Context, orderID string) (string, error) {
 	return "submitted_" + orderID, nil
 }

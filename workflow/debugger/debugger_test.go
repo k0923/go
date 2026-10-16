@@ -383,6 +383,8 @@ func (s shipment) Done() bool { return s.Done_ }
 
 // TestEndToEndTwoIsolatedRuns mirrors examples/debugger: two workers attached
 // to one server, advanced only through the HTTP operations the UI uses.
+// TestEndToEndTwoIsolatedRuns 对应 examples/debugger：两个 worker 连接到同一个
+// server，并且只通过 UI 使用的 HTTP 操作推进。
 func TestEndToEndTwoIsolatedRuns(t *testing.T) {
 	f := newFixture(t)
 	f.store.now = time.Now
@@ -437,6 +439,7 @@ func TestEndToEndTwoIsolatedRuns(t *testing.T) {
 	b, _ := NewClient(f.server.URL, "order-b")
 
 	// eventually retries an operation until the worker has registered the wait.
+	// eventually 会重试某个操作，直到 worker 已注册等待。
 	eventually := func(what string, op func() error) {
 		t.Helper()
 		deadline := time.Now().Add(5 * time.Second)

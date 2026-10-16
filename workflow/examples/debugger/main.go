@@ -6,6 +6,14 @@
 // Open http://127.0.0.1:7788, answer the "approval" WaitFor with a JSON such
 // as {"approved": true, "by": "alice"}, or fire the Sleep timers early.
 // Start several workers with different -run values to debug them side by side.
+// workflow debugger 的演示 worker。请先启动服务：
+//
+//	go run ./workflow/cmd/wfdebug
+//	go run ./workflow/examples/debugger -run order-1
+//
+// 打开 http://127.0.0.1:7788，用类似 {"approved": true, "by": "alice"} 的 JSON
+// 回答 "approval" WaitFor，或提前触发 Sleep 计时器。使用不同 -run 值启动多个 worker，
+// 可以并排调试它们。
 package main
 
 import (
@@ -65,6 +73,7 @@ func charge(ctx context.Context, order Order) (string, error) {
 		return "", err
 	}
 	// ActionKey is a stable idempotency key for the payment provider.
+	// ActionKey 是支付提供方使用的稳定幂等键。
 	return "pay_" + workflow.ActionKey(ctx), nil
 }
 
@@ -109,8 +118,10 @@ var orderFlow = workflow.FlowFunc[Order, Summary](func(f *workflow.FlowContext, 
 	}
 
 	// Shipment polling and customer notification progress concurrently.
+	// 物流轮询和客户通知会并发推进。
 	notice := f.GoFlow("notify", workflow.FlowFunc[string, string](func(f *workflow.FlowContext, id string) (string, error) {
 		// Acks are typed in by hand in the debugger, so accept any JSON shape.
+		// ack 是在 debugger 中手动输入的，因此接受任意 JSON 形状。
 		winner, err := f.WaitAny[json.RawMessage]("channel",
 			workflow.WaitForSignal("email_ack", map[string]string{"order": id, "channel": "email"}),
 			workflow.WaitForSignal("sms_ack", map[string]string{"order": id, "channel": "sms"}),

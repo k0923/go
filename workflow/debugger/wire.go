@@ -9,6 +9,17 @@
 // Then drive a workflow against it:
 //
 //	result, err := debugger.Run(ctx, definition, input, debugger.Options{})
+// Package debugger 提供一个本地、由 HTTP + SQLite 支持的 workflow Infrastructure，
+// 并带有 Web UI。一个 server 可承载多个隔离运行；每个运行拥有自己的记录、租约、
+// 通知、等待组和事件历史。
+//
+// 启动服务：
+//
+//	go run ./workflow/cmd/wfdebug -addr 127.0.0.1:7788 -db wfdebug.db
+//
+// 然后让工作流连接到它执行：
+//
+//	result, err := debugger.Run(ctx, definition, input, debugger.Options{})
 package debugger
 
 import (
@@ -19,10 +30,12 @@ import (
 )
 
 // DefaultServer is the address used by Run and NewClient when none is given.
+// DefaultServer 是 Run 和 NewClient 在未指定地址时使用的地址。
 const DefaultServer = "http://127.0.0.1:7788"
 
 // Run statuses reported by a worker. They extend workflow.Status with the
 // states only a driver loop can observe.
+// worker 上报的运行状态。它们在 workflow.Status 基础上扩展了只有驱动循环能观察到的状态。
 const (
 	RunCreated  = "CREATED"
 	RunRetrying = "RETRYING"
@@ -30,6 +43,8 @@ const (
 
 // RunSpec registers a run. An empty ID generates one. Reusing an ID resumes
 // the run: Drive replays durable records already stored on the server.
+// RunSpec 注册一个运行。空 ID 会生成一个新 ID。复用 ID 会恢复运行：
+// Drive 会回放已存储在服务端的持久记录。
 type RunSpec struct {
 	ID       string          `json:"id"`
 	Workflow string          `json:"workflow"`
@@ -65,6 +80,8 @@ type RunInfo struct {
 
 // RecordView is both the RPC encoding of workflow.Record and the UI view.
 // Empty payloads are omitted so nil survives the round trip (not "null").
+// RecordView 既是 workflow.Record 的 RPC 编码，也是 UI 视图。
+// 空负载会被省略，因此 nil 可以在往返中保留，而不是变成 "null"。
 type RecordView struct {
 	Key       string          `json:"key"`
 	Kind      workflow.Kind   `json:"kind"`
@@ -112,6 +129,7 @@ type EventView struct {
 }
 
 // Report is posted by the worker after every Drive.
+// Report 由 worker 在每次 Drive 后提交。
 type Report struct {
 	Status  string             `json:"status"`
 	Output  json.RawMessage    `json:"output,omitempty"`
@@ -125,6 +143,7 @@ type apiError struct {
 }
 
 // RPC payloads of the Infrastructure endpoints.
+// Infrastructure 端点的 RPC 负载。
 type (
 	keyRequest   struct{ Key string }
 	claimRequest struct {

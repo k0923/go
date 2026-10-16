@@ -46,6 +46,7 @@ func TestFlowContextWaitAny(t *testing.T) {
 			t.Fatalf("%t %v", ok, err)
 		}
 		// Cancellation occurs at Resolve time, BEFORE any resume.
+		// 取消发生在 Resolve 时刻，早于任何恢复。
 		a, _ = store.Get(ctx, a.Key)
 		if a.Status != Cancelled {
 			t.Fatal("loser was not cancelled atomically", a)
@@ -251,6 +252,7 @@ func TestFlowContextWaitAny(t *testing.T) {
 			t.Fatalf("%+v %v", fresh, err)
 		}
 		// Repeated replay retains only the bounded history for this one group.
+		// 重复回放只会保留这个组的有界历史。
 		if len(store.waitGroups) != 1 || len(store.waitOwners) != 2 {
 			t.Fatal("unexpected waiting registrations")
 		}

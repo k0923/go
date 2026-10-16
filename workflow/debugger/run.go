@@ -12,19 +12,26 @@ import (
 )
 
 // Options configures Run. Zero values are usable.
+// Options 配置 Run。零值可直接使用。
 type Options struct {
 	// Server is the debugger base URL; empty uses DefaultServer.
+	// Server 是 debugger 的基础 URL；为空时使用 DefaultServer。
 	Server string
 	// RunID attaches to a run. Empty generates "<workflow>-<random>"; reuse an
 	// ID to resume a run after restarting your process.
+	// RunID 绑定到一个运行。为空时生成 "<workflow>-<random>"；复用 ID 可在进程重启后恢复运行。
 	RunID string
 	// Engine options. Observer and Now are respected; LeaseTTL defaults to 30s.
+	// Engine 选项。Observer 和 Now 会被保留；LeaseTTL 默认 30s。
 	Engine workflow.Options
 	// RetryDelay paces drives after a retryable error. Default 2s.
+	// RetryDelay 控制可重试错误后的 drive 间隔。默认 2s。
 	RetryDelay time.Duration
 	// Logf receives progress lines; nil uses log.Printf. Use a no-op to silence.
+	// Logf 接收进度日志；nil 时使用 log.Printf。可传入空操作以静默输出。
 	Logf func(format string, args ...any)
 	// OnAttach is called once the run is registered, e.g. to open the UI.
+	// OnAttach 会在运行注册后调用，例如用于打开 UI。
 	OnAttach func(runURL string)
 }
 
@@ -34,6 +41,11 @@ type Options struct {
 //
 // Replays happen on every Drive, so it is expected to see completed actions
 // marked as replayed in the timeline.
+// Run 将工作流连接到 debugger，并持续驱动它，直到 COMPLETED、FAILED 或 ctx 被取消。
+// 挂起的运行会等待 WAKE：UI 中回答的 WaitFor、到期的 Sleep，或手动 "Re-drive"。
+//
+// 每次 Drive 都会发生回放，因此在时间线中看到已完成的 action 被标记为 replayed
+// 是预期行为。
 func Run[I, O any](ctx context.Context, definition workflow.Workflow[I, O], input I, options Options) (workflow.Result[O], error) {
 	var zero workflow.Result[O]
 	logf := options.Logf
@@ -122,6 +134,8 @@ func Run[I, O any](ctx context.Context, definition workflow.Workflow[I, O], inpu
 
 // waitForWake blocks until at least one WAKE is due, then acknowledges every
 // due wake: a single Drive replays the whole definition and consumes them all.
+// waitForWake 会阻塞，直到至少一个 WAKE 到期，然后确认所有到期 wake：
+// 单次 Drive 会回放整个定义并消费它们。
 func waitForWake(ctx context.Context, client *Client) error {
 	for {
 		notifications, err := client.WaitWake(ctx, 20*time.Second)
@@ -150,6 +164,8 @@ func waitForWake(ctx context.Context, client *Client) error {
 
 // forwarder batches engine events to the server off the Drive path, because
 // listeners are synchronous and must return promptly.
+// forwarder 会在 Drive 路径之外批量发送引擎事件到服务端，因为 listener 是同步的，
+// 且必须快速返回。
 type forwarder struct {
 	client *Client
 	mu     sync.Mutex
@@ -208,6 +224,7 @@ func (f *forwarder) loop() {
 }
 
 // flush sends buffered events and waits, so a Drive's events precede its report.
+// flush 会发送缓冲事件并等待完成，确保一次 Drive 的事件先于其 report。
 func (f *forwarder) flush() {
 	ack := make(chan struct{})
 	select {

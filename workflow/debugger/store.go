@@ -85,6 +85,8 @@ CREATE INDEX IF NOT EXISTS messages_due ON messages (run_id, state, available_at
 
 // Message delivery states. REMOVED means storage withdrew it (a resolved or
 // cancelled wait); DONE means a request was answered through the debugger.
+// 消息投递状态。REMOVED 表示存储已撤回消息（等待已解析或已取消）；
+// DONE 表示请求已通过 debugger 被回答。
 const (
 	msgPending = "PENDING"
 	msgAcked   = "ACKED"
@@ -95,6 +97,8 @@ const (
 // Store is the SQLite state behind the server. All mutations run in one
 // serialized transaction, matching the atomicity MemoryInfrastructure gets
 // from its single mutex.
+// Store 是服务端背后的 SQLite 状态。所有变更都在一个串行事务中执行，
+// 与 MemoryInfrastructure 通过单个互斥锁获得的原子性保持一致。
 type Store struct {
 	db  *sql.DB
 	mu  sync.Mutex
@@ -109,6 +113,7 @@ func OpenStore(path string) (*Store, error) {
 	}
 	// One connection: SQLite has one writer anyway, and in-memory databases
 	// would otherwise be distinct per connection.
+	// 单连接：SQLite 本来也只有一个 writer；否则内存数据库会按连接彼此隔离。
 	db.SetMaxOpenConns(1)
 	for _, pragma := range []string{"PRAGMA journal_mode=WAL", "PRAGMA busy_timeout=5000", "PRAGMA synchronous=NORMAL"} {
 		if _, err = db.Exec(pragma); err != nil {
@@ -141,6 +146,8 @@ func tm(n int64) time.Time {
 
 // sameRaw treats an absent payload and JSON null as equal: RawMessage(nil)
 // encodes as null and decodes back as the literal bytes "null".
+// sameRaw 将缺失负载和 JSON null 视为相等：RawMessage(nil) 会编码为 null，
+// 并解码回字面量字节 "null"。
 func sameRaw(a, b []byte) bool {
 	norm := func(raw []byte) []byte {
 		if string(raw) == "null" {
@@ -153,6 +160,8 @@ func sameRaw(a, b []byte) bool {
 
 // blob scans a nullable BLOB into a JSON payload. json.RawMessage is not a
 // []byte for database/sql in this toolchain, so it cannot be scanned directly.
+// blob 将可空 BLOB 扫描为 JSON 负载。在此工具链中，json.RawMessage 对
+// database/sql 而言不是 []byte，因此不能直接扫描。
 type blob struct{ dst *json.RawMessage }
 
 func (b blob) Scan(value any) error {
@@ -180,6 +189,8 @@ type txn struct {
 
 // exec runs a write and marks the transaction dirty when it changed rows, so
 // read-only transactions (e.g. the wake long poll) never notify subscribers.
+// exec 执行一次写入，并在改动行时将事务标记为 dirty，因此只读事务
+// （例如 wake 长轮询）不会通知订阅者。
 func (t *txn) exec(query string, args ...any) (sql.Result, error) {
 	res, err := t.tx.Exec(query, args...)
 	if err == nil {
@@ -192,6 +203,8 @@ func (t *txn) exec(query string, args ...any) (sql.Result, error) {
 
 // tx runs fn atomically for one run. The run row is created lazily so a
 // client may use the Infrastructure without registering first.
+// tx 为单个运行原子执行 fn。run 行会被惰性创建，因此客户端可以在注册前
+// 使用 Infrastructure。
 func (s *Store) tx(ctx context.Context, run string, fn func(*txn) error) error {
 	if run == "" {
 		return workflow.ErrInvalid
@@ -315,6 +328,7 @@ func (t *txn) saveGroup(key string, g *storedGroup) error {
 }
 
 // ---- lease.Infrastructure ----
+// ---- lease.Infrastructure 接口实现 ----
 
 func (s *Store) Claim(ctx context.Context, run, key string, ttl time.Duration) (lease *workflow.Lease, err error) {
 	if ttl <= 0 {
@@ -384,6 +398,7 @@ func (s *Store) Release(ctx context.Context, run string, l workflow.Lease) error
 }
 
 // ---- workflow.Infrastructure ----
+// ---- workflow.Infrastructure 接口实现 ----
 
 func (s *Store) Get(ctx context.Context, run, key string) (record *workflow.Record, err error) {
 	err = s.tx(ctx, run, func(t *txn) error {
@@ -536,6 +551,7 @@ func (t *txn) complete(r *workflow.Record, group string, response []byte) error 
 		return err
 	}
 	// The request was answered; keep the delivery view honest.
+	// 请求已被回答；保持投递视图准确。
 	if err := t.closeMessages(c.Key, workflow.RequestNotification, msgDone); err != nil {
 		return err
 	}
@@ -554,6 +570,7 @@ func (t *txn) complete(r *workflow.Record, group string, response []byte) error 
 }
 
 // ---- workflow.Delivery ----
+// ---- workflow.Delivery 接口实现 ----
 
 func (s *Store) Pending(ctx context.Context, run string, now time.Time) (result []workflow.Notification, err error) {
 	err = s.tx(ctx, run, func(t *txn) error {
@@ -598,6 +615,8 @@ func (s *Store) Ack(ctx context.Context, run, id string) error {
 
 // nextWake returns due WAKE notifications, or the time the earliest future
 // one becomes due (zero when none is scheduled).
+// nextWake 返回已到期的 WAKE 通知，或最早的未来通知到期时间
+// （没有计划通知时为零值）。
 func (s *Store) nextWake(ctx context.Context, run string) (due []workflow.Notification, next time.Time, err error) {
 	err = s.tx(ctx, run, func(t *txn) error {
 		if due, err = t.pending(t.now, workflow.WakeNotification); err != nil || len(due) > 0 {
@@ -615,6 +634,7 @@ func (s *Store) nextWake(ctx context.Context, run string) (due []workflow.Notifi
 }
 
 // ---- workflow.WaitAnyInfrastructure ----
+// ---- workflow.WaitAnyInfrastructure 接口实现 ----
 
 func (s *Store) WaitAny(ctx context.Context, run, key string, requests []workflow.WaitRequest) (state *workflow.WaitAnyState, err error) {
 	if key == "" || len(requests) == 0 {
@@ -727,6 +747,7 @@ func pendingOf(r *workflow.Record) workflow.Pending {
 
 // settleGroup selects the winner, cancels losers and withdraws their
 // notifications in the resolving transaction.
+// settleGroup 在解析事务中选择赢家、取消失败方并撤回它们的通知。
 func (t *txn) settleGroup(key string, winner *workflow.Record) error {
 	g, err := t.group(key)
 	if err != nil || g == nil {
@@ -762,6 +783,7 @@ func (t *txn) settleGroup(key string, winner *workflow.Record) error {
 }
 
 // advanceGroup resolves the earliest due timer of a suspended group.
+// advanceGroup 解析挂起组中最早到期的计时器。
 func (t *txn) advanceGroup(key string) error {
 	g, err := t.group(key)
 	if err != nil || g == nil || g.State.Status != workflow.Suspended {
@@ -850,6 +872,7 @@ func (t *txn) failWait(key string, version int64, message string) (bool, error) 
 }
 
 // ---- debugger operations used by the UI and the worker ----
+// ---- UI 和 worker 使用的 debugger 操作 ----
 
 func (s *Store) Register(ctx context.Context, spec RunSpec) (RunInfo, error) {
 	if spec.ID == "" {
@@ -885,6 +908,7 @@ func (s *Store) Report(ctx context.Context, run string, report Report) error {
 }
 
 // Touch marks the run's worker as alive without creating a store event.
+// Touch 将运行的 worker 标记为存活，但不会创建 store 事件。
 func (s *Store) Touch(run string) {
 	s.mu.Lock()
 	_, _ = s.db.Exec(`UPDATE runs SET last_seen = ? WHERE id = ?`, ts(s.now()), run)
@@ -910,6 +934,7 @@ func (s *Store) AppendEvents(ctx context.Context, run string, events []json.RawM
 }
 
 // Submit answers a suspended WaitFor (or WaitAny member) with a JSON payload.
+// Submit 使用 JSON 负载回答一个挂起的 WaitFor（或 WaitAny 成员）。
 func (s *Store) Submit(ctx context.Context, run, key string, response json.RawMessage) (accepted bool, err error) {
 	if !json.Valid(response) {
 		return false, fmt.Errorf("%w: response is not valid JSON", workflow.ErrInvalid)
@@ -933,6 +958,7 @@ func (s *Store) Submit(ctx context.Context, run, key string, response json.RawMe
 }
 
 // FireSleep moves a pending timer's deadline to now and resolves it.
+// FireSleep 将 pending 计时器的截止时间移动到当前时间并解析它。
 func (s *Store) FireSleep(ctx context.Context, run, key string) error {
 	return s.tx(ctx, run, func(t *txn) error {
 		r, group, err := t.record(key)
@@ -974,6 +1000,7 @@ func (s *Store) FailMember(ctx context.Context, run, key, message string) (bool,
 }
 
 // Redrive enqueues a manual WAKE so the attached worker drives again.
+// Redrive 入队一个手动 WAKE，使已连接的 worker 再次 drive。
 func (s *Store) Redrive(ctx context.Context, run string) error {
 	return s.tx(ctx, run, func(t *txn) error {
 		t.log("debugger.redrive", run, nil)
@@ -1007,6 +1034,7 @@ func (s *Store) Delete(ctx context.Context, run string) error {
 }
 
 // ---- read models ----
+// ---- 读取模型 ----
 
 const onlineWindow = 10 * time.Second
 
@@ -1195,6 +1223,7 @@ func (s *Store) Events(ctx context.Context, run string, after int64, limit int) 
 }
 
 // hub fans out "run changed" notifications to SSE clients and long polls.
+// hub 将 "run changed" 通知扇出给 SSE 客户端和长轮询。
 type hub struct {
 	mu   sync.Mutex
 	subs map[chan string]struct{}
@@ -1221,6 +1250,7 @@ func (h *hub) publish(run string) {
 		select {
 		case ch <- run:
 		default: // a slow consumer refetches on its next notification
+			// 慢消费者会在下一次通知时重新拉取。
 		}
 	}
 }

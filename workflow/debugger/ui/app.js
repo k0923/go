@@ -18,6 +18,7 @@ const state = {
 }
 
 // ---------- formatting ----------
+// ---------- 格式化 ----------
 
 const STATUS = {
   COMPLETED: { label: 'Completed', chip: 'bg-emerald-500/10 text-emerald-300 ring-1 ring-emerald-500/25', dot: 'bg-emerald-400', bar: 'bg-emerald-500' },
@@ -41,6 +42,8 @@ const kd = k => KIND[k] || KIND.DEFINITION
 
 // Live refreshes re-render often; only touch the DOM when markup changed so
 // clicks, hover and text selection survive an unchanged refresh.
+// 实时刷新会频繁重新渲染；只有在标记发生变化时才触碰 DOM，
+// 这样点击、悬停和文本选择才能在未变化的刷新中保留。
 const lastHTML = new WeakMap()
 function setHTML(sel, html) {
   const el = $(sel)
@@ -87,6 +90,7 @@ function countdown(t) {
 }
 
 // Payloads arrive as inline JSON (json.RawMessage); absent means undefined.
+// 负载以内联 JSON（json.RawMessage）形式到达；缺失表示 undefined。
 const decodeRaw = raw => raw ?? undefined
 
 function highlight(value) {
@@ -127,6 +131,7 @@ function toast(message, kind = 'ok') {
 }
 
 // ---------- API ----------
+// ---------- API 接口 ----------
 
 async function api(path, options = {}) {
   const res = await fetch(path, {
@@ -143,6 +148,7 @@ async function api(path, options = {}) {
 const runPath = (id, suffix = '') => `/api/runs/${encodeURIComponent(id)}${suffix}`
 
 // ---------- runs list ----------
+// ---------- 运行列表 ----------
 
 async function loadRuns() {
   state.runs = await api('/api/runs')
@@ -209,6 +215,7 @@ function runItem(r) {
 }
 
 // ---------- detail ----------
+// ---------- 详情 ----------
 
 async function selectRun(id) {
   if (state.current !== id) {
@@ -296,6 +303,7 @@ function renderDetail() {
 }
 
 // Steps grouped by key prefix (RunFlow / Loop / WaitAny namespaces).
+// 步骤按 key 前缀分组（RunFlow / Loop / WaitAny 命名空间）。
 function renderSteps(records) {
   const steps = records.filter(r => r.kind !== 'DEFINITION')
   if (!steps.length) {
@@ -346,6 +354,7 @@ function stepRow(r, t0, span, now) {
 }
 
 // ---------- events ----------
+// ---------- 事件 ----------
 
 const EVENT_STYLE = {
   drive_started: ['bg-slate-400', 'Drive 开始'],
@@ -426,6 +435,7 @@ function renderEvents() {
 }
 
 // ---------- messages ----------
+// ---------- 消息 ----------
 
 function renderMessages() {
   const msgs = state.detail.messages
@@ -468,6 +478,7 @@ function renderIO() {
 }
 
 // ---------- waits (right panel) ----------
+// ---------- 等待项（右侧面板） ----------
 
 function renderWaits() {
   const { records, groups } = state.detail
@@ -477,10 +488,12 @@ function renderWaits() {
     ? '<span class="absolute inline-flex h-full w-full rounded-full bg-amber-400 opacity-60 animate-ping"></span><span class="relative inline-flex h-2 w-2 rounded-full bg-amber-400"></span>'
     : '<span class="relative inline-flex h-2 w-2 rounded-full bg-slate-600"></span>')
   // Re-rendering would steal focus from an editor; skip when nothing changed.
+  // 重新渲染会夺走编辑器焦点；没有变化时跳过。
   const signature = state.current + '|' + waits.map(r => `${r.key}@${r.version}@${r.until}`).join(',') + '|' + groups.map(g => g.state.Status).join(',')
   if (signature === state.waitSignature) return
   state.waitSignature = signature
   // Preserve drafts the user is typing across live refreshes.
+  // 在实时刷新期间保留用户正在输入的草稿。
   for (const el of $$('[data-draft]')) state.drafts[el.dataset.draft] = el.value
   if (!waits.length) {
     $('#p-waits').innerHTML = `<div class="text-center py-14 px-4">
@@ -555,6 +568,7 @@ function sleepCard(r, group) {
 }
 
 // ---------- drawer ----------
+// ---------- 抽屉 ----------
 
 function openDrawer(key, refresh = false) {
   const record = state.detail?.records.find(r => r.key === key)
@@ -599,6 +613,7 @@ function closeDrawer() {
 }
 
 // ---------- actions ----------
+// ---------- 操作 ----------
 
 async function doSubmit(key) {
   const el = $(`[data-draft="${CSS.escape(key)}"]`)
@@ -636,6 +651,7 @@ async function doFail(key) {
 }
 
 // ---------- wiring ----------
+// ---------- 事件绑定 ----------
 
 document.addEventListener('click', e => {
   const t = e.target.closest('button, [data-close]')
@@ -699,6 +715,7 @@ function route() {
 window.addEventListener('hashchange', route)
 
 // Live updates: SSE tells us which run changed; coalesce refetches.
+// 实时更新：SSE 告知哪个运行发生变化；重新拉取会被合并。
 let pendingRuns = false, pendingDetail = false, timer = null
 function schedule(run) {
   pendingRuns = true
@@ -724,6 +741,7 @@ function connect() {
 }
 
 // Clocks: countdowns, "ago" labels and worker liveness.
+// 时钟：倒计时、"多久前" 标签和 worker 存活状态。
 setInterval(() => {
   for (const el of $$('[data-countdown]')) el.textContent = countdown(el.dataset.countdown)
 }, 1000)

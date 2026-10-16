@@ -8,6 +8,8 @@ import (
 
 // slowCommitInfrastructure waits for renewal from inside the final write.
 // If the engine stops renewal before commit, this operation cannot complete.
+// slowCommitInfrastructure 会在最终写入内部等待续租。
+// 如果引擎在提交前停止续租，该操作将无法完成。
 type slowCommitInfrastructure struct {
 	Infrastructure
 	renewed chan struct{}

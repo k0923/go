@@ -12,6 +12,8 @@ import (
 
 // RunFlow creates a namespace, not another lease or workflow state.
 // A child Flow can itself RunFlow recursively.
+// RunFlow 创建的是命名空间，而不是另一个租约或工作流状态。
+// 子 Flow 本身也可以递归调用 RunFlow。
 func (f *FlowContext) RunFlow[I, O any](key string, flow Flow[I, O], input I) (output O, err error) {
 	defer f.remember(&err)
 	resolved, err := f.claim(key)
@@ -27,6 +29,8 @@ func (f *FlowContext) RunFlow[I, O any](key string, flow Flow[I, O], input I) (o
 
 // WaitFor registers a durable request in the Flow, outside any Action lease.
 // Ignoring its returned error still cannot mark the drive completed.
+// WaitFor 在 Flow 中注册一个持久请求，该请求位于任何 Action 租约之外。
+// 即使忽略它返回的错误，也无法把本次 drive 标记为 completed。
 func (f *FlowContext) WaitFor[Response, Request any](key string, request Request) (output Response, err error) {
 	defer f.remember(&err)
 	resolved, err := f.claim(key)
@@ -164,6 +168,8 @@ type LoopOutput interface{ Done() bool }
 
 // Loop records EACH attempt as an Action, so a crash after an attempt cannot
 // repeat a completed attempt. Its interval is a separate durable sleep.
+// Loop 将每一次 attempt 都记录为一个 Action，因此 attempt 之后崩溃不会重复
+// 已完成的 attempt。它的间隔是一个独立的持久化 sleep。
 func (f *FlowContext) Loop[I any, O LoopOutput](key string, action Action[I, O], input I, options LoopOptions) (output O, err error) {
 	defer f.remember(&err)
 	resolved, err := f.claim(key)
@@ -198,6 +204,8 @@ func (f *FlowContext) Loop[I any, O LoopOutput](key string, action Action[I, O],
 // ResolveSignal atomically persists a typed callback and a durable Wake.
 // expectedVersion comes from the registered request. A repeated callback
 // cannot replace the first response. Missing registration returns ErrNotFound.
+// ResolveSignal 原子地持久化类型化回调和持久 Wake。expectedVersion 来自已注册的请求。
+// 重复回调无法替换第一次响应。缺少注册时返回 ErrNotFound。
 func (e *Engine) ResolveSignal[T any](ctx context.Context, key string, expectedVersion int64, response T) (bool, error) {
 	raw, err := json.Marshal(response)
 	if err != nil {
@@ -207,6 +215,8 @@ func (e *Engine) ResolveSignal[T any](ctx context.Context, key string, expectedV
 	if err == nil && resolved {
 		// Resolve's existing interface returns no record kind; do not invent
 		// one (custom stores may also accept sleep signals here).
+		// Resolve 的现有接口不返回 record kind；不要凭空构造一个。
+		// 自定义存储也可能在这里接受 sleep 信号。
 		e.emit(ctx, Event{Type: WaitResolved, Key: key,
 			Status: Completed, RecordVersion: expectedVersion + 1,
 		}, nil)

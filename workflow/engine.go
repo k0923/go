@@ -21,6 +21,8 @@ type Options struct {
 	Observer       Observer
 	// Now supplies workflow clock reads; production must agree with the store
 	// clock. Lease validity is ALWAYS decided by the store.
+	// Now 提供工作流时钟读取；生产环境中它必须与存储时钟一致。
+	// 租约有效性始终由存储决定。
 	Now func() time.Time
 }
 
@@ -59,6 +61,8 @@ func NewEngine(store Infrastructure, options Options) (*Engine, error) {
 
 // ActionKey is stable within a scoped run. For external idempotency compose
 // it with your run identity; do not use the generation as an idempotency key.
+// ActionKey 在带作用域的运行中保持稳定。用于外部幂等时，需要与运行身份组合；
+// 不要将 generation 用作幂等键。
 func ActionKey(ctx context.Context) string {
 	key, _ := ctx.Value(actionKey{}).(string)
 	return key
@@ -82,6 +86,8 @@ var localKey = regexp.MustCompile(`^[A-Za-z0-9_]+$`)
 
 // FlowContext is deliberately NOT context.Context. Context() is the only
 // standard context passed to external clients; workflow APIs live here.
+// FlowContext 有意不实现 context.Context。Context() 是唯一传给外部客户端的
+// 标准 context；工作流 API 位于这里。
 type FlowContext struct {
 	execution *execution
 	prefix    string
@@ -128,6 +134,7 @@ func (f *FlowContext) remember(err *error) {
 	}
 	e.errs = append(e.errs, *err)
 	// Waiting is a normal outcome. Actual errors cancel ongoing sibling IO.
+	// 等待是正常结果。实际错误会取消正在进行的兄弟 IO。
 	e.cancel()
 }
 
@@ -136,6 +143,7 @@ func (e *Engine) observe(ctx context.Context, key, phase string, started time.Ti
 		return
 	}
 	// Instrumentation failures do not turn a committed action into a retry.
+	// 可观测性插桩失败不会把已提交的 action 变成需要重试。
 	defer func() { _ = recover() }()
 	now := e.options.Now()
 	e.options.Observer(ctx, Observation{Key: key, Phase: phase, At: now, Duration: now.Sub(started), Err: err})
@@ -144,6 +152,8 @@ func (e *Engine) observe(ctx context.Context, key, phase string, started time.Ti
 // Drive replays the definition from its entry point. It joins all registered
 // async work before returning, including work the caller forgot to Wait().
 // Non-nil error is retryable unless it is PermanentError or ReplayError.
+// Drive 从入口点回放定义。返回前它会等待所有已注册的异步工作，包括调用方忘记
+// Wait 的工作。非 nil 错误默认可重试，除非它是 PermanentError 或 ReplayError。
 func (e *Engine) Drive[I, O any](ctx context.Context, workflow Workflow[I, O], input I) (result Result[O], err error) {
 	result.Status = Running
 	eventCtx := ctx
@@ -343,6 +353,7 @@ func (f *FlowContext) runAction[I, O any](key string, action Action[I, O], input
 		record.EndedAt = e.options.Now()
 		// Renewal remains active during the commit. The storage boundary still
 		// atomically validates current generation, expiry and record version.
+		// 提交期间续租仍保持活跃。存储边界仍会原子验证当前 generation、过期时间和记录版本。
 		committed, commitErr := e.store.Commit(executionCtx, token, record, record.Version)
 		if commitErr != nil {
 			return errors.Join(actionErr, &OperationError{key, "Commit", commitErr})
