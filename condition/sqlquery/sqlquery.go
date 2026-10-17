@@ -8,9 +8,14 @@
 //
 // Semantic alignment with in-memory evaluation:
 //
-//   - Columns are assumed NOT NULL. SQL three-valued logic differs from Go
-//     for NULLs; map nullable columns to COALESCE expressions via a view or
-//     keep them out of the schema.
+//   - Columns of required fields are assumed NOT NULL. Optional fields
+//     (condition.Schema.Optional) are NULL when missing; every comparison on
+//     them is guarded with IS NOT NULL so the result is two-valued and
+//     matches memory: false when missing, ne/nin true, exists false. A NULL
+//     PostgreSQL array column counts as empty.
+//   - Dates are bound as time.Time in UTC; use a timestamp column type
+//     (timestamptz, DATETIME). SQLite stores text, which only orders
+//     correctly when every stored value is UTC in the driver's format.
 //   - String equality and ordering follow the column collation. Set
 //     Options.Collate (for example "C" on PostgreSQL, "utf8mb4_bin" on MySQL)
 //     to get Go's byte-wise semantics. SQLite's default BINARY already matches.
@@ -167,6 +172,16 @@ func (w *writer) column(f *rule.Field, sc *scope) (string, error) {
 	return w.quote(sc.alias) + "." + w.quote(col), nil
 }
 
+// arrayColumn is a PostgreSQL array column, with NULL read as empty when the
+// field is optional.
+func (w *writer) arrayColumn(list *rule.Field, sc *scope) (string, error) {
+	col, err := w.column(list, sc)
+	if err != nil || !w.chk.Field(list).Optional {
+		return col, err
+	}
+	return "coalesce(" + col + ", '{}')", nil
+}
+
 // cond renders a condition as a predicate.
 func (w *writer) cond(n rule.Cond, sc *scope) (string, error) {
 	group := func(items []rule.Cond, empty, sep string) (string, error) {
@@ -196,27 +211,92 @@ func (w *writer) cond(n rule.Cond, sc *scope) (string, error) {
 		return "NOT (" + s + ")", err
 	case *rule.Quant:
 		return w.quant(n, sc)
-	case *rule.Compare:
-		switch op := n.Op; {
-		case op == rule.OpContains || op == rule.OpStartsWith || op == rule.OpEndsWith:
-			return w.stringOp(n, sc)
-		case op.IsList():
-			s, err := w.in(n, sc)
-			if err != nil || op == rule.OpIn {
-				return s, err
+	case *rule.Exists:
+		info := w.chk.Field(n.X)
+		switch {
+		case !info.Optional:
+			return "TRUE", nil
+		case info.Kind == condition.KindObject:
+			if _, ok := sc.columns[n.X.Name]; !ok {
+				return "", w.unsupported(n.X, "exists on object %q needs a column in Columns", n.X.Name)
 			}
-			return "NOT (" + s + ")", nil
+		case info.Kind.IsList():
+			return "", w.unsupported(n.X, "exists on list %q", n.X.Name)
 		}
-		a, b, err := w.pair(n.X, n.Y, sc)
+		col, err := w.column(n.X, sc)
+		return col + " IS NOT NULL", err
+	case *rule.Compare:
+		guards, err := w.guards(nil, sc, n.X, n.Y)
+		if err != nil || len(guards) == 0 {
+			if err != nil {
+				return "", err
+			}
+			return w.compare(n, n.Op, sc)
+		}
+		op, neg := n.Op, false
+		switch op {
+		case rule.OpNe:
+			op, neg = rule.OpEq, true
+		case rule.OpNin:
+			op, neg = rule.OpIn, true
+		}
+		s, err := w.compare(n, op, sc)
 		if err != nil {
 			return "", err
 		}
-		if n.Type == rule.TypeString {
-			a = w.collate(a)
+		s = "(" + strings.Join(append(guards, s), " AND ") + ")"
+		if neg {
+			return "NOT " + s, nil
 		}
-		return a + " " + cmpOps[n.Op] + " " + b, nil
+		return s, nil
 	}
 	return "", w.unsupported(n, "condition %T", n)
+}
+
+// guards renders IS NOT NULL for every optional scalar column an operand
+// reads. Guarded comparisons are FALSE, never NULL, on missing values.
+func (w *writer) guards(out []string, sc *scope, es ...rule.Expr) ([]string, error) {
+	for _, e := range es {
+		switch e := e.(type) {
+		case *rule.Field:
+			if info := w.chk.Field(e); info.Optional && !info.Kind.IsList() {
+				col, err := w.column(e, sc)
+				if err != nil {
+					return nil, err
+				}
+				out = append(out, col+" IS NOT NULL")
+			}
+		case *rule.Arith:
+			var err error
+			if out, err = w.guards(out, sc, e.X, e.Y); err != nil {
+				return nil, err
+			}
+		}
+	}
+	return out, nil
+}
+
+// compare renders n with operator op, which may differ from n.Op when the
+// caller negates a guarded comparison.
+func (w *writer) compare(n *rule.Compare, op rule.Op, sc *scope) (string, error) {
+	switch {
+	case op == rule.OpContains || op == rule.OpStartsWith || op == rule.OpEndsWith:
+		return w.stringOp(n, op, sc)
+	case op.IsList():
+		s, err := w.in(n, sc)
+		if err != nil || op == rule.OpIn {
+			return s, err
+		}
+		return "NOT (" + s + ")", nil
+	}
+	a, b, err := w.pair(n.X, n.Y, sc)
+	if err != nil {
+		return "", err
+	}
+	if n.Type == rule.TypeString {
+		a = w.collate(a)
+	}
+	return a + " " + cmpOps[op] + " " + b, nil
 }
 
 var (
@@ -244,6 +324,8 @@ func (w *writer) val(e rule.Expr, sc *scope) (string, error) {
 		return w.bindNum(e.V), nil
 	case *rule.String:
 		return w.bind(e.V), nil
+	case *rule.Date:
+		return w.bind(e.V.UTC()), nil
 	case *rule.Arith:
 		a, b, err := w.pair(e.X, e.Y, sc)
 		if err != nil {
@@ -264,7 +346,7 @@ func escapeLike(s string) string {
 	return strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`).Replace(s)
 }
 
-func (w *writer) stringOp(n *rule.Compare, sc *scope) (string, error) {
+func (w *writer) stringOp(n *rule.Compare, op rule.Op, sc *scope) (string, error) {
 	x, err := w.val(n.X, sc)
 	if err != nil {
 		return "", err
@@ -273,7 +355,7 @@ func (w *writer) stringOp(n *rule.Compare, sc *scope) (string, error) {
 	// can use an index. SQLite's LIKE is case-insensitive, so it never does.
 	if pat, ok := n.Y.(*rule.String); ok && w.opt.Dialect != SQLite {
 		s := escapeLike(pat.V)
-		switch n.Op {
+		switch op {
 		case rule.OpContains:
 			s = "%" + s + "%"
 		case rule.OpStartsWith:
@@ -290,7 +372,7 @@ func (w *writer) stringOp(n *rule.Compare, sc *scope) (string, error) {
 	// p renders the pattern again for every use, rebinding literals.
 	p := func() (string, error) { return w.val(n.Y, sc) }
 	ln := w.strLen()
-	switch n.Op {
+	switch op {
 	case rule.OpContains:
 		fn := map[Dialect]string{SQLite: "instr", Postgres: "strpos", MySQL: "INSTR"}[w.opt.Dialect]
 		y, err := p()
@@ -353,7 +435,7 @@ func (w *writer) inField(n *rule.Compare, list *rule.Field, sc *scope) (string, 
 		return "", err
 	}
 	if _, ok := sc.relations[list.Name]; !ok && w.opt.Dialect == Postgres {
-		col, err := w.column(list, sc)
+		col, err := w.arrayColumn(list, sc)
 		return x + " = ANY(" + col + ")", err
 	}
 	return w.exists(list, sc, func(el *scope) (string, error) {
@@ -399,7 +481,7 @@ func (w *writer) exists(list *rule.Field, sc *scope, where func(*scope) (string,
 
 func (w *writer) length(list *rule.Field, sc *scope) (string, error) {
 	if _, ok := sc.relations[list.Name]; !ok && w.opt.Dialect == Postgres && w.chk.Field(list).Kind != condition.KindObjects {
-		col, err := w.column(list, sc)
+		col, err := w.arrayColumn(list, sc)
 		return "cardinality(" + col + ")", err
 	}
 	from, _, err := w.elements(list, sc)
@@ -438,8 +520,11 @@ func (w *writer) elements(list *rule.Field, sc *scope) (source, *scope, error) {
 		}
 		return source{table: w.quote(rel.Table) + " AS " + qa, on: on}, el, nil
 	}
+	if list.Name == condition.SelfField {
+		return source{}, nil, w.unsupported(list, "a list of lists needs a Relation keyed %q", condition.SelfField)
+	}
 	if w.opt.Dialect == Postgres && w.chk.Field(list).Kind != condition.KindObjects {
-		col, err := w.column(list, sc)
+		col, err := w.arrayColumn(list, sc)
 		if err != nil {
 			return source{}, nil, err
 		}

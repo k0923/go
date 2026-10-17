@@ -240,14 +240,93 @@ func TestRoundTrip(t *testing.T) {
 	}
 }
 
+type buyer struct {
+	Level int
+	Owner user
+	Pets  []item
+}
+
+type order struct {
+	Buyer  buyer
+	Seller user
+}
+
+func orderSchema() *Schema[order] {
+	b := NewSchema[buyer]().
+		Number("level", func(b buyer) int { return b.Level }).
+		Object("owner", func(b buyer) user { return b.Owner }, userSchema()).
+		List("pets", func(b buyer) []item { return b.Pets }, itemSchema())
+	return NewSchema[order]().
+		Object("buyer", func(o order) buyer { return o.Buyer }, b).
+		Object("seller", func(o order) user { return o.Seller }, userSchema())
+}
+
+func TestObject(t *testing.T) {
+	s := orderSchema()
+	o := order{
+		Buyer:  buyer{Level: 3, Owner: alice, Pets: []item{{Price: 7, Tags: []string{"cat"}}}},
+		Seller: user{Age: 40, City: "sh"},
+	}
+	for name, tc := range map[string]struct {
+		src  string
+		want bool
+	}{
+		"leaf":              {`{"type":"number","x":"buyer.level","opt":"gte","y":3}`, true},
+		"nested object":     {`{"type":"string","x":"buyer.owner.city","opt":"eq","y":"bj"}`, true},
+		"two objects":       {`{"type":"string","x":"buyer.owner.city","opt":"eq","y":{"type":"field","name":"seller.city"}}`, false},
+		"list in object":    {`{"type":"array","x":"buyer.owner.items","opt":"any","y":{"type":"number","x":"price","opt":"lt","y":10}}`, true},
+		"len in object":     {`{"type":"number","x":{"type":"len","x":"buyer.pets"},"opt":"eq","y":1}`, true},
+		"scalar list":       {`{"type":"string","x":{"type":"literal","value":"beta"},"opt":"in","y":{"type":"field","name":"buyer.owner.tags"}}`, true},
+		"quant in list":     {`{"type":"array","x":"buyer.pets","opt":"all","y":{"type":"array","x":"tags","opt":"any","y":{"type":"string","x":"$","opt":"eq","y":"cat"}}}`, true},
+		"arith over leaves": {`{"type":"number","x":{"type":"arith","x":"seller.age","opt":"sub","y":{"type":"field","name":"buyer.owner.age"}},"opt":"eq","y":10}`, true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			c, err := s.CompileJSON([]byte(tc.src))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got, err := c.Match(o); err != nil || got != tc.want {
+				t.Fatalf("got %v, %v; want %v", got, err, tc.want)
+			}
+		})
+	}
+	if _, err := s.CompileJSON([]byte(`{"type":"number","x":"buyer","opt":"eq","y":1}`)); !errors.Is(err, ErrTypeMismatch) {
+		t.Fatalf("object itself: want ErrTypeMismatch, got %v", err)
+	}
+	for name, src := range map[string]string{
+		"unknown leaf":    `{"type":"number","x":"buyer.age","opt":"eq","y":1}`,
+		"parent in quant": `{"type":"array","x":"buyer.pets","opt":"any","y":{"type":"number","x":"buyer.level","opt":"eq","y":1}}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := s.CompileJSON([]byte(src)); !errors.Is(err, ErrUnknownField) {
+				t.Fatalf("want ErrUnknownField, got %v", err)
+			}
+		})
+	}
+	if f, ok := s.Field("buyer.owner.items"); !ok || f.Kind != KindObjects || f.Elem["price"] == nil {
+		t.Fatalf("buyer.owner.items: %+v", f)
+	}
+}
+
 func TestSchemaRegistration(t *testing.T) {
 	u2b := func(u user) bool { return u.VIP }
+	self := NewSchema[user]()
 	for name, f := range map[string]func(){
 		"duplicate": func() { NewSchema[user]().Bool("x", u2b).Bool("x", u2b) },
 		"empty":     func() { NewSchema[user]().Bool("", u2b) },
 		"nil get":   func() { NewSchema[user]().Bool("x", nil) },
 		"nil num":   func() { NewSchema[user]().Number("x", (func(user) int)(nil)) },
 		"nil elem":  func() { NewSchema[user]().List("items", func(u user) []item { return nil }, (*Schema[item])(nil)) },
+		"nil obj": func() {
+			NewSchema[order]().Object("buyer", func(o order) buyer { return o.Buyer }, (*Schema[buyer])(nil))
+		},
+		"nil obj get": func() {
+			NewSchema[order]().Object("seller", (func(order) user)(nil), userSchema())
+		},
+		"obj clash": func() {
+			NewSchema[order]().Number("seller.age", func(order) int { return 0 }).Object("seller", func(o order) user { return o.Seller }, userSchema())
+		},
+		"obj self": func() { self.Object("me", func(u user) user { return u }, self) },
 		"foreign checked": func() {
 			chk, _ := userSchema().Check(vipRule())
 			userSchema().Build(chk)

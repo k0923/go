@@ -3,10 +3,12 @@ package rule
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"slices"
 	"strings"
+	"time"
 )
 
 // Parse decodes a JSON rule. Unknown types, unknown or missing keys,
@@ -44,7 +46,7 @@ var (
 		keys   []string
 		decode func(o *object, lit slot) (Expr, error)
 	}
-	optionalKeys = map[string]bool{"items": true}
+	optionalKeys = map[string]bool{"items": true, "args": true}
 )
 
 func init() {
@@ -58,6 +60,9 @@ func init() {
 		"string":  {[]string{"x", "opt", "y"}, func(o *object) (Cond, error) { return o.compare(TypeString) }},
 		"number":  {[]string{"x", "opt", "y"}, func(o *object) (Cond, error) { return o.compare(TypeNumber) }},
 		"boolean": {[]string{"x", "opt", "y"}, func(o *object) (Cond, error) { return o.compare(TypeBoolean) }},
+		"date":    {[]string{"x", "opt", "y"}, func(o *object) (Cond, error) { return o.compare(TypeDate) }},
+		"exists":  {[]string{"x"}, func(o *object) (Cond, error) { f, err := o.anyField("x"); return &Exists{f}, err }},
+		"call":    {[]string{"name", "args"}, (*object).call},
 		"array":   {[]string{"x", "opt", "y"}, (*object).quant},
 	}
 	exprTypes = map[string]struct {
@@ -243,6 +248,30 @@ func (o *object) arith() (Expr, error) {
 	return &Arith{X: x, Op: op, Y: y}, nil
 }
 
+func (o *object) call() (Cond, error) {
+	var name string
+	if err := json.Unmarshal(o.fields["name"], &name); err != nil || name == "" {
+		return nil, Errorf(o.at("name"), ErrInvalidNode, "want a non-empty string")
+	}
+	c := &Call{Name: name}
+	raw, ok := o.fields["args"]
+	if !ok {
+		return c, nil
+	}
+	var list []json.RawMessage
+	if err := json.Unmarshal(raw, &list); err != nil {
+		return nil, Errorf(o.at("args"), ErrInvalidNode, "want an array")
+	}
+	for i, r := range list {
+		a, err := parseExpr(r, fmt.Sprintf("%s.args[%d]", o.path, i), o.depth+1, slot{natural: true}, false)
+		if err != nil {
+			return nil, err
+		}
+		c.Args = append(c.Args, a)
+	}
+	return c, nil
+}
+
 func (o *object) field() (*Field, error) {
 	var name string
 	if err := json.Unmarshal(o.fields["name"], &name); err != nil {
@@ -253,6 +282,15 @@ func (o *object) field() (*Field, error) {
 
 // listField reads key as a field name: "items" or {"type":"field","name":"items"}.
 func (o *object) listField(key string) (*Field, error) {
+	f, err := o.anyField(key)
+	if errors.Is(err, ErrTypeMismatch) {
+		return nil, Errorf(o.at(key), ErrTypeMismatch, "want a list field")
+	}
+	return f, err
+}
+
+// anyField reads key as a field name, in either form.
+func (o *object) anyField(key string) (*Field, error) {
 	raw := o.fields[key]
 	var name string
 	if json.Unmarshal(raw, &name) == nil {
@@ -264,7 +302,7 @@ func (o *object) listField(key string) (*Field, error) {
 	}
 	f, ok := e.(*Field)
 	if !ok {
-		return nil, Errorf(o.at(key), ErrTypeMismatch, "want a list field")
+		return nil, Errorf(o.at(key), ErrTypeMismatch, "want a field")
 	}
 	return f, nil
 }
@@ -280,9 +318,19 @@ func newField(name, path string) (*Field, error) {
 type slot struct {
 	typ  Type // 0: no literal allowed
 	list bool
+	// natural reads a literal by its JSON kind, for call arguments.
+	natural bool
 }
 
 func (s slot) decode(raw json.RawMessage, path string) (Expr, error) {
+	if s.natural {
+		for _, t := range []slot{{typ: TypeString}, {typ: TypeNumber}, {typ: TypeBoolean}, {typ: TypeString, list: true}, {typ: TypeNumber, list: true}} {
+			if e, err := t.decode(raw, path); err == nil {
+				return e, nil
+			}
+		}
+		return nil, Errorf(path, ErrTypeMismatch, "want a string, number, boolean or list literal, got %s", preview(raw))
+	}
 	bad := func() (Expr, error) {
 		want := "no literal"
 		if s.typ != 0 {
@@ -305,6 +353,12 @@ func (s slot) decode(raw json.RawMessage, path string) (Expr, error) {
 	case s.typ == TypeBoolean && !s.list:
 		if v, ok := scalar[bool](raw); ok {
 			return &Bool{v}, nil
+		}
+	case s.typ == TypeDate && !s.list:
+		if v, ok := scalar[string](raw); ok {
+			if t, err := time.Parse(time.RFC3339Nano, v); err == nil {
+				return &Date{t}, nil
+			}
 		}
 	case s.typ == TypeString:
 		if v, ok := list[string](raw); ok {

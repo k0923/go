@@ -9,9 +9,10 @@ const (
 	TypeString Type = iota + 1
 	TypeNumber
 	TypeBoolean
+	TypeDate
 )
 
-var typeNames = map[Type]string{TypeString: "string", TypeNumber: "number", TypeBoolean: "boolean"}
+var typeNames = map[Type]string{TypeString: "string", TypeNumber: "number", TypeBoolean: "boolean", TypeDate: "date"}
 
 func (t Type) String() string {
 	if n, ok := typeNames[t]; ok {
@@ -90,8 +91,11 @@ func Ops() []Op {
 //	string   eq ne gt gte lt lte in nin contains starts_with ends_with
 //	number   eq ne gt gte lt lte in nin
 //	boolean  eq ne
+//	date     eq ne gt gte lt lte
 func (t Type) Allows(op Op) bool {
 	switch t {
+	case TypeDate:
+		return op >= OpEq && op <= OpLte
 	case TypeString:
 		return op >= OpEq && op <= OpEndsWith
 	case TypeNumber:

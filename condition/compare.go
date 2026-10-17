@@ -4,6 +4,7 @@ import (
 	"cmp"
 	"slices"
 	"strings"
+	"time"
 )
 
 // foldConst evaluates c once if all its operands are constant.
@@ -229,4 +230,28 @@ func InList[T any, V comparable](x Expr[T, V], list Expr[T, []V]) Condition[T] {
 // NotInList matches when x is not an element of the computed list.
 func NotInList[T any, V comparable](x Expr[T, V], list Expr[T, []V]) Condition[T] {
 	return &inListCond[T, V]{neg: true, x: newOperand(x, "left"), choices: newOperand(list, "list")}
+}
+
+// dateCond compares instants with time.Time.Compare, so the same instant in
+// different locations is equal; test receives the comparison result.
+type dateCond[T any] struct {
+	test func(int) bool
+	x, y operand[T, time.Time]
+}
+
+func (c *dateCond[T]) Match(v T) (bool, error) {
+	a, err := c.x.eval(v)
+	if err != nil {
+		return false, err
+	}
+	b, err := c.y.eval(v)
+	if err != nil {
+		return false, err
+	}
+	return c.test(a.Compare(b)), nil
+}
+
+func newDate[T any](test func(int) bool, x, y Expr[T, time.Time]) Condition[T] {
+	c := &dateCond[T]{test: test, x: newOperand(x, "left"), y: newOperand(y, "right")}
+	return foldConst(c, c.x.isConst && c.y.isConst)
 }

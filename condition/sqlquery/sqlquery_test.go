@@ -7,6 +7,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	_ "modernc.org/sqlite"
 
@@ -326,5 +327,139 @@ func TestEveryOperatorCovered(t *testing.T) {
 		if !seen[op] {
 			t.Errorf("no differential rule uses %s", op)
 		}
+	}
+}
+
+// TestObjectFields: object leaves are ordinary columns, mapped by their
+// dotted name; lists inside the object use a Relation keyed the same way.
+func TestObjectFields(t *testing.T) {
+	type buyer struct {
+		Level int
+		Items []item
+	}
+	type withBuyer struct{ Buyer buyer }
+	items := condition.NewSchema[item]().Number("price", func(i item) float64 { return i.Price })
+	s := condition.NewSchema[withBuyer]().Object("buyer", func(o withBuyer) buyer { return o.Buyer },
+		condition.NewSchema[buyer]().
+			Number("level", func(b buyer) int { return b.Level }).
+			List("items", func(b buyer) []item { return b.Items }, items))
+	typed, err := s.CheckJSON([]byte(`{"type":"and","items":[{"type":"number","x":"buyer.level","opt":"gte","y":3},{"type":"array","x":"buyer.items","opt":"any","y":{"type":"number","x":"price","opt":"gt","y":50}}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	where, args, err := sqlquery.Where(typed, sqlquery.Options{
+		Table:     "o",
+		Columns:   map[string]string{"buyer.level": "buyer_level"},
+		Relations: map[string]sqlquery.Relation{"buyer.items": {Table: "buyer_items", On: "{child}.order_id = {parent}.id"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := `("o"."buyer_level" >= ? AND EXISTS (SELECT 1 FROM "buyer_items" AS "t1" WHERE "t1".order_id = "o".id AND "t1"."price" > ?))`
+	if where != want || fmt.Sprint(args) != "[3 50]" {
+		t.Fatalf("got  %s %v\nwant %s", where, args, want)
+	}
+}
+
+// TestOptionalSQLite stores optional fields in nullable columns and requires
+// SQLite to select exactly the rows Match selects, including ne/nin and
+// arithmetic over NULL.
+func TestOptionalSQLite(t *testing.T) {
+	type row struct {
+		ID       int
+		Amount   float64
+		Discount *float64
+		Note     *string
+	}
+	s := condition.NewSchema[row]().
+		Number("id", func(r row) int { return r.ID }).
+		Number("amount", func(r row) float64 { return r.Amount }).
+		Number("discount", func(r row) float64 { return *r.Discount }).
+		Optional("discount", func(r row) bool { return r.Discount != nil }).
+		String("note", func(r row) string { return *r.Note }).
+		Optional("note", func(r row) bool { return r.Note != nil })
+
+	db, err := sql.Open("sqlite", ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.Exec(`CREATE TABLE r (id INTEGER PRIMARY KEY, amount REAL NOT NULL, discount REAL, note TEXT)`); err != nil {
+		t.Fatal(err)
+	}
+	discounts := []*float64{nil, new(0.0), new(10.0)}
+	notes := []*string{nil, new(""), new("gift")}
+	var rows []row
+	for i := range 27 {
+		r := row{ID: i + 1, Amount: float64(i % 3 * 10), Discount: discounts[i%3], Note: notes[i/3%3]}
+		rows = append(rows, r)
+		if _, err := db.Exec(`INSERT INTO r VALUES (?, ?, ?, ?)`, r.ID, r.Amount, r.Discount, r.Note); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	for _, src := range []string{
+		`{"type":"exists","x":"discount"}`,
+		`{"type":"not","x":{"type":"exists","x":"note"}}`,
+		`{"type":"exists","x":"amount"}`,
+		`{"type":"number","x":"discount","opt":"eq","y":10}`,
+		`{"type":"number","x":"discount","opt":"ne","y":10}`,
+		`{"type":"number","x":"discount","opt":"nin","y":[0]}`,
+		`{"type":"not","x":{"type":"number","x":"discount","opt":"gt","y":0}}`,
+		`{"type":"number","x":"amount","opt":"ne","y":{"type":"field","name":"discount"}}`,
+		`{"type":"number","x":{"type":"arith","x":"amount","opt":"sub","y":{"type":"field","name":"discount"}},"opt":"ne","y":0}`,
+		`{"type":"string","x":"note","opt":"ne","y":"gift"}`,
+		`{"type":"string","x":"note","opt":"starts_with","y":""}`,
+		`{"type":"not","x":{"type":"string","x":"note","opt":"contains","y":"if"}}`,
+		`{"type":"or","items":[{"type":"number","x":"discount","opt":"lt","y":5},{"type":"string","x":"note","opt":"nin","y":["gift"]}]}`,
+	} {
+		typed, err := s.CheckJSON([]byte(src))
+		if err != nil {
+			t.Fatalf("%s: %v", src, err)
+		}
+		where, args, err := sqlquery.Where(typed, sqlquery.Options{Table: "r"})
+		if err != nil {
+			t.Fatalf("%s: %v", src, err)
+		}
+		got := map[int]bool{}
+		res, err := db.Query(`SELECT id FROM r WHERE `+where, args...)
+		if err != nil {
+			t.Fatalf("%s\n%s: %v", src, where, err)
+		}
+		for res.Next() {
+			var id int
+			_ = res.Scan(&id)
+			got[id] = true
+		}
+		res.Close()
+		match := s.Build(typed)
+		for _, r := range rows {
+			if want, _ := match.Match(r); want != got[r.ID] {
+				t.Fatalf("row %d: memory=%v sql=%v\nrule:  %s\nwhere: %s", r.ID, want, got[r.ID], src, where)
+			}
+		}
+	}
+}
+
+func TestDateAndExistsSQL(t *testing.T) {
+	type row struct {
+		PaidAt *time.Time
+		Due    time.Time
+	}
+	s := condition.NewSchema[row]().
+		Date("paid_at", func(r row) time.Time { return *r.PaidAt }).
+		Optional("paid_at", func(r row) bool { return r.PaidAt != nil }).
+		Date("due", func(r row) time.Time { return r.Due })
+	typed, err := s.CheckJSON([]byte(`{"type":"and","items":[{"type":"date","x":"paid_at","opt":"ne","y":"2024-05-01T08:00:00+08:00"},{"type":"date","x":"due","opt":"lt","y":{"type":"field","name":"paid_at"}},{"type":"exists","x":"paid_at"}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	where, args, err := sqlquery.Where(typed, sqlquery.Options{Dialect: sqlquery.Postgres})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := `(NOT ("paid_at" IS NOT NULL AND "paid_at" = $1) AND ("paid_at" IS NOT NULL AND "due" < "paid_at") AND "paid_at" IS NOT NULL)`
+	if where != want || len(args) != 1 || !args[0].(time.Time).Equal(time.Date(2024, 5, 1, 0, 0, 0, 0, time.UTC)) || args[0].(time.Time).Location() != time.UTC {
+		t.Fatalf("got  %s %v\nwant %s", where, args, want)
 	}
 }

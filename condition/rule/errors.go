@@ -16,6 +16,7 @@ var (
 	ErrTypeMismatch = errors.New("type mismatch")
 	ErrInvalidNode  = errors.New("invalid node")
 	ErrTooDeep      = errors.New("nesting too deep")
+	ErrUnknownMacro = errors.New("unknown macro")
 )
 
 // Error reports why a rule was rejected and where. Path is a JSONPath-like

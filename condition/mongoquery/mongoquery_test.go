@@ -5,6 +5,7 @@ import (
 	"math/rand/v2"
 	"slices"
 	"testing"
+	"time"
 
 	"github.com/k0923/go/condition"
 	"github.com/k0923/go/condition/mongoquery"
@@ -234,5 +235,232 @@ func TestEveryOperatorCovered(t *testing.T) {
 		if !seen[op] {
 			t.Errorf("no differential rule uses %s", op)
 		}
+	}
+}
+
+// TestObjectFields: fields registered with Schema.Object are dotted paths,
+// which MongoDB resolves into embedded documents natively.
+func TestObjectFields(t *testing.T) {
+	type buyer struct {
+		Level int
+		Items []item
+	}
+	type withBuyer struct{ Buyer buyer }
+	items := condition.NewSchema[item]().Number("price", func(i item) float64 { return i.Price })
+	s := condition.NewSchema[withBuyer]().Object("buyer", func(o withBuyer) buyer { return o.Buyer },
+		condition.NewSchema[buyer]().
+			Number("level", func(b buyer) int { return b.Level }).
+			List("items", func(b buyer) []item { return b.Items }, items))
+	src := `{"type":"and","items":[{"type":"number","x":"buyer.level","opt":"gte","y":3},{"type":"array","x":"buyer.items","opt":"any","y":{"type":"number","x":"price","opt":"gt","y":50}}]}`
+	typed, err := s.CheckJSON([]byte(src))
+	if err != nil {
+		t.Fatal(err)
+	}
+	match, _ := s.Compile(typed.Root())
+	f, err := mongoquery.Filter(typed, mongoquery.Options{Paths: map[string]string{"buyer.items.price": "unit_price"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, _ := json.Marshal(f)
+	if want := `{"$and":[{"buyer.level":{"$gte":3}},{"buyer.items":{"$elemMatch":{"unit_price":{"$gt":50}}}}]}`; string(raw) != want {
+		t.Fatalf("got  %s\nwant %s", raw, want)
+	}
+	var decoded map[string]any
+	_ = json.Unmarshal(raw, &decoded)
+	for _, o := range []withBuyer{
+		{buyer{Level: 3, Items: []item{{Price: 60}}}},
+		{buyer{Level: 3, Items: []item{{Price: 40}}}},
+		{buyer{Level: 1, Items: []item{{Price: 60}}}},
+		{buyer{Level: 5}},
+	} {
+		lines := make([]any, len(o.Buyer.Items))
+		for i, it := range o.Buyer.Items {
+			lines[i] = map[string]any{"unit_price": it.Price}
+		}
+		d := map[string]any{"buyer": map[string]any{"level": float64(o.Buyer.Level), "items": lines}}
+		want, _ := match.Match(o)
+		if got := evalFilter(decoded, d); got != want {
+			t.Fatalf("%+v: memory=%v mongo=%v", o, want, got)
+		}
+	}
+}
+
+// TestOptionalDifferential runs rules over documents whose optional fields
+// are missing, null or set, through both the native and the $expr paths,
+// and requires memory and Mongo to agree. Filters are evaluated without a
+// JSON round trip so dates stay time.Time.
+func TestOptionalDifferential(t *testing.T) {
+	type doc = map[string]any
+	has := func(k string) func(doc) bool { return func(d doc) bool { v, ok := d[k]; return ok && v != nil } }
+	num := func(k string) func(doc) float64 { return func(d doc) float64 { return d[k].(float64) } }
+	buyer := condition.NewSchema[doc]().Number("level", num("level")).Optional("level", has("level"))
+	s := condition.NewSchema[doc]().
+		Number("amount", num("amount")).
+		Number("discount", num("discount")).Optional("discount", has("discount")).
+		String("note", func(d doc) string { return d["note"].(string) }).Optional("note", has("note")).
+		Date("paid_at", func(d doc) time.Time { return d["paid_at"].(time.Time) }).Optional("paid_at", has("paid_at")).
+		Date("due_at", func(d doc) time.Time { return d["due_at"].(time.Time) }).
+		Strings("tags", func(d doc) []string {
+			out := []string{}
+			for _, v := range asSlice(d["tags"]) {
+				out = append(out, v.(string))
+			}
+			return out
+		}).Optional("tags", has("tags")).
+		Object("buyer", func(d doc) doc { m, _ := d["buyer"].(doc); return m }, buyer).Optional("buyer", has("buyer"))
+
+	due := time.Date(2024, 5, 1, 0, 0, 0, 0, time.UTC)
+	var docs []doc
+	for i := range 81 {
+		d := doc{"amount": float64(i % 7 * 10), "due_at": due}
+		// Each optional field cycles through missing, null and two values.
+		set := func(k string, step int, a, b any) {
+			switch (i / step) % 4 {
+			case 1:
+				d[k] = nil
+			case 2:
+				d[k] = a
+			case 3:
+				d[k] = b
+			}
+		}
+		set("discount", 1, 10.0, 0.0)
+		set("note", 4, "gift", "")
+		set("paid_at", 16, due.Add(-time.Hour), due.Add(time.Hour))
+		set("tags", 2, []any{"vip"}, []any{})
+		switch i % 3 {
+		case 1:
+			d["buyer"] = doc{}
+		case 2:
+			d["buyer"] = doc{"level": float64(i % 5)}
+		}
+		docs = append(docs, d)
+	}
+
+	rules := []string{
+		`{"type":"exists","x":"discount"}`,
+		`{"type":"exists","x":"buyer"}`,
+		`{"type":"exists","x":"buyer.level"}`,
+		`{"type":"not","x":{"type":"exists","x":"note"}}`,
+		`{"type":"number","x":"discount","opt":"eq","y":10}`,
+		`{"type":"number","x":"discount","opt":"ne","y":10}`,
+		`{"type":"number","x":"discount","opt":"lt","y":5}`,
+		`{"type":"number","x":"discount","opt":"nin","y":[0]}`,
+		`{"type":"number","x":"buyer.level","opt":"gte","y":2}`,
+		`{"type":"string","x":"note","opt":"starts_with","y":""}`,
+		`{"type":"string","x":"note","opt":"ne","y":"gift"}`,
+		`{"type":"date","x":"paid_at","opt":"gt","y":"2024-05-01T08:00:00+08:00"}`,
+		`{"type":"date","x":"paid_at","opt":"ne","y":"2024-04-30T23:00:00Z"}`,
+		// $expr paths: field vs field, arithmetic, len.
+		`{"type":"date","x":"paid_at","opt":"lt","y":{"type":"field","name":"due_at"}}`,
+		`{"type":"date","x":"paid_at","opt":"ne","y":{"type":"field","name":"due_at"}}`,
+		`{"type":"number","x":{"type":"arith","x":"amount","opt":"sub","y":{"type":"field","name":"discount"}},"opt":"gte","y":20}`,
+		`{"type":"number","x":{"type":"arith","x":"amount","opt":"sub","y":{"type":"field","name":"discount"}},"opt":"ne","y":20}`,
+		`{"type":"number","x":"discount","opt":"lt","y":{"type":"field","name":"amount"}}`,
+		`{"type":"number","x":{"type":"len","x":"tags"},"opt":"eq","y":0}`,
+		`{"type":"array","x":"tags","opt":"none","y":{"type":"string","x":"$","opt":"eq","y":"vip"}}`,
+		`{"type":"string","x":{"type":"literal","value":"vip"},"opt":"nin","y":{"type":"field","name":"tags"}}`,
+		`{"type":"or","items":[{"type":"number","x":"discount","opt":"ne","y":{"type":"field","name":"amount"}},{"type":"exists","x":"note"}]}`,
+	}
+	for _, src := range rules {
+		typed, err := s.CheckJSON([]byte(src))
+		if err != nil {
+			t.Fatalf("%s: %v", src, err)
+		}
+		match := s.Build(typed)
+		filter, err := mongoquery.Filter(typed, mongoquery.Options{})
+		if err != nil {
+			t.Fatalf("%s: %v", src, err)
+		}
+		for _, d := range docs {
+			want, err := match.Match(d)
+			if err != nil {
+				t.Fatalf("%s: %v", src, err)
+			}
+			if got := evalFilter(filter, d); got != want {
+				raw, _ := json.Marshal(filter)
+				t.Fatalf("memory=%v mongo=%v\nrule:   %s\nfilter: %s\ndoc:    %v", want, got, src, raw, d)
+			}
+		}
+	}
+}
+
+func asSlice(v any) []any { s, _ := v.([]any); return s }
+
+// TestListOfLists: an inner list is the element "$" itself, which has no
+// document path, so it is translated through $map and must agree with Match.
+func TestListOfLists(t *testing.T) {
+	type doc = map[string]any
+	rows := condition.NewSchema[[]float64]().Numbers(condition.SelfField, func(r []float64) []float64 { return r })
+	s := condition.NewSchema[doc]().List("m", func(d doc) [][]float64 {
+		var out [][]float64
+		for _, r := range asSlice(d["m"]) {
+			row := []float64{}
+			for _, v := range asSlice(r) {
+				row = append(row, v.(float64))
+			}
+			out = append(out, row)
+		}
+		return out
+	}, rows)
+	docs := []doc{{}, {"m": []any{}}, {"m": []any{[]any{}}}, {"m": []any{[]any{1.0, 5.0}, []any{3.0}}}, {"m": []any{[]any{4.0, 5.0}}}}
+	for _, src := range []string{
+		`{"type":"array","x":"m","opt":"any","y":{"type":"array","x":"$","opt":"all","y":{"type":"number","x":"$","opt":"gt","y":2}}}`,
+		`{"type":"array","x":"m","opt":"all","y":{"type":"array","x":"$","opt":"any","y":{"type":"number","x":"$","opt":"eq","y":5}}}`,
+		`{"type":"array","x":"m","opt":"none","y":{"type":"number","x":{"type":"len","x":"$"},"opt":"gte","y":2}}`,
+	} {
+		typed, err := s.CheckJSON([]byte(src))
+		if err != nil {
+			t.Fatal(err)
+		}
+		filter, err := mongoquery.Filter(typed, mongoquery.Options{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, d := range docs {
+			want, _ := s.Build(typed).Match(d)
+			if got := evalFilter(filter, d); got != want {
+				raw, _ := json.Marshal(filter)
+				t.Fatalf("%v: memory=%v mongo=%v\n%s\n%s", d, want, got, src, raw)
+			}
+		}
+	}
+}
+
+// TestPrefix: with Prefix every top-level path moves under it, element paths
+// stay relative, and results still agree with Match on nested documents.
+func TestPrefix(t *testing.T) {
+	s := schema()
+	opt := mongoquery.Options{Paths: opts.Paths, Prefix: "data"}
+	nest := func(o order) map[string]any { return map[string]any{"data": toDoc(o)} }
+	for name, src := range rules {
+		typed, err := s.CheckJSON([]byte(src))
+		if err != nil {
+			t.Fatal(err)
+		}
+		filter, err := mongoquery.Filter(typed, opt)
+		if err != nil {
+			t.Fatal(err)
+		}
+		raw, _ := json.Marshal(filter)
+		var decoded map[string]any
+		_ = json.Unmarshal(raw, &decoded)
+		match := s.Build(typed)
+		for _, o := range fixture() {
+			want, err := match.Match(o)
+			if err != nil {
+				continue
+			}
+			if got := evalFilter(decoded, nest(o)); got != want {
+				t.Fatalf("%s: order %d: memory=%v mongo=%v\n%s", name, o.ID, want, got, raw)
+			}
+		}
+	}
+	typed, _ := s.CheckJSON([]byte(`{"type":"and","items":[{"type":"number","x":"amount","opt":"gte","y":100},{"type":"array","x":"items","opt":"any","y":{"type":"number","x":"price","opt":"gt","y":{"type":"arith","x":1,"opt":"add","y":1}}},{"type":"number","x":{"type":"len","x":"tags"},"opt":"gt","y":1}]}`))
+	f, _ := mongoquery.Filter(typed, opt)
+	raw, _ := json.Marshal(f)
+	want := `{"$and":[{"data.total":{"$gte":100}},{"$expr":{"$anyElementTrue":[{"$map":{"as":"e1","in":{"$gt":["$$e1.unit_price",{"$add":[1,1]}]},"input":{"$ifNull":["$data.lines",{"$literal":[]}]}}}]}},{"$expr":{"$gt":[{"$size":{"$ifNull":["$data.tags",{"$literal":[]}]}},1]}}]}`
+	if string(raw) != want {
+		t.Fatalf("got  %s\nwant %s", raw, want)
 	}
 }

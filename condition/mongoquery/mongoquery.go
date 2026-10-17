@@ -14,8 +14,11 @@
 // Semantic alignment with in-memory evaluation:
 //
 //   - Documents are assumed to hold every registered field with the right
-//     BSON type. $ne/$nin also match documents where the field is missing.
-//     A missing or null list field behaves like an empty list.
+//     BSON type, except optional fields (condition.Schema.Optional), which
+//     may be missing or null; both count as missing. A comparison with a
+//     missing operand is false, ne/nin true, exists false. A missing or null
+//     list field behaves like an empty list.
+//   - Dates are emitted as time.Time, which the driver encodes as BSON dates.
 //   - String operators are byte-wise and case-sensitive, like Go.
 //   - Division by zero aborts the query with an error, like Match.
 package mongoquery
@@ -42,6 +45,11 @@ type Options struct {
 	// e.g. {"items": "lines", "items.price": "unit_price"}. Unmapped fields
 	// use their schema name.
 	Paths map[string]string
+	// Prefix is prepended, with a dot, to every top-level document path,
+	// including paths from Paths. Paths inside list elements are relative to
+	// the element and are not prefixed. With Prefix "data", the field
+	// "level" becomes "data.level" and the list "items" "data.items".
+	Prefix string
 }
 
 // Filter translates a checked rule into a MongoDB filter document.
@@ -108,10 +116,14 @@ func (tr *translator) unsupported(n rule.Node, format string, a ...any) error {
 }
 
 func (tr *translator) path(f *rule.Field, sc scope) string {
-	if p, ok := tr.opt.Paths[sc.key+f.Name]; ok {
-		return p
+	p, ok := tr.opt.Paths[sc.key+f.Name]
+	if !ok {
+		p = f.Name
 	}
-	return f.Name
+	if sc.key == "" && tr.opt.Prefix != "" {
+		return tr.opt.Prefix + "." + p
+	}
+	return p
 }
 
 // lit renders a literal as a BSON-compatible value. Integral numbers become
@@ -119,6 +131,8 @@ func (tr *translator) path(f *rule.Field, sc scope) string {
 func lit(e rule.Expr) (v any, ok bool) {
 	switch e := e.(type) {
 	case *rule.Bool:
+		return e.V, true
+	case *rule.Date:
 		return e.V, true
 	case *rule.Number:
 		return num(e.V), true
@@ -200,6 +214,10 @@ func (tr *translator) query(n rule.Cond, sc scope) (map[string]any, bool, error)
 		}
 		return doc("$nor", []any{f}), true, nil
 	case *rule.Quant:
+		if n.X.Name == condition.SelfField {
+			// A list nested in a list has no document path of its own.
+			return nil, false, nil
+		}
 		if tr.chk.Field(n.X).Kind != condition.KindObjects {
 			return tr.scalarQuant(n, sc)
 		}
@@ -217,7 +235,18 @@ func (tr *translator) query(n rule.Cond, sc scope) (map[string]any, bool, error)
 		default: // no element satisfies it
 			return doc(path, doc("$not", doc("$elemMatch", p))), true, nil
 		}
+	case *rule.Exists:
+		if !tr.chk.Field(n.X).Optional {
+			return map[string]any{}, true, nil
+		}
+		f, ok := docField(n.X)
+		if !ok {
+			return nil, false, nil
+		}
+		return doc(tr.path(f, sc), doc("$ne", nil)), true, nil
 	case *rule.Compare:
+		// Native operators already give missing fields the required
+		// semantics: $eq/$in/$lt/$regex/... fail, $ne/$nin hold.
 		return tr.compare(n, sc)
 	}
 	return nil, false, nil
@@ -368,16 +397,64 @@ func (tr *translator) cond(n rule.Cond, sc scope) (any, error) {
 		return doc("$not", []any{e}), err
 	case *rule.Quant:
 		return tr.quant(n, sc)
+	case *rule.Exists:
+		if !tr.chk.Field(n.X).Optional {
+			return true, nil
+		}
+		return tr.present(n.X, sc), nil
 	case *rule.Compare:
-		return tr.compareExpr(n, sc)
+		guards := tr.guards(nil, sc, n.X, n.Y)
+		if len(guards) == 0 {
+			return tr.compareExpr(n, n.Op, sc)
+		}
+		// Aggregation orders null below every value and some operators fail
+		// on null, so test presence first ($and short-circuits) and negate
+		// the guarded positive form for ne/nin.
+		op, neg := n.Op, false
+		switch op {
+		case rule.OpNe:
+			op, neg = rule.OpEq, true
+		case rule.OpNin:
+			op, neg = rule.OpIn, true
+		}
+		e, err := tr.compareExpr(n, op, sc)
+		if err != nil {
+			return nil, err
+		}
+		e = doc("$and", append(guards, e))
+		if neg {
+			return doc("$not", []any{e}), nil
+		}
+		return e, nil
 	}
 	return nil, tr.unsupported(n, "condition %T", n)
 }
 
-func (tr *translator) compareExpr(n *rule.Compare, sc scope) (any, error) {
-	if n.Op.IsList() {
+// present is an aggregation test that f is neither missing nor null.
+func (tr *translator) present(f *rule.Field, sc scope) any {
+	return doc("$ne", []any{doc("$ifNull", []any{tr.fieldRef(f, sc), nil}), nil})
+}
+
+// guards collects presence tests for the optional scalar fields an operand
+// reads. Lists need none: a missing list already behaves like an empty one.
+func (tr *translator) guards(out []any, sc scope, es ...rule.Expr) []any {
+	for _, e := range es {
+		switch e := e.(type) {
+		case *rule.Field:
+			if info := tr.chk.Field(e); info.Optional && !info.Kind.IsList() {
+				out = append(out, tr.present(e, sc))
+			}
+		case *rule.Arith:
+			out = tr.guards(out, sc, e.X, e.Y)
+		}
+	}
+	return out
+}
+
+func (tr *translator) compareExpr(n *rule.Compare, op rule.Op, sc scope) (any, error) {
+	if op.IsList() {
 		if l, ok := lit(n.Y); ok && len(l.([]any)) == 0 {
-			return n.Op == rule.OpNin, nil
+			return op == rule.OpNin, nil
 		}
 	}
 	x, err := tr.expr(n.X, sc)
@@ -388,7 +465,7 @@ func (tr *translator) compareExpr(n *rule.Compare, sc scope) (any, error) {
 	if err != nil {
 		return nil, err
 	}
-	switch n.Op {
+	switch op {
 	case rule.OpContains:
 		return doc("$gte", []any{doc("$indexOfBytes", []any{x, y}), 0}), nil
 	case rule.OpStartsWith:
@@ -399,12 +476,12 @@ func (tr *translator) compareExpr(n *rule.Compare, sc scope) (any, error) {
 		return doc("$and", []any{doc("$gte", []any{lx, ly}), doc("$eq", []any{tail, y})}), nil
 	case rule.OpIn, rule.OpNin:
 		in := doc("$in", []any{x, orEmpty(y)})
-		if n.Op == rule.OpNin {
+		if op == rule.OpNin {
 			return doc("$not", []any{in}), nil
 		}
 		return in, nil
 	}
-	return doc(cmpOps[n.Op], []any{x, y}), nil
+	return doc(cmpOps[op], []any{x, y}), nil
 }
 
 // orEmpty treats a missing or null list as an empty one.
@@ -446,7 +523,7 @@ func (tr *translator) expr(e rule.Expr, sc scope) (any, error) {
 	case *rule.Numbers, *rule.Strings:
 		v, _ := lit(e)
 		return doc("$literal", v), nil
-	case *rule.Number, *rule.Bool:
+	case *rule.Number, *rule.Bool, *rule.Date:
 		v, _ := lit(e)
 		return v, nil
 	case *rule.Arith:

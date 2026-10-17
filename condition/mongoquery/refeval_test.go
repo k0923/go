@@ -6,6 +6,7 @@ import (
 	"regexp"
 	"slices"
 	"strings"
+	"time"
 )
 
 // evalFilter is a small reference implementation of the MongoDB query
@@ -102,9 +103,12 @@ func matchValue(val any, present bool, pred func(any) bool) bool {
 func evalFieldOp(op string, arg, val any, present bool) bool {
 	switch op {
 	case "$eq":
+		if arg == nil && !present {
+			return true // {$eq: null} also matches a missing field
+		}
 		return matchValue(val, present, func(x any) bool { return equal(x, arg) })
 	case "$ne":
-		return !matchValue(val, present, func(x any) bool { return equal(x, arg) })
+		return !evalFieldOp("$eq", arg, val, present)
 	case "$lt", "$lte", "$gt", "$gte":
 		return matchValue(val, present, func(x any) bool {
 			c, ok := compare(x, arg)
@@ -167,6 +171,10 @@ func num(v any) (float64, bool) {
 }
 
 func equal(a, b any) bool {
+	if x, ok := a.(time.Time); ok {
+		y, ok := b.(time.Time)
+		return ok && x.Equal(y)
+	}
 	if x, ok := num(a); ok {
 		y, ok := num(b)
 		return ok && x == y
@@ -175,6 +183,10 @@ func equal(a, b any) bool {
 }
 
 func compare(a, b any) (int, bool) {
+	if x, ok := a.(time.Time); ok {
+		y, ok := b.(time.Time)
+		return x.Compare(y), ok
+	}
 	if x, ok := num(a); ok {
 		if y, ok := num(b); ok {
 			return map[bool]int{true: -1, false: 0}[x < y] + map[bool]int{true: 1, false: 0}[x > y], true

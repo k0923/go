@@ -6,6 +6,7 @@
 go run ./condition/examples/builder       # Go 构建 API
 go run ./condition/examples/collections   # 量词、Len、算术、错误处理
 go run ./condition/examples/jsonrules     # JSON 规则、Schema、编译期校验
+go run ./condition/examples/macros        # 宏（call 节点）、Object 提升宏、Mongo Prefix
 go run ./condition/examples/integration   # 接入业务配置、计算字段、并发共享
 go run ./condition/examples/query         # 同一份 JSON：内存判断 + SQL + MongoDB
 go test ./condition/examples              # 校验全部示例输出
@@ -27,13 +28,16 @@ go test ./condition/examples -update      # 修改示例后重新生成预期输
 | 长度 | `Len` | collections |
 | 算术 | `Add` `Sub` `Mul` `Div`、`ErrDivideByZero` | collections |
 | 错误透传与短路保护 | `And(guard, risky)` | collections |
-| 字段白名单 | `NewSchema`、`Bool` `String` `Number` `Strings` `Numbers` `List` | jsonrules |
+| 字段白名单 | `NewSchema`、`Bool` `String` `Number` `Date` `Strings` `Numbers` `List` `Object`、`Optional` | jsonrules |
 | JSON 编译 | `CompileJSON`、`Compile`、`rule.Parse` | jsonrules |
 | 代码构建规则并序列化 | `rule.And` `rule.Compare` `rule.Quant` `rule.Field` `rule.Number` … | jsonrules |
 | 编译错误定位 | `*CompileError{Path}`、`ErrUnknownField` 等 | jsonrules |
 | 标量列表元素引用 | `"x":"$"`（`SelfField`） | jsonrules、integration |
 | 嵌入业务配置 | `json.RawMessage` 加 `CompileJSON` | integration |
 | 计算字段（扩展点） | Schema 注册任意函数 | integration |
+| 宏（扩展点） | `Schema.Macro`、`{"type":"call","name":...,"args":[...]}`、`ErrUnknownMacro` | macros |
+| 可缺失字段、日期 | `Optional`、`exists`、`Date`、`{"type":"date",...}` | macros |
+| Mongo 数据前缀 | `mongoquery.Options.Prefix` | macros |
 | 并发共享 | 编译结果不可变 | integration |
 | 完整复杂规则 JSON | [rule.json](query/rule.json) | query |
 | 生成 SQL（SQLite/PostgreSQL/MySQL） | `Check` → `sqlquery.Where` | query |
@@ -115,11 +119,15 @@ rule.json ─rule.Parse─> rule.Cond ─Schema.Check─> *Checked ─┬─ Sch
 | `any/all/none` 对象列表 | `EXISTS` / `NOT EXISTS` 子表 | `$elemMatch` / `$not: {$elemMatch}` |
 | `any/all/none` 标量列表 | 子表 / PG `unnest` | `$elemMatch` 或 `$expr`+`$map` |
 | 两字段比较、算术、`len` | 原生表达式、`COUNT(*)` | `$expr`（不走索引） |
+| `exists`（Optional 字段） | `col IS NOT NULL` | `{x: {$ne: null}}` |
+| Optional 字段上的比较 | 加 `col IS NOT NULL AND …` 守卫；`ne/nin` 为守卫后取反 | 原生算子天然满足；`$expr` 路径加 `$ifNull` 守卫 |
+| `date` 比较 | 绑定 UTC `time.Time` | 输出 `time.Time`（BSON date） |
+| 列表的列表（`$` 上嵌套 array） | 需 `Relation`，否则报 unsupported | `$expr`+嵌套 `$map` |
 
 需要注意的语义约束：
 
-- **SQL**：默认列为 NOT NULL；字符串比较遵循列的排序规则，要和 Go 一样按字节比较，需要设置 `Options.Collate`；列表字段要么配置 `Relation` 映射到子表，要么在 PostgreSQL 上用数组列；除以 0 在 SQLite/MySQL 中得到 NULL（该行不匹配），而内存求值和 PostgreSQL 会报错。
-- **MongoDB**：文档应包含所有注册字段且类型正确；`$ne`/`$nin` 也会匹配缺失该字段的文档；缺失或为 null 的数组按空数组处理。
+- **SQL**：必填字段的列应为 NOT NULL，Optional 字段的列为 NULL 表示缺失；字符串比较遵循列的排序规则，要和 Go 一样按字节比较，需要设置 `Options.Collate`；列表字段要么配置 `Relation` 映射到子表，要么在 PostgreSQL 上用数组列；除以 0 在 SQLite/MySQL 中得到 NULL（该行不匹配），而内存求值和 PostgreSQL 会报错。
+- **MongoDB**：文档应包含所有必填字段且类型正确；Optional 字段缺失与 null 等价；缺失或为 null 的数组按空数组处理。
 
 ## JSON 场景的开发规范：不再使用 xjson.G
 
@@ -139,11 +147,12 @@ rule.json ─rule.Parse─> rule.Cond ─Schema.Check─> *Checked ─┬─ Sch
 
 1. **规则统一用 rule 包的格式表达**（见上文“规则格式”）。不要再定义新的 `Condition` 实现类型并通过 `xjson.Bind` 注册。
 2. **规则以 `json.RawMessage` 保存，用 `Schema.CompileJSON` 编译。** 它会拒绝未知的键、缺失的键和多余的尾部数据。
-3. **业务能力通过 Schema 字段扩展，不通过接口扩展。** 需要自定义判断时，把它注册成计算字段，例如 `Bool("is_weekend", fn)`、`Number("user_bucket", fn)`。JSON 规则只能访问已注册的字段，Schema 也就同时充当了安全白名单。
+3. **业务能力通过 Schema 字段和宏扩展，不通过接口扩展。** 需要自定义判断时，若能由已有字段组合表达，就注册成宏（`Macro("high_risk", params, expand)`），`Check` 会把调用展开成普通节点，内存、SQL、Mongo 自动支持且语义一致；只有原子节点表达不了的逻辑才注册成计算字段，例如 `Bool("is_weekend", fn)`、`Number("user_bucket", fn)`，计算字段只能在内存中求值。JSON 规则只能访问已注册的字段，Schema 也就同时充当了安全白名单。嵌套对象用 `Object("buyer", getBuyer, buyerSchema)` 复用已有 Schema，规则里写 `buyer.level`；SQL 后端用 `Columns["buyer.level"]` 映射列名，Mongo 直接按点路径访问内嵌文档；业务数据统一放在某个子文档（如 `data`）下时，用 `mongoquery.Options{Prefix: "data"}`。
 4. **在加载阶段编译，并把编译结果缓存起来复用。** 编译错误应作为配置错误让加载失败，不要拖到请求时再处理。`Condition` 不可变，可以在多个 goroutine 之间共享。
 5. **Schema 在初始化阶段注册完毕。** 注册完成后不要再修改，也不要在 `Compile` 的同时修改。
-6. **数值约束**：JSON 模式下数值统一按 `float64` 比较，超过 2^53 的整数（例如雪花 ID）不能用 `Number` 注册，应该用 `String` 注册后按字符串比较。
-7. **Go 代码中的规则直接使用构建 API**，如 `And`、`Ge`、`Field` 等，能获得编译期的类型检查，也不需要绕道 JSON。
+6. **可缺失字段用 `Optional(name, has)` 标记。** 缺失值上的比较为 false，`ne`/`nin` 为 true，`exists` 判断是否存在；缺失列表视为空列表。内存、SQL（`IS NOT NULL` 守卫）、Mongo 三端语义一致。未标记 Optional 的字段视为必然存在，取值函数不应自行用零值兜底缺失。
+7. **数值约束**：JSON 模式下数值统一按 `float64` 比较，超过 2^53 的整数（例如雪花 ID）不能用 `Number` 注册，应该用 `String` 注册后按字符串比较。
+8. **Go 代码中的规则直接使用构建 API**，如 `And`、`Ge`、`Field` 等，能获得编译期的类型检查，也不需要绕道 JSON。
 
 ### 与 xjson.G 共存
 

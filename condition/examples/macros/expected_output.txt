@@ -1,0 +1,133 @@
+== expanded rule:
+{
+  "type": "and",
+  "items": [
+    {
+      "type": "and",
+      "items": [
+        {
+          "type": "or",
+          "items": [
+            {
+              "type": "number",
+              "x": "score",
+              "opt": "lt",
+              "y": 60
+            },
+            {
+              "type": "array",
+              "x": "labels",
+              "opt": "any",
+              "y": {
+                "type": "number",
+                "x": "confidence",
+                "opt": "lt",
+                "y": 0.6
+              }
+            }
+          ]
+        },
+        {
+          "type": "string",
+          "x": "source",
+          "opt": "in",
+          "y": [
+            "crowd",
+            "model"
+          ]
+        },
+        {
+          "type": "not",
+          "x": {
+            "type": "and",
+            "items": [
+              {
+                "type": "exists",
+                "x": "reviewer"
+              },
+              {
+                "type": "number",
+                "x": "reviewer.level",
+                "opt": "gte",
+                "y": 3
+              }
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "type": "date",
+      "x": "updated_at",
+      "opt": "gte",
+      "y": "2024-05-01T00:00:00+08:00"
+    }
+  ]
+}
+
+== in-memory matches: [1 2 4]
+
+== MongoDB filter (Prefix: data):
+{
+  "$and": [
+    {
+      "$and": [
+        {
+          "$or": [
+            {
+              "data.score": {
+                "$lt": 60
+              }
+            },
+            {
+              "data.labels": {
+                "$elemMatch": {
+                  "confidence": {
+                    "$lt": 0.6
+                  }
+                }
+              }
+            }
+          ]
+        },
+        {
+          "data.source": {
+            "$in": [
+              "crowd",
+              "model"
+            ]
+          }
+        },
+        {
+          "$nor": [
+            {
+              "$and": [
+                {
+                  "data.reviewer": {
+                    "$ne": null
+                  }
+                },
+                {
+                  "data.reviewer.level": {
+                    "$gte": 3
+                  }
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "data.updated_at": {
+        "$gte": "2024-05-01T00:00:00+08:00"
+      }
+    }
+  ]
+}
+
+== rejected rules:
+  condition: $.name: unknown macro: "low_score"
+  condition: $.args[0]: type mismatch: want an RFC 3339 date, got "2024-05-01"
+  condition: $.args: type mismatch: macro "needs_review" takes 1 arguments, got 2
+  condition: $.name: unknown macro: "disputed"

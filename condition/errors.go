@@ -21,4 +21,5 @@ var (
 	ErrTypeMismatch = rule.ErrTypeMismatch
 	ErrInvalidNode  = rule.ErrInvalidNode
 	ErrTooDeep      = rule.ErrTooDeep
+	ErrUnknownMacro = rule.ErrUnknownMacro
 )

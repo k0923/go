@@ -1,6 +1,9 @@
 package rule
 
-import "encoding/json"
+import (
+	"encoding/json"
+	"time"
+)
 
 // Every node marshals to the canonical JSON form accepted by Parse, with
 // "type" first and the shorthands used where they apply, so
@@ -14,6 +17,7 @@ type wire struct {
 	Opt   string `json:"opt,omitempty"`
 	Y     any    `json:"y,omitempty"`
 	Items []Cond `json:"items,omitempty"`
+	Args  []any  `json:"args,omitempty"`
 }
 
 func (n *And) MarshalJSON() ([]byte, error) { return json.Marshal(wire{Type: "and", Items: n.Items}) }
@@ -32,11 +36,24 @@ func (n *Arith) MarshalJSON() ([]byte, error) {
 	return json.Marshal(wire{Type: "arith", X: xForm(n.X), Opt: n.Op.String(), Y: yForm(n.Y)})
 }
 
+func (n *Exists) MarshalJSON() ([]byte, error) {
+	return json.Marshal(wire{Type: "exists", X: xForm(n.X)})
+}
+
+func (n *Call) MarshalJSON() ([]byte, error) {
+	w := wire{Type: "call", Name: n.Name}
+	for _, a := range n.Args {
+		w.Args = append(w.Args, yForm(a))
+	}
+	return json.Marshal(w)
+}
+
 func (n *Field) MarshalJSON() ([]byte, error)   { return json.Marshal(wire{Type: "field", Name: n.Name}) }
 func (n *Len) MarshalJSON() ([]byte, error)     { return json.Marshal(wire{Type: "len", X: xForm(n.X)}) }
 func (n *Number) MarshalJSON() ([]byte, error)  { return literal(n.V) }
 func (n *String) MarshalJSON() ([]byte, error)  { return literal(n.V) }
 func (n *Bool) MarshalJSON() ([]byte, error)    { return literal(n.V) }
+func (n *Date) MarshalJSON() ([]byte, error)    { return literal(dateString(n.V)) }
 func (n *Numbers) MarshalJSON() ([]byte, error) { return literal(nonNil(n.V)) }
 func (n *Strings) MarshalJSON() ([]byte, error) { return literal(nonNil(n.V)) }
 
@@ -75,6 +92,8 @@ func yForm(e Expr) any {
 		v = e.V
 	case *Bool:
 		v = e.V
+	case *Date:
+		v = dateString(e.V)
 	case *Numbers:
 		v = nonNil(e.V)
 	case *Strings:
@@ -85,3 +104,5 @@ func yForm(e Expr) any {
 	raw, _ := json.Marshal(v)
 	return json.RawMessage(raw)
 }
+
+func dateString(t time.Time) string { return t.Format(time.RFC3339Nano) }

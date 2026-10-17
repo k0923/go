@@ -10,9 +10,9 @@
 //     rule := condition.And(adult, condition.In(city, "bj", "sh"))
 //
 //  2. Declarative rules (package rule) checked against a Schema. A rule is a
-//     tree of closed node types — And, Or, Not, Compare, Quant for
-//     conditions; Field, literals, Arith, Len for values — with a flat JSON
-//     form such as {"type":"number","x":"amount","opt":"gte","y":100}. The
+//     tree of closed node types — And, Or, Not, Compare, Quant, Exists,
+//     Call for conditions; Field, literals, Arith, Len for values — with a
+//     flat JSON form such as {"type":"number","x":"amount","opt":"gte","y":100}. The
 //     left operand may be any expression, not only a field. All validation —
 //     unknown types, opt values, fields, kind mismatches, constant division
 //     by zero, nesting depth — happens in rule.Parse and Schema.Check and is
@@ -41,6 +41,17 @@
 //   - Division by zero is an error for both integers and floats.
 //   - Values decoded from JSON numbers are float64; integers beyond 2^53 lose
 //     precision.
+//   - Fields marked with Schema.Optional may be missing. A comparison that
+//     reads a missing scalar is false; ne and nin, being the negations of eq
+//     and in, are true; exists is false. A missing list is empty. Every
+//     backend implements the same two-valued semantics.
+//   - Dates compare as instants: the same moment in two time zones is equal.
+//     Date literals in JSON are RFC 3339 strings.
+//   - A Call invokes a macro registered with Schema.Macro. Check replaces
+//     it with the macro's expansion, so a *Checked never contains a Call
+//     and backends need no support for macros.
+//   - A list of lists is a List whose element schema registers the inner
+//     list as SelfField ("$"); rules nest array rules over "$".
 //
 // Every Condition and Expr in this package is immutable after construction and
 // safe for concurrent use. A Schema must be fully registered before it is used
