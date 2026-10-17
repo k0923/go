@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/k0923/go/workflow"
+	"github.com/k0923/go/workflow/memory"
 )
 
 //go:embed ui
@@ -227,7 +228,7 @@ func (s *Server) wake(w http.ResponseWriter, r *http.Request, run string) {
 				return
 			case <-deadline.C:
 				heartbeat.Stop()
-				writeJSON(w, http.StatusOK, notificationsResponse{Notifications: []workflow.Notification{}})
+				writeJSON(w, http.StatusOK, notificationsResponse{Notifications: []memory.Notification{}})
 				return
 			case <-mature:
 				break wait
@@ -391,7 +392,7 @@ func (s *Server) infra(w http.ResponseWriter, r *http.Request, run string) {
 	case "pending":
 		var body pendingRequest
 		if err = decode(r, &body); err == nil {
-			var notifications []workflow.Notification
+			var notifications []memory.Notification
 			notifications, err = s.store.Pending(ctx, run, body.Now)
 			response = notificationsResponse{Notifications: notifications}
 		}

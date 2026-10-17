@@ -56,7 +56,7 @@ func (f TaskFlow) Run(ctx *workflow.FlowContext, input Input) (Reply, error) {
     if err != nil {
         return Reply{}, err
     }
-    return ctx.WaitFor[Reply]("reply", task)
+    return ctx.WaitFor[Reply]("reply", task), nil // 未回调时挂起
 }
 
 type Root struct {
@@ -82,7 +82,7 @@ root := Root{Left: leftFlow, Right: rightFlow}
 definition := workflow.NewWorkflow("tasks", "1", root.Orchestrate)
 ```
 
-上面 Input/Task/Reply/Client 是业务定义。完整可运行验证见 parallel_wait_test.go：12 个独立 Workflow 实例各启动 8 个平级 Flow，混合外部等待与 Sleep，重复回调、分批恢复和回放均使用真实引擎执行。
+上面 Input/Task/Reply/Client 是业务定义。完整可运行验证见 tests/parallel_wait_test.go：12 个独立 Workflow 实例各启动 8 个平级 Flow，混合外部等待与 Sleep，重复回调、分批恢复和回放均使用真实引擎执行。
 
 ## 从嵌套方案迁移
 

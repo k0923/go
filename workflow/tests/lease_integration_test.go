@@ -1,9 +1,12 @@
-package workflow
+package tests
 
 import (
 	"context"
 	"testing"
 	"time"
+
+	. "github.com/k0923/go/workflow"
+	"github.com/k0923/go/workflow/memory"
 )
 
 // slowCommitInfrastructure waits for renewal from inside the final write.
@@ -40,7 +43,7 @@ func (s *slowCommitInfrastructure) Commit(ctx context.Context, token Lease, reco
 }
 
 func TestEngineLeaseIntegration(t *testing.T) {
-	store := NewMemoryInfrastructure()
+	store := memory.New()
 	slow := &slowCommitInfrastructure{Infrastructure: store, renewed: make(chan struct{}, 4)}
 	engine := testEngine(t, slow, Options{LeaseTTL: 150 * time.Millisecond})
 	flow := definition(FlowFunc[int, int](func(f *FlowContext, input int) (int, error) {

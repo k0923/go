@@ -11,9 +11,9 @@
 | 旧实现中的问题 | 新版验证 | 结果 |
 | --- | --- | --- |
 | Flow 层信号没有持久化、Sleep 重驱延后期限 | TestFlowContextWaitFor、TestFlowContextSleep | 等待登记持久化，原 Until 稳定 |
-| 请求确认与恢复共享投递身份造成唤醒消耗 | TestFlowContextWaitFor、TestMemoryInfrastructure/resolve_racing_registration_returns_resolved_snapshot | 请求确认后 WAKE 保留，重复注册读到完成响应 |
+| 请求确认与恢复共享投递身份造成唤醒消耗 | TestFlowContextWaitFor、memory.TestInfrastructure/resolve_racing_registration_returns_resolved_snapshot | 请求确认后 WAKE 保留，重复注册读到完成响应 |
 | 普通 IO/存储错误被永久写 FAILED | TestEngineDrive/ordinary_failure_retries、TestEngineInfrastructureFailure | 错误可重试，已完成提交可回放 |
-| 旧租约 owner CAS 写入结果 | TestMemoryInfrastructure/fencing_expiry_CAS_and_deep_copies | 过期及被接管 owner Commit 均拒绝 |
+| 旧租约 owner CAS 写入结果 | memory.TestInfrastructure/fencing_expiry_CAS_and_deep_copies | 过期及被接管 owner Commit 均拒绝 |
 | 重复 key 返回其他输入的结果 | TestFlowContextRun | 重复及非法 key 拒绝，输入变化拒绝 |
 | Future 并发 Wait 竞争及阻塞 | TestFutureWait | 16 个并发等待者读取同一结果 |
 | 未 Wait 的分支错误被吞掉或驱动结束仍运行 | TestFlowContextGoFlow | 分支错误汇总，返回前兄弟已退出 |
@@ -23,9 +23,9 @@
 
 ## 生成的用例
 
-- engine_test.go：构造参数、根输入与版本、回放、普通错误重试、永久错误、panic 堆栈、超时、取消、忽略挂起的兜底、Observer 隔离、key 校验、竞争驱动和递归 Flow。
-- flow_test.go：信号注册与完成、陈旧与重复回调、请求确认后 WAKE、稳定休眠期限、立即休眠、检查点回放、Loop 完成/耗尽、Future 并发 Wait、多分支挂起、错误取消与汇合。
-- infrastructure_test.go：存储 generation/expiry fencing、版本 CAS、深拷贝、terminal 状态保护、Resolve/Register 交错、所有方法 context 取消、读写/续租/释放/信号登记故障。
+- tests/engine_test.go：构造参数、根输入与版本、回放、普通错误重试、永久错误、panic 堆栈、超时、取消、忽略挂起的兜底、Observer 隔离、key 校验、竞争驱动和递归 Flow。
+- tests/flow_test.go：信号注册与完成、陈旧与重复回调、请求确认后 WAKE、稳定休眠期限、立即休眠、检查点回放、Loop 完成/耗尽、Future 并发 Wait、多分支挂起、错误取消与汇合。
+- tests/infrastructure_test.go：存储 generation/expiry fencing、版本 CAS、深拷贝、terminal 状态保护、Resolve/Register 交错、所有方法 context 取消、读写/续租/释放/信号登记故障。
 - example_test.go：外部包完整“提交订单 → 等待审批 → 完成回调 → 恢复”例子，输出由 Go 示例测试验证。
 
 共 13 个顶层测试/示例入口、24 个子测试；统计来自 go test -json，新版入口与子测试全部通过。子测试数不代表所有表驱动输入数量。
@@ -48,7 +48,7 @@ Step7：执行 utree flush；测试统计、验证结论与局限均已记录。
 
 ## 验证局限
 
-MemoryInfrastructure 是进程内参考实现。没有证明具体 MongoDB、Redis 或 MQ 适配器的原子性，也没有执行真实 API、跨进程宕机或时钟漂移测试。生产部署应对自定义 Infrastructure 的 Commit、Put、Resolve 原子契约运行适配器测试。
+`workflow/memory` 是进程内参考实现。没有证明具体 MongoDB、Redis 或 MQ 适配器的原子性，也没有执行真实 API、跨进程宕机或时钟漂移测试。生产部署应对自定义 Infrastructure 的 Commit、Put、Resolve 原子契约运行适配器测试。
 
 IO 副作用到结果提交之间仍存在不确定窗口，需要外部幂等。不响应 context 的 Action 会阻塞汇合。新版 Record 与旧事件 schema 不兼容，旧在途实例需要保留旧版路由或显式迁移。
 
@@ -68,7 +68,7 @@ IO 副作用到结果提交之间仍存在不确定窗口，需要外部幂等�
 
 缺陷分析：本次没有确认的缺陷条目。测试重点验证并发快照、回放与实际执行的区分、Resolve 幂等、校验失败的结束事件和异常隔离；未把不同 Drive 上同 key 的挂起观察视为重复交付。
 
-生成用例：events_test.go 包含正常执行/回放精确事件序列、JSON 往返、ID 唯一性、拒绝/取消驱动、暂时/永久/panic/超时、读取失败和抢租约冲突、快照修改隔离、监听者/Observer panic、损坏错误格式化方法、Observer 阶段兼容、筛选/重入退订、并发订阅变更、多分支、信号重复 Resolve、Sleep 与立即休眠。events_example_test.go 提供外部包筛选订阅示例。
+生成用例：tests/events_test.go 包含正常执行/回放精确事件序列、JSON 往返、ID 唯一性、拒绝/取消驱动、暂时/永久/panic/超时、读取失败和抢租约冲突、快照修改隔离、监听者/Observer panic、损坏错误格式化方法、Observer 阶段兼容、筛选/重入退订、并发订阅变更、多分支、信号重复 Resolve、Sleep 与立即休眠。example_test.go 提供外部包筛选订阅示例。
 
 验证结果：新增 3 个顶层测试与 1 个可执行示例，15 个子测试全部通过（go test -json 统计）。第一次生成、验证通过；补充冲突、坏错误格式化和示例后重新验证通过，未保留失败用例或放宽断言。
 
@@ -78,11 +78,11 @@ IO 副作用到结果提交之间仍存在不确定窗口，需要外部幂等�
 
 ## WaitAny 多路等待
 
-范围：FlowContext.WaitAny、可选 WaitAnyInfrastructure、MemoryInfrastructure 原子等待组、原 Resolve 的赢家选择与取消、Engine.FailWait、CANCEL 通知和双监听者清理示例。
+范围：FlowContext.WaitAny、可选 WaitAnyInfrastructure、memory.Infrastructure 原子等待组、原 Resolve 的赢家选择与取消、Engine.FailWait、CANCEL 通知和双监听者清理示例。
 
 缺陷分析：本次无确认的未修复缺陷。重点验证首个完成者唯一性、取消通知与请求清理、失败隔离、快照深拷贝、迟到回调和稳定回放。
 
-生成用例：wait_any_test.go 的 8 个子测试覆盖全部候选登记、赢家取消败者且后续 Action 只执行一次、同时回调仅接受一个赢家、单候选失败、全候选失败与唤醒、请求编码失败及 panic 隔离、非法拓扑无部分登记、旧适配器与 context 取消、请求/快照不可变及非法响应不改变赢家。wait_any_example_test.go 验证完整输出；examples/wait_any/main.go 提供双并行外部监听者的可运行清理程序。
+生成用例：tests/wait_any_test.go 的 8 个子测试覆盖全部候选登记、赢家取消败者且后续 Action 只执行一次、同时回调仅接受一个赢家、单候选失败、全候选失败与唤醒、请求编码失败及 panic 隔离、非法拓扑无部分登记、旧适配器与 context 取消、请求/快照不可变及非法响应不改变赢家。example_test.go 验证完整输出；examples/wait_any/main.go 提供双并行外部监听者的可运行清理程序。
 
 验证：新增测试首次生成/验证通过；增加 CANCEL 通知、快照边界后重新验证通过。`go test -race -count=1 -timeout=30s -cover ./workflow/... ./lease`、`go vet ./workflow/... ./lease`、`go test ./...`、`git diff --check` 均通过。最后一次 workflow 包级语句覆盖率为 89.5%，未要求的 CI 增量门禁跳过。utree flush 已执行。
 
@@ -92,7 +92,9 @@ IO 副作用到结果提交之间仍存在不确定窗口，需要外部幂等�
 
 WaitFor 和 Sleep 统一为 Signal 描述。保留原 WaitCase 泛型调用，新增 WaitForSignal、SleepSignal、SleepUntilSignal 构造器；WaitAnyResult 增加赢家 Kind。存储保存 Kind、Duration、Until、WinnerKind，相对定时截止时间只初始化一次。定时信号到期后按最早截止时间结算，迟到的响应或失败报告不能取代它。未知 Kind 由参考存储明确拒绝，自定义适配器可扩展新种类。
 
-signals_test.go 新增 7 个子测试：回复获胜取消定时、超时获胜与回放、迟到回调不可抢占、多个定时的最早截止时间、立即定时、失败外部信号与健康定时、未知种类无部分登记。signals_example_test.go 验证可运行的“回复或超时”示例。
+> 2026-10-17 更新：上述 WaitCase / WaitForSignal / SleepSignal / WaitAnyResult 已被异构 Case API 取代（`OnSignal[R]` / `OnKind[R]` / `OnSleep` / `OnSleepUntil`，`f.WaitAny(group, cases...)` 返回赢家 Case），存储格式与语义不变，测试已全部迁移。见 [WAIT_ANY.md](WAIT_ANY.md)。
+
+tests/signals_test.go 新增 7 个子测试：回复获胜取消定时、超时获胜与回放、迟到回调不可抢占、多个定时的最早截止时间、立即定时、失败外部信号与健康定时、未知种类无部分登记。example_test.go 验证可运行的“回复或超时”示例。
 
 验证：新增场景、旧 WaitAny 场景及示例均通过；`go test -race -count=1 -timeout=30s ./workflow/... ./lease` 与对应 vet 通过。覆盖率卡口未要求，未追加门禁。没有保留失败的 workflow 用例。
 
@@ -102,7 +104,7 @@ signals_test.go 新增 7 个子测试：回复获胜取消定时、超时获胜�
 
 缺陷分析：本次无确认的未修复缺陷。接口替换后原生函数不能直接作为 Action，初次编译检查按预期暴露未迁移调用；调用已适配为 AsAction 或具名 Action，没有降低类型安全。nil 入口在租约和步骤写入前统一拒绝。
 
-生成用例：action_test.go 的 4 个顶层测试、9 个子测试全部通过（go test -json 统计）。覆盖 ActionFn 的 context/input/output/error 转发、nil 函数、AsAction 类型推断、指针/值实现、Run/Go/Loop 回放及 15 个 nil 接入组合（3 条执行路径 × 5 类 nil）。既有错误、并发、轮询、WaitAny 和事件断言保留，函数调用仅增加适配。
+生成用例：tests/action_test.go 的 4 个顶层测试、9 个子测试全部通过（go test -json 统计）。覆盖 ActionFn 的 context/input/output/error 转发、nil 函数、AsAction 类型推断、指针/值实现、Run/Go/Loop 回放及 15 个 nil 接入组合（3 条执行路径 × 5 类 nil）。既有错误、并发、轮询、WaitAny 和事件断言保留，函数调用仅增加适配。
 
 验证结果：`go test -race -count=1 -timeout=60s -coverprofile=<临时路径> ./workflow/... ./lease` 通过；workflow 包级语句覆盖率 90.6%，debugger 71.6%，legacy 86.4%，lease 96.3%。`go vet ./workflow/... ./lease` 通过。新版视频模拟用例 race 测试通过；具名 Action 示例两次 Drive 仅查询一次 Repository。没有调用真实视频 API。
 
@@ -114,7 +116,7 @@ signals_test.go 新增 7 个子测试：回复获胜取消定时、超时获胜�
 
 以下为上一版递归方案的历史验证记录。当前三层调用规范禁止 Flow 嵌套，测试已迁移为平级并行场景，见本文“三层调用权限”。
 
-范围：GoFlow、RunFlow 的后代汇合与 Drive 挂起聚合，独立实例隔离、重复驱动、并发回调、混合 Sleep/WaitFor/WaitAny、异常与取消。测试位于 parallel_wait_test.go。
+范围：GoFlow、RunFlow 的后代汇合与 Drive 挂起聚合，独立实例隔离、重复驱动、并发回调、混合 Sleep/WaitFor/WaitAny、异常与取消。测试位于 tests/parallel_wait_test.go。
 
 缺陷分析：确认并修复一项 P1 完成边界缺陷。子 Flow 启动 GoFlow 后不 Wait，自身返回成功，原 Future/RunFlow 会提前报告成功；父 Flow 检查返回错误仍可能执行后续 Action，最终 Drive 才返回 Suspended。第一轮 `go test -count=1 -timeout=15s ./workflow -run '^TestNestedParallelWaits$'` 两个子场景均失败，稳定显示两个 pending 尚未完成而 continuation calls=1。不是死锁或测试时序问题。
 
@@ -136,7 +138,7 @@ signals_test.go 新增 7 个子测试：回复获胜取消定时、超时获胜�
 
 设计与缺陷分析：本轮为明确的架构约束变更，先前递归能力符合旧契约，不作为存量缺陷计数。新契约限定“顶层 → Flow → Action”，Flow 内 RunFlow/GoFlow、自调用、循环调用均禁止。私有 topLevel 权限仅在 Drive 根上下文设置，子上下文不继承。ErrFlowCallForbidden 包装 ErrInvalid；违规调用在 claim、任务创建和存储访问前拒绝，忽略错误也不能使 Drive 报告完成。
 
-生成及迁移用例：parallel_wait_test.go 的 4 个顶层入口、12 个子测试。权限测试覆盖顶层同步/异步挂载与 Flow 内同步/异步调用的四种组合，已完成错误 Future、忽略错误防护、不注册 key、无被调用步骤/租约/消息、自调用与循环调用。先前嵌套并行测试按新规范展平，继续验证 12 个独立实例 × 8 个平级 Flow 的等待恢复、重复回调、作用域隔离、16 个冗余驱动的通知幂等、Flow 内异步 Action 汇合与取消，以及两个平级 Flow 的 WaitAny 响应/超时竞争。engine_test.go 的执行点验证迁移为合法的顶层 → Flow → Action。
+生成及迁移用例：tests/parallel_wait_test.go 的 4 个顶层入口、12 个子测试。权限测试覆盖顶层同步/异步挂载与 Flow 内同步/异步调用的四种组合，已完成错误 Future、忽略错误防护、不注册 key、无被调用步骤/租约/消息、自调用与循环调用。先前嵌套并行测试按新规范展平，继续验证 12 个独立实例 × 8 个平级 Flow 的等待恢复、重复回调、作用域隔离、16 个冗余驱动的通知幂等、Flow 内异步 Action 汇合与取消，以及两个平级 Flow 的 WaitAny 响应/超时竞争。tests/engine_test.go 的执行点验证迁移为合法的顶层 → Flow → Action。
 
 验证：第一轮最小范围 race 通过，无未解释的编译或测试失败；全体新增场景连续 20 轮 race 通过，go test -json 统计为 4 个入口、12 个子测试、0 失败。`go test -race -count=1 -timeout=60s -coverprofile=<临时路径> ./workflow/...` 和 `go vet ./workflow/...` 全部通过。workflow 语句覆盖率 90.9%，debugger 71.6%，legacy 86.4%。未要求增量覆盖率门禁，跳过；未重跑其他包或真实第三方 API。
 

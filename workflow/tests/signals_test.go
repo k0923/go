@@ -1,23 +1,26 @@
-package workflow
+package tests
 
 import (
 	"context"
 	"errors"
 	"testing"
 	"time"
+
+	. "github.com/k0923/go/workflow"
+	"github.com/k0923/go/workflow/memory"
 )
 
 func TestWaitAnySignals(t *testing.T) {
 	ctx := context.Background()
-	newTimedEngine := func(t *testing.T, now *time.Time) (*MemoryInfrastructure, *Engine) {
-		store := NewMemoryInfrastructure()
-		store.now = func() time.Time { return *now }
+	newTimedEngine := func(t *testing.T, now *time.Time) (*memory.Infrastructure, *Engine) {
+		store := memory.New()
+		store.SetClock(func() time.Time { return *now })
 		return store, testEngine(t, store, Options{Now: func() time.Time { return *now }})
 	}
-	definitionWithTimeout := definition(FlowFunc[int, WaitAnyResult[string]](func(f *FlowContext, input int) (WaitAnyResult[string], error) {
-		return f.WaitAny[string]("signals",
-			WaitForSignal("callback", input),
-			SleepSignal("timeout", time.Hour),
+	definitionWithTimeout := definition(FlowFunc[int, waitOutcome](func(f *FlowContext, input int) (waitOutcome, error) {
+		return waitAnyOutcome(f, "signals",
+			OnSignal[string]("callback", input),
+			OnSleep("timeout", time.Hour),
 		)
 	}))
 
@@ -47,7 +50,7 @@ func TestWaitAnySignals(t *testing.T) {
 		}
 		messages, _ := store.Pending(ctx, now)
 		for _, message := range messages {
-			if message.Key == timer.Key && message.Purpose == WakeNotification {
+			if message.Key == timer.Key && message.Purpose == memory.WakeNotification {
 				t.Fatal("cancelled timer still scheduled")
 			}
 		}
@@ -102,8 +105,8 @@ func TestWaitAnySignals(t *testing.T) {
 		now := time.Now()
 		_, engine := newTimedEngine(t, &now)
 		deadline := now.Add(30 * time.Minute)
-		flow := definition(FlowFunc[int, WaitAnyResult[string]](func(f *FlowContext, _ int) (WaitAnyResult[string], error) {
-			return f.WaitAny[string]("timers", SleepSignal("late", time.Hour), SleepUntilSignal("early", deadline))
+		flow := definition(FlowFunc[int, waitOutcome](func(f *FlowContext, _ int) (waitOutcome, error) {
+			return waitAnyOutcome(f, "timers", OnSleep("late", time.Hour), OnSleepUntil("early", deadline))
 		}))
 		_, err := engine.Drive(ctx, flow, 0)
 		if err != nil {
@@ -118,8 +121,8 @@ func TestWaitAnySignals(t *testing.T) {
 	t.Run("immediate sleep completes registration atomically", func(t *testing.T) {
 		now := time.Now()
 		store, engine := newTimedEngine(t, &now)
-		flow := definition(FlowFunc[int, WaitAnyResult[string]](func(f *FlowContext, in int) (WaitAnyResult[string], error) {
-			return f.WaitAny[string]("signals", WaitForSignal("callback", in), SleepSignal("now", 0))
+		flow := definition(FlowFunc[int, waitOutcome](func(f *FlowContext, in int) (waitOutcome, error) {
+			return waitAnyOutcome(f, "signals", OnSignal[string]("callback", in), OnSleep("now", 0))
 		}))
 		result, err := engine.Drive(ctx, flow, 1)
 		if err != nil || result.Status != Completed || result.Output.Kind != SleepKind {
@@ -146,15 +149,15 @@ func TestWaitAnySignals(t *testing.T) {
 		}
 		now = now.Add(time.Hour)
 		result, err := engine.Drive(ctx, definitionWithTimeout, 1)
-		if err != nil || result.Output.Kind != SleepKind || len(result.Output.Failures) != 1 {
+		if err != nil || result.Output.Kind != SleepKind || result.Output.Failures != 1 {
 			t.Fatalf("%+v %v", result, err)
 		}
 	})
 	t.Run("custom kind rejected explicitly by reference store", func(t *testing.T) {
-		store := NewMemoryInfrastructure()
+		store := memory.New()
 		engine := testEngine(t, store, Options{})
-		flow := definition(FlowFunc[int, WaitAnyResult[string]](func(f *FlowContext, in int) (WaitAnyResult[string], error) {
-			return f.WaitAny[string]("signals", Signal{Key: "custom", Kind: Kind("CUSTOM"), Request: in})
+		flow := definition(FlowFunc[int, waitOutcome](func(f *FlowContext, in int) (waitOutcome, error) {
+			return waitAnyOutcome(f, "signals", OnKind[string](Kind("CUSTOM"), "custom", in))
 		}))
 		if _, err := engine.Drive(ctx, flow, 1); !errors.Is(err, ErrSignalUnsupported) {
 			t.Fatal(err)

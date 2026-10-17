@@ -3,6 +3,7 @@ package debugger
 import (
 	"bufio"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"net"
@@ -176,7 +177,7 @@ func TestStaleSuspensionRechecksDurableWait(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
 	flow := definition(func(fc *workflow.FlowContext, input int) (int, error) {
-		return fc.WaitFor[int]("approval", input)
+		return fc.WaitFor[int]("approval", input), nil
 	})
 	result, err := engine.Drive(ctx, flow, 1)
 	if err != nil {
@@ -325,5 +326,35 @@ func TestEventOutageRetainsBatchAndReportsIncompleteTimeline(t *testing.T) {
 	f.close()
 	if posts.Load() < 6 || !incomplete.Load() {
 		t.Fatalf("outage not retried or reported: posts=%d incomplete=%t", posts.Load(), incomplete.Load())
+	}
+}
+
+func TestStoreMigratesRecordsWithoutTypePath(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "old.db")
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The records table as it existed before Record.Type.
+	// Record.Type 引入之前的 records 表结构。
+	_, err = db.Exec(`CREATE TABLE records (run_id TEXT NOT NULL, key TEXT NOT NULL, kind TEXT NOT NULL,
+		status TEXT NOT NULL, version INTEGER NOT NULL, input BLOB, result BLOB, error TEXT NOT NULL DEFAULT '',
+		until INTEGER NOT NULL DEFAULT 0, started_at INTEGER NOT NULL DEFAULT 0, ended_at INTEGER NOT NULL DEFAULT 0,
+		updated_at INTEGER NOT NULL DEFAULT 0, group_key TEXT NOT NULL DEFAULT '', PRIMARY KEY (run_id, key));
+		INSERT INTO records (run_id, key, kind, status, version, input, result) VALUES ('old', 'step', 'ACTION', 'COMPLETED', 1, '1', '5')`)
+	db.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for range 2 { // reopening an upgraded database is a no-op
+		store, err := OpenStore(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		record, err := store.Get(context.Background(), "old", "step")
+		store.Close()
+		if err != nil || record == nil || record.Type != "" || string(record.Result) != "5" {
+			t.Fatalf("%+v %v", record, err)
+		}
 	}
 }

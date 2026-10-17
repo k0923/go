@@ -1,7 +1,6 @@
 package debugger
 
 import (
-	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
@@ -13,6 +12,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/k0923/go/workflow"
+	"github.com/k0923/go/workflow/memory"
 	_ "modernc.org/sqlite"
 )
 
@@ -53,6 +53,7 @@ CREATE TABLE IF NOT EXISTS records (
 	ended_at INTEGER NOT NULL DEFAULT 0,
 	updated_at INTEGER NOT NULL DEFAULT 0,
 	group_key TEXT NOT NULL DEFAULT '',
+	type_path TEXT NOT NULL DEFAULT '',
 	PRIMARY KEY (run_id, key)
 );
 CREATE TABLE IF NOT EXISTS leases (
@@ -103,10 +104,10 @@ const (
 )
 
 // Store is the SQLite state behind the server. All mutations run in one
-// serialized transaction, matching the atomicity MemoryInfrastructure gets
+// serialized transaction, matching the atomicity memory.Infrastructure gets
 // from its single mutex.
 // Store 是服务端背后的 SQLite 状态。所有变更都在一个串行事务中执行，
-// 与 MemoryInfrastructure 通过单个互斥锁获得的原子性保持一致。
+// 与 memory.Infrastructure 通过单个互斥锁获得的原子性保持一致。
 type Store struct {
 	db  *sql.DB
 	mu  sync.Mutex
@@ -133,6 +134,17 @@ func OpenStore(path string) (*Store, error) {
 		db.Close()
 		return nil, err
 	}
+	// Databases created before Record.Type lack the column; their records keep
+	// an empty type path and therefore strict input comparison.
+	// Record.Type 之前创建的数据库缺少该列；其中的记录类型路径为空，因此仍按输入严格比较。
+	var hasType int
+	if err = db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('records') WHERE name = 'type_path'`).Scan(&hasType); err == nil && hasType == 0 {
+		_, err = db.Exec(`ALTER TABLE records ADD COLUMN type_path TEXT NOT NULL DEFAULT ''`)
+	}
+	if err != nil {
+		db.Close()
+		return nil, err
+	}
 	return &Store{db: db, now: time.Now, hub: newHub()}, nil
 }
 
@@ -150,20 +162,6 @@ func tm(n int64) time.Time {
 		return time.Time{}
 	}
 	return time.Unix(0, n)
-}
-
-// sameRaw treats an absent payload and JSON null as equal: RawMessage(nil)
-// encodes as null and decodes back as the literal bytes "null".
-// sameRaw 将缺失负载和 JSON null 视为相等：RawMessage(nil) 会编码为 null，
-// 并解码回字面量字节 "null"。
-func sameRaw(a, b []byte) bool {
-	norm := func(raw []byte) []byte {
-		if string(raw) == "null" {
-			return nil
-		}
-		return raw
-	}
-	return bytes.Equal(norm(a), norm(b))
 }
 
 // blob scans a nullable BLOB into a JSON payload. json.RawMessage is not a
@@ -277,9 +275,9 @@ func (t *txn) record(key string) (*workflow.Record, string, error) {
 	var r workflow.Record
 	var group string
 	var until, started, ended int64
-	err := t.tx.QueryRow(`SELECT key, kind, status, version, input, result, error, until, started_at, ended_at, group_key
+	err := t.tx.QueryRow(`SELECT key, kind, status, version, type_path, input, result, error, until, started_at, ended_at, group_key
 		FROM records WHERE run_id = ? AND key = ?`, t.run, key).
-		Scan(&r.Key, &r.Kind, &r.Status, &r.Version, blob{&r.Input}, blob{&r.Result}, &r.Error, &until, &started, &ended, &group)
+		Scan(&r.Key, &r.Kind, &r.Status, &r.Version, &r.Type, blob{&r.Input}, blob{&r.Result}, &r.Error, &until, &started, &ended, &group)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, "", nil
 	}
@@ -293,9 +291,9 @@ func (t *txn) record(key string) (*workflow.Record, string, error) {
 
 func (t *txn) saveRecord(r *workflow.Record, group string) error {
 	_, err := t.exec(`INSERT OR REPLACE INTO records
-		(run_id, key, kind, status, version, input, result, error, until, started_at, ended_at, updated_at, group_key)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		t.run, r.Key, r.Kind, r.Status, r.Version, []byte(r.Input), []byte(r.Result), r.Error,
+		(run_id, key, kind, status, version, type_path, input, result, error, until, started_at, ended_at, updated_at, group_key)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		t.run, r.Key, r.Kind, r.Status, r.Version, r.Type, []byte(r.Input), []byte(r.Result), r.Error,
 		ts(r.Until), ts(r.StartedAt), ts(r.EndedAt), ts(t.now), group)
 	return err
 }
@@ -505,9 +503,9 @@ func (s *Store) Put(ctx context.Context, run string, r *workflow.Record) (stored
 		}
 		switch c.Kind {
 		case workflow.SignalKind:
-			err = t.enqueue(&c, workflow.RequestNotification, t.now)
+			err = t.enqueue(&c, memory.RequestNotification, t.now)
 		case workflow.SleepKind:
-			err = t.enqueue(&c, workflow.WakeNotification, c.Until)
+			err = t.enqueue(&c, memory.WakeNotification, c.Until)
 		}
 		fields := map[string]any{"kind": c.Kind, "status": c.Status, "record_version": c.Version}
 		if !c.Until.IsZero() {
@@ -576,11 +574,11 @@ func (t *txn) complete(r *workflow.Record, group string, response []byte) error 
 	}
 	// The request was answered; keep the delivery view honest.
 	// 请求已被回答；保持投递视图准确。
-	if err := t.closeMessages(c.Key, workflow.RequestNotification, msgDone); err != nil {
+	if err := t.closeMessages(c.Key, memory.RequestNotification, msgDone); err != nil {
 		return err
 	}
 	if c.Kind == workflow.SleepKind {
-		if err := t.closeMessages(c.Key, workflow.WakeNotification, msgRemoved); err != nil {
+		if err := t.closeMessages(c.Key, memory.WakeNotification, msgRemoved); err != nil {
 			return err
 		}
 	}
@@ -590,13 +588,13 @@ func (t *txn) complete(r *workflow.Record, group string, response []byte) error 
 			return err
 		}
 	}
-	return t.enqueue(&c, workflow.WakeNotification, t.now)
+	return t.enqueue(&c, memory.WakeNotification, t.now)
 }
 
-// ---- debugger.Delivery ----
-// ---- debugger.Delivery 接口实现 ----
+// ---- memory.Outbox ----
+// ---- memory.Outbox 接口实现 ----
 
-func (s *Store) Pending(ctx context.Context, run string, now time.Time) (result []workflow.Notification, err error) {
+func (s *Store) Pending(ctx context.Context, run string, now time.Time) (result []memory.Notification, err error) {
 	err = s.tx(ctx, run, func(t *txn) error {
 		result, err = t.pending(now, "")
 		return err
@@ -604,7 +602,7 @@ func (s *Store) Pending(ctx context.Context, run string, now time.Time) (result 
 	return result, err
 }
 
-func (t *txn) pending(now time.Time, purpose string) ([]workflow.Notification, error) {
+func (t *txn) pending(now time.Time, purpose string) ([]memory.Notification, error) {
 	query := `SELECT id, key, purpose, available_at FROM messages WHERE run_id = ? AND state = ? AND available_at <= ?`
 	args := []any{t.run, msgPending, ts(now)}
 	if purpose != "" {
@@ -616,9 +614,9 @@ func (t *txn) pending(now time.Time, purpose string) ([]workflow.Notification, e
 		return nil, err
 	}
 	defer rows.Close()
-	var result []workflow.Notification
+	var result []memory.Notification
 	for rows.Next() {
-		var n workflow.Notification
+		var n memory.Notification
 		var at int64
 		if err = rows.Scan(&n.ID, &n.Key, &n.Purpose, &at); err != nil {
 			return nil, err
@@ -641,14 +639,14 @@ func (s *Store) Ack(ctx context.Context, run, id string) error {
 // one becomes due (zero when none is scheduled).
 // nextWake 返回已到期的 WAKE 通知，或最早的未来通知到期时间
 // （没有计划通知时为零值）。
-func (s *Store) nextWake(ctx context.Context, run string) (due []workflow.Notification, next time.Time, err error) {
+func (s *Store) nextWake(ctx context.Context, run string) (due []memory.Notification, next time.Time, err error) {
 	err = s.tx(ctx, run, func(t *txn) error {
-		if due, err = t.pending(t.now, workflow.WakeNotification); err != nil || len(due) > 0 {
+		if due, err = t.pending(t.now, memory.WakeNotification); err != nil || len(due) > 0 {
 			return err
 		}
 		var at sql.NullInt64
 		err = t.tx.QueryRow(`SELECT MIN(available_at) FROM messages WHERE run_id = ? AND state = ? AND purpose = ?`,
-			run, msgPending, workflow.WakeNotification).Scan(&at)
+			run, msgPending, memory.WakeNotification).Scan(&at)
 		if at.Valid {
 			next = tm(at.Int64)
 		}
@@ -680,10 +678,7 @@ func (s *Store) WaitAny(ctx context.Context, run, key string, requests []workflo
 				return workflow.ErrChanged
 			}
 			for i, request := range requests {
-				old := existing.Requests[i]
-				if request.Key != old.Key || request.Kind != old.Kind || request.Duration != old.Duration ||
-					(request.Error == "") != (old.Error == "") ||
-					!request.Until.Equal(old.Until) || !sameRaw(request.Request, old.Request) {
+				if !workflow.SameWaitMember(existing.Requests[i], request) {
 					return workflow.ErrChanged
 				}
 			}
@@ -731,7 +726,7 @@ func (s *Store) WaitAny(ctx context.Context, run, key string, requests []workflo
 			request.Request = clone(request.Request)
 			g.Requests = append(g.Requests, request)
 			record := &workflow.Record{Key: request.Key, Kind: request.Kind, Status: workflow.Suspended,
-				Version: 1, Input: clone(request.Request), StartedAt: t.now}
+				Version: 1, Type: request.Type, Input: clone(request.Request), StartedAt: t.now}
 			if request.Error != "" {
 				record.Status, record.Error, record.EndedAt = workflow.Failed, request.Error, t.now
 			}
@@ -750,9 +745,9 @@ func (s *Store) WaitAny(ctx context.Context, run, key string, requests []workflo
 			}
 			g.State.Pending = append(g.State.Pending, pendingOf(record))
 			if record.Kind == workflow.SleepKind {
-				err = t.enqueue(record, workflow.WakeNotification, record.Until)
+				err = t.enqueue(record, memory.WakeNotification, record.Until)
 			} else {
-				err = t.enqueue(record, workflow.RequestNotification, t.now)
+				err = t.enqueue(record, memory.RequestNotification, t.now)
 			}
 			if err != nil {
 				return err
@@ -760,7 +755,7 @@ func (s *Store) WaitAny(ctx context.Context, run, key string, requests []workflo
 		}
 		if len(g.State.Pending) == 0 {
 			g.State.Status = workflow.Failed
-			if err = t.enqueueID(key+"|"+workflow.WakeNotification+"|failed", key, workflow.WakeNotification, t.now); err != nil {
+			if err = t.enqueueID(key+"|"+memory.WakeNotification+"|failed", key, memory.WakeNotification, t.now); err != nil {
 				return err
 			}
 		}
@@ -810,7 +805,7 @@ func (t *txn) settleGroup(key string, winner *workflow.Record) error {
 			if err = t.saveRecord(record, key); err != nil {
 				return err
 			}
-			if err = t.enqueue(record, workflow.CancelNotification, t.now); err != nil {
+			if err = t.enqueue(record, memory.CancelNotification, t.now); err != nil {
 				return err
 			}
 			t.log("store.cancel", record.Key, map[string]any{"kind": record.Kind, "status": record.Status, "group": key})
@@ -901,8 +896,8 @@ func (t *txn) failWait(key string, version int64, message string) (bool, error) 
 	}
 	if len(g.State.Pending) == 0 {
 		g.State.Status = workflow.Failed
-		id := fmt.Sprintf("%s|%s|failed", groupKey, workflow.WakeNotification)
-		if err = t.enqueueID(id, groupKey, workflow.WakeNotification, t.now); err != nil {
+		id := fmt.Sprintf("%s|%s|failed", groupKey, memory.WakeNotification)
+		if err = t.enqueueID(id, groupKey, memory.WakeNotification, t.now); err != nil {
 			return false, err
 		}
 	}
@@ -1057,8 +1052,8 @@ func (s *Store) FailMember(ctx context.Context, run, key, message string) (bool,
 func (s *Store) Redrive(ctx context.Context, run string) error {
 	return s.tx(ctx, run, func(t *txn) error {
 		t.log("debugger.redrive", run, nil)
-		return t.enqueueID(fmt.Sprintf("$manual|%s|%d", workflow.WakeNotification, t.now.UnixNano()),
-			"$run", workflow.WakeNotification, t.now)
+		return t.enqueueID(fmt.Sprintf("$manual|%s|%d", memory.WakeNotification, t.now.UnixNano()),
+			"$run", memory.WakeNotification, t.now)
 	})
 }
 
@@ -1202,7 +1197,7 @@ func (s *Store) Detail(ctx context.Context, run string) (*RunDetail, error) {
 		return nil, err
 	}
 	detail := &RunDetail{Run: info, Records: []RecordView{}, Groups: []GroupView{}, Messages: []MessageView{}, Now: s.now()}
-	rows, err := s.db.QueryContext(ctx, `SELECT key, kind, status, version, input, result, error, until, started_at, ended_at, updated_at, group_key
+	rows, err := s.db.QueryContext(ctx, `SELECT key, kind, status, version, type_path, input, result, error, until, started_at, ended_at, updated_at, group_key
 		FROM records WHERE run_id = ? ORDER BY started_at, rowid`, run)
 	if err != nil {
 		return nil, err
@@ -1210,7 +1205,7 @@ func (s *Store) Detail(ctx context.Context, run string) (*RunDetail, error) {
 	for rows.Next() {
 		var v RecordView
 		var until, started, ended, updated int64
-		if err = rows.Scan(&v.Key, &v.Kind, &v.Status, &v.Version, blob{&v.Input}, blob{&v.Result}, &v.Error,
+		if err = rows.Scan(&v.Key, &v.Kind, &v.Status, &v.Version, &v.Type, blob{&v.Input}, blob{&v.Result}, &v.Error,
 			&until, &started, &ended, &updated, &v.Group); err != nil {
 			rows.Close()
 			return nil, err

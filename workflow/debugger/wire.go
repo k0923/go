@@ -24,11 +24,11 @@
 package debugger
 
 import (
-	"context"
 	"encoding/json"
 	"time"
 
 	"github.com/k0923/go/workflow"
+	"github.com/k0923/go/workflow/memory"
 )
 
 // DefaultServer is the address used by Run and NewClient when none is given.
@@ -42,17 +42,6 @@ const (
 	RunCreated  = "CREATED"
 	RunRetrying = "RETRYING"
 )
-
-// Delivery is the debugger client-side queue API used by the worker loop.
-// A consumer must ACK only after durable handoff. On ErrConflict or transient
-// drive errors it retries the Wake message. Duplicate delivery is expected.
-// Delivery 是 debugger 客户端侧供 worker 循环使用的队列 API。消费者只能在持久化
-// 交接后 ACK。遇到 ErrConflict 或暂时性 drive 错误时会重试 Wake 消息。
-// 重复投递是预期行为。
-type Delivery interface {
-	Pending(context.Context, time.Time) ([]workflow.Notification, error)
-	Ack(context.Context, string) error
-}
 
 // RunSpec registers a run. An empty ID generates one. Reusing an ID resumes
 // the run: Drive replays durable records already stored on the server.
@@ -100,6 +89,7 @@ type RecordView struct {
 	Kind      workflow.Kind   `json:"kind"`
 	Status    workflow.Status `json:"status"`
 	Version   int64           `json:"version"`
+	Type      string          `json:"type,omitempty"`
 	Input     json.RawMessage `json:"input,omitempty"`
 	Result    json.RawMessage `json:"result,omitempty"`
 	Error     string          `json:"error,omitempty"`
@@ -192,7 +182,7 @@ type (
 	recordResponse        struct{ Record *RecordView }
 	leaseResponse         struct{ Lease *workflow.Lease }
 	boolResponse          struct{ OK bool }
-	notificationsResponse struct{ Notifications []workflow.Notification }
+	notificationsResponse struct{ Notifications []memory.Notification }
 	stateResponse         struct{ State *workflow.WaitAnyState }
 )
 
@@ -201,7 +191,7 @@ func toView(r *workflow.Record, group string) *RecordView {
 		return nil
 	}
 	return &RecordView{
-		Key: r.Key, Kind: r.Kind, Status: r.Status, Version: r.Version,
+		Key: r.Key, Kind: r.Kind, Status: r.Status, Version: r.Version, Type: r.Type,
 		Input: clone(r.Input), Result: clone(r.Result), Error: r.Error,
 		Until: r.Until, StartedAt: r.StartedAt, EndedAt: r.EndedAt, Group: group,
 	}
@@ -212,7 +202,7 @@ func fromView(v *RecordView) *workflow.Record {
 		return nil
 	}
 	return &workflow.Record{
-		Key: v.Key, Kind: v.Kind, Status: v.Status, Version: v.Version,
+		Key: v.Key, Kind: v.Kind, Status: v.Status, Version: v.Version, Type: v.Type,
 		Input: clone(v.Input), Result: clone(v.Result), Error: v.Error,
 		Until: v.Until, StartedAt: v.StartedAt, EndedAt: v.EndedAt,
 	}

@@ -32,7 +32,7 @@ result, err := debugger.Run(ctx, definition, input, debugger.Options{
    `SUSPENDED` 时长轮询等待 WAKE（UI 提交 JSON、Sleep 到期、手动 Re-drive）。
 
 只想要 Infrastructure、自己控制 Drive，用 `debugger.NewClient(server, runID)`。
-它同时实现了 `workflow.Infrastructure`、`workflow.Delivery`、`workflow.WaitAnyInfrastructure`。
+它同时实现了 `workflow.Infrastructure`、`memory.Outbox`、`workflow.WaitAnyInfrastructure`。
 
 ## UI 能做什么
 
@@ -49,7 +49,7 @@ UI 通过 SSE 实时刷新。样式使用 Tailwind CDN，首次打开需要能�
 
 ## 语义说明
 
-- 存储语义与 `MemoryInfrastructure` 一致：所有变更在单个 SQLite 事务中串行执行，
+- 存储语义与 `memory.Infrastructure` 一致：所有变更在单个 SQLite 事务中串行执行，
   租约按 generation 做 fencing，`Commit` 原子校验租约与版本。
 - 时间以 **Server 时钟** 为准（租约有效期、Sleep 到期）。本地调试时 worker 与 Server 同机，不存在时钟偏差。
 - UI 提交 JSON 等同于 `Engine.ResolveSignal`：只有第一次提交生效，WaitAny 中已取消/失败的成员忽略后续提交。

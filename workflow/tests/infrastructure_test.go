@@ -1,111 +1,14 @@
-package workflow
+package tests
 
 import (
 	"context"
 	"errors"
 	"testing"
 	"time"
-)
 
-func TestMemoryInfrastructure(t *testing.T) {
-	t.Run("fencing expiry CAS and deep copies", func(t *testing.T) {
-		now := time.Now()
-		m := NewMemoryInfrastructure()
-		m.now = func() time.Time { return now }
-		ctx := context.Background()
-		first, err := m.Claim(ctx, "step", time.Minute)
-		if err != nil {
-			t.Fatal(err)
-		}
-		r, err := m.Commit(ctx, *first, &Record{Key: "step", Kind: ActionKind, Status: Running, Input: []byte(`"input"`)}, 0)
-		if err != nil || r.Version != 1 {
-			t.Fatalf("%+v %v", r, err)
-		}
-		r.Input[1] = 'X'
-		fresh, _ := m.Get(ctx, "step")
-		if string(fresh.Input) != `"input"` {
-			t.Fatal("stored data mutated")
-		}
-		now = now.Add(time.Minute)
-		fresh.Status = Completed
-		fresh.Result = []byte(`7`)
-		if _, err := m.Commit(ctx, *first, fresh, 1); !errors.Is(err, ErrConflict) {
-			t.Fatal("expired owner committed", err)
-		}
-		second, err := m.Claim(ctx, "step", time.Minute)
-		if err != nil || second.Generation == first.Generation {
-			t.Fatalf("%+v %v", second, err)
-		}
-		if _, err := m.Commit(ctx, *first, fresh, 1); !errors.Is(err, ErrConflict) {
-			t.Fatal("zombie committed", err)
-		}
-		if err := m.Release(ctx, *first); !errors.Is(err, ErrConflict) {
-			t.Fatal(err)
-		}
-		if _, err := m.Renew(ctx, *first, time.Minute); !errors.Is(err, ErrConflict) {
-			t.Fatal(err)
-		}
-		renewed, err := m.Renew(ctx, *second, time.Hour)
-		if err != nil || !renewed.ExpiresAt.Equal(now.Add(time.Hour)) {
-			t.Fatalf("%+v %v", renewed, err)
-		}
-		if _, err := m.Commit(ctx, *second, fresh, 0); !errors.Is(err, ErrConflict) {
-			t.Fatal(err)
-		}
-		committed, err := m.Commit(ctx, *second, fresh, 1)
-		if err != nil || committed.Version != 2 || committed.Status != Completed {
-			t.Fatalf("%+v %v", committed, err)
-		}
-		if _, err := m.Commit(ctx, *second, committed, 2); !errors.Is(err, ErrConflict) {
-			t.Fatal("terminal rewritten", err)
-		}
-		if err := m.Release(ctx, *second); err != nil {
-			t.Fatal(err)
-		}
-	})
-	t.Run("resolve racing registration returns resolved snapshot", func(t *testing.T) {
-		m := NewMemoryInfrastructure()
-		ctx := context.Background()
-		request := &Record{Key: "callback", Kind: SignalKind, Status: Suspended, Input: []byte(`"request"`)}
-		stored, err := m.Put(ctx, request)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if _, err = m.Resolve(ctx, "callback", stored.Version, []byte(`"approved"`)); err != nil {
-			t.Fatal(err)
-		}
-		existing, err := m.Put(ctx, request)
-		if err != nil || existing.Status != Completed || string(existing.Result) != `"approved"` {
-			t.Fatalf("%+v %v", existing, err)
-		}
-		messages, _ := m.Pending(ctx, time.Now())
-		if len(messages) != 2 {
-			t.Fatal(messages)
-		}
-		if _, err := m.Put(ctx, &Record{Key: "callback", Kind: SleepKind, Status: Suspended}); !errors.Is(err, ErrChanged) {
-			t.Fatal(err)
-		}
-	})
-	t.Run("context cancellation rejects operations", func(t *testing.T) {
-		m := NewMemoryInfrastructure()
-		ctx, cancel := context.WithCancel(context.Background())
-		cancel()
-		_, getErr := m.Get(ctx, "x")
-		_, claimErr := m.Claim(ctx, "x", time.Second)
-		_, renewErr := m.Renew(ctx, Lease{}, time.Second)
-		releaseErr := m.Release(ctx, Lease{})
-		_, commitErr := m.Commit(ctx, Lease{}, &Record{}, 0)
-		_, putErr := m.Put(ctx, &Record{})
-		_, resolveErr := m.Resolve(ctx, "x", 1, nil)
-		_, pendingErr := m.Pending(ctx, time.Now())
-		ackErr := m.Ack(ctx, "x")
-		for _, err := range []error{getErr, claimErr, renewErr, releaseErr, commitErr, putErr, resolveErr, pendingErr, ackErr} {
-			if !errors.Is(err, context.Canceled) {
-				t.Fatalf("cancel lost: %v", err)
-			}
-		}
-	})
-}
+	. "github.com/k0923/go/workflow"
+	"github.com/k0923/go/workflow/memory"
+)
 
 type failingInfrastructure struct {
 	Infrastructure
@@ -146,7 +49,7 @@ func (s *failingInfrastructure) Release(ctx context.Context, l Lease) error {
 func TestEngineInfrastructureFailure(t *testing.T) {
 	t.Run("transient read and commit errors preserve running state", func(t *testing.T) {
 		for _, op := range []string{"Get", "Commit"} {
-			store := NewMemoryInfrastructure()
+			store := memory.New()
 			cause := errors.New("database unavailable")
 			fake := &failingInfrastructure{Infrastructure: store}
 			if op == "Get" {
@@ -170,7 +73,7 @@ func TestEngineInfrastructureFailure(t *testing.T) {
 		}
 	})
 	t.Run("renewal failure cancels action and never commits result", func(t *testing.T) {
-		store := NewMemoryInfrastructure()
+		store := memory.New()
 		cause := errors.New("renewal unavailable")
 		fake := &failingInfrastructure{Infrastructure: store, renewError: cause}
 		e := testEngine(t, fake, Options{LeaseTTL: 30 * time.Millisecond})
@@ -190,7 +93,7 @@ func TestEngineInfrastructureFailure(t *testing.T) {
 		}
 	})
 	t.Run("release failure visible after completed commit", func(t *testing.T) {
-		store := NewMemoryInfrastructure()
+		store := memory.New()
 		cause := errors.New("release unavailable")
 		fake := &failingInfrastructure{Infrastructure: store, releaseError: cause}
 		e := testEngine(t, fake, Options{})
@@ -209,9 +112,9 @@ func TestEngineInfrastructureFailure(t *testing.T) {
 		}
 	})
 	t.Run("signal registration failure does not claim lease", func(t *testing.T) {
-		store := NewMemoryInfrastructure()
+		store := memory.New()
 		e := testEngine(t, store, Options{})
-		flow := definition(FlowFunc[int, string](func(f *FlowContext, in int) (string, error) { return f.WaitFor[string]("signal", in) }))
+		flow := definition(FlowFunc[int, string](func(f *FlowContext, in int) (string, error) { return f.WaitFor[string]("signal", in), nil }))
 		// Initialize the definition first, then reject only signal writes.
 		// 先初始化定义，然后只拒绝 signal 写入。
 		first, err := e.Drive(context.Background(), flow, 0)
@@ -219,7 +122,7 @@ func TestEngineInfrastructureFailure(t *testing.T) {
 			t.Fatalf("%+v %v", first, err)
 		}
 		cause := errors.New("registration unavailable")
-		e.store = &signalFailingInfrastructure{Infrastructure: store, cause: cause}
+		e = testEngine(t, &signalFailingInfrastructure{Infrastructure: store, cause: cause}, Options{})
 		result, err := e.Drive(context.Background(), flow, 0)
 		if !errors.Is(err, cause) || result.Status != Running {
 			t.Fatalf("%+v %v", result, err)

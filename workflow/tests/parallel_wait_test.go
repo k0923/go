@@ -1,4 +1,4 @@
-package workflow
+package tests
 
 import (
 	"context"
@@ -12,6 +12,9 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	. "github.com/k0923/go/workflow"
+	"github.com/k0923/go/workflow/memory"
 )
 
 func TestFlowCallHierarchy(t *testing.T) {
@@ -57,15 +60,15 @@ func TestParallelFlowWaitRecovery(t *testing.T) {
 		now := func() time.Time { return time.Unix(0, clock.Load()) }
 		const runs, branches = 12, 8
 		type run struct {
-			store         *MemoryInfrastructure
+			store         *memory.Infrastructure
 			engine        *Engine
 			flow          Workflow[int, int]
 			before, after atomic.Int32
 		}
 		all := make([]*run, runs)
 		for i := range all {
-			r := &run{store: NewMemoryInfrastructure()}
-			r.store.now = now
+			r := &run{store: memory.New()}
+			r.store.SetClock(now)
 			r.engine = testEngine(t, r.store, Options{Now: now})
 			r.flow = NewWorkflow("test", "1", func(f *WorkflowContext, input int) (int, error) {
 				futures := make([]*Future[int], branches)
@@ -78,11 +81,9 @@ func TestParallelFlowWaitRecovery(t *testing.T) {
 							return 0, err
 						}
 						if index%2 == 0 {
-							if _, err := child.WaitFor[string]("reply", input); err != nil {
-								return 0, err
-							}
-						} else if err := child.Sleep("sleep", time.Hour); err != nil {
-							return 0, err
+							child.WaitFor[string]("reply", input)
+						} else {
+							child.Sleep("sleep", time.Hour)
 						}
 						return child.Run("after", AsAction(func(context.Context, int) (int, error) {
 							r.after.Add(1)
@@ -165,10 +166,7 @@ func TestParallelFlowWaitRecovery(t *testing.T) {
 							}
 						}
 					}
-					r.store.mu.Lock()
-					leases := len(r.store.leases)
-					r.store.mu.Unlock()
-					if leases != 0 {
+					if leases, _, _, _ := r.store.Stats(); leases != 0 {
 						t.Error("lease leaked")
 					}
 				}(index, r)
@@ -182,22 +180,36 @@ func TestParallelFlowWaitRecovery(t *testing.T) {
 			}
 		}
 	})
-	t.Run("same scope rejects different input", func(t *testing.T) {
-		engine := testEngine(t, NewMemoryInfrastructure(), Options{})
-		flow := definition(FlowFunc[int, string](func(f *FlowContext, input int) (string, error) { return f.WaitFor[string]("reply", input) }))
-		first, err := engine.Drive(context.Background(), flow, 1)
+	t.Run("same scope replays a changed request and rejects a changed type", func(t *testing.T) {
+		store := memory.New()
+		engine := testEngine(t, store, Options{})
+		var changed atomic.Int32
+		defer engine.Subscribe(func(context.Context, Event) { changed.Add(1) }, InputChanged)()
+		request := 1
+		flow := definition(FlowFunc[int, string](func(f *FlowContext, _ int) (string, error) { return f.WaitFor[string]("reply", request), nil }))
+		first, err := engine.Drive(context.Background(), flow, 0)
 		if err != nil || first.Status != Suspended {
 			t.Fatalf("%+v %v", first, err)
 		}
-		_, err = engine.Drive(context.Background(), flow, 2)
-		if !errors.Is(err, ErrChanged) {
+		// The changed request is observed but not re-sent: the wait stays the same.
+		// 变化的请求会被观测但不会重发：等待保持不变。
+		request = 2
+		second, err := engine.Drive(context.Background(), flow, 0)
+		record, _ := store.Get(context.Background(), "reply")
+		if err != nil || second.Status != Suspended || record == nil || string(record.Input) != "1" || changed.Load() != 1 {
+			t.Fatalf("%+v %v %+v changed=%d", second, err, record, changed.Load())
+		}
+		typed := definition(FlowFunc[int, string](func(f *FlowContext, _ int) (string, error) {
+			return fmt.Sprint(f.WaitFor[int]("reply", request)), nil
+		}))
+		if _, err = engine.Drive(context.Background(), typed, 0); !errors.Is(err, ErrChanged) {
 			t.Fatal(err)
 		}
 	})
 	t.Run("redundant drives enqueue one request and one wake", func(t *testing.T) {
-		store := NewMemoryInfrastructure()
+		store := memory.New()
 		engine := testEngine(t, store, Options{})
-		flow := definition(FlowFunc[int, string](func(f *FlowContext, input int) (string, error) { return f.WaitFor[string]("reply", input) }))
+		flow := definition(FlowFunc[int, string](func(f *FlowContext, input int) (string, error) { return f.WaitFor[string]("reply", input), nil }))
 		for stage := range 2 {
 			var wg sync.WaitGroup
 			for range 16 {
@@ -224,10 +236,10 @@ func TestParallelFlowWaitRecovery(t *testing.T) {
 			}
 			requests, wakes := 0, 0
 			for _, message := range messages {
-				if message.Purpose == RequestNotification {
+				if message.Purpose == memory.RequestNotification {
 					requests++
 				}
-				if message.Purpose == WakeNotification {
+				if message.Purpose == memory.WakeNotification {
 					wakes++
 				}
 			}
@@ -248,7 +260,7 @@ func TestParallelFlowWaitRecovery(t *testing.T) {
 func TestFlowScopeJoinsActions(t *testing.T) {
 	for _, mode := range []string{"RunFlow", "GoFlow"} {
 		t.Run(mode+" joins unwaited Action failure", func(t *testing.T) {
-			engine := testEngine(t, NewMemoryInfrastructure(), Options{})
+			engine := testEngine(t, memory.New(), Options{})
 			cause := errors.New("action failed")
 			child := FlowFunc[int, int](func(f *FlowContext, input int) (int, error) {
 				f.Go("failed", AsAction(func(context.Context, int) (int, error) { return 0, cause }), input)
@@ -278,7 +290,7 @@ func TestFlowScopeJoinsActions(t *testing.T) {
 	t.Run("cancelled child joins IO and retains durable wait", func(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
-		store := NewMemoryInfrastructure()
+		store := memory.New()
 		engine := testEngine(t, store, Options{})
 		started, stopped := make(chan struct{}), make(chan struct{})
 		engine.Subscribe(func(context.Context, Event) { cancel() }, WaitSuspended)
@@ -290,8 +302,8 @@ func TestFlowScopeJoinsActions(t *testing.T) {
 				return 0, ctx.Err()
 			}), input)
 			<-started
-			_, err := f.WaitFor[string]("reply", input)
-			return 0, err
+			f.WaitFor[string]("reply", input)
+			return 0, nil
 		})
 		root := NewWorkflow("test", "1", func(f *WorkflowContext, input int) (int, error) { return f.GoFlow("child", child, input).Wait() })
 		result, err := engine.Drive(ctx, root, 1)
@@ -303,7 +315,8 @@ func TestFlowScopeJoinsActions(t *testing.T) {
 		default:
 			t.Fatal("IO not joined")
 		}
-		if len(store.leases) != 0 || store.records["child|reply"].Status != Suspended {
+		reply, _ := store.Get(context.Background(), "child|reply")
+		if leases, _, _, _ := store.Stats(); leases != 0 || reply.Status != Suspended {
 			t.Fatal("lease leak or signal lost")
 		}
 	})
@@ -313,12 +326,12 @@ func TestParallelFlowWaitAny(t *testing.T) {
 	var clock atomic.Int64
 	clock.Store(time.Now().UnixNano())
 	now := func() time.Time { return time.Unix(0, clock.Load()) }
-	store := NewMemoryInfrastructure()
-	store.now = now
+	store := memory.New()
+	store.SetClock(now)
 	engine := testEngine(t, store, Options{Now: now})
 	candidate := FlowFunc[int, string](func(f *FlowContext, input int) (string, error) {
-		winner, err := f.WaitAny[string]("race", WaitForSignal("reply", input), SleepSignal("timeout", time.Hour))
-		return string(winner.Kind), err
+		winner := f.WaitAny("race", OnSignal[string]("reply", input), OnSleep("timeout", time.Hour))
+		return string(winner.Kind()), nil
 	})
 	root := NewWorkflow("test", "1", func(f *WorkflowContext, input int) (string, error) {
 		left := f.GoFlow("left", candidate, input)

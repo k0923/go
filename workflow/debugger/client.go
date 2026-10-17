@@ -13,13 +13,14 @@ import (
 	"time"
 
 	"github.com/k0923/go/workflow"
+	"github.com/k0923/go/workflow/memory"
 )
 
-// Client is a workflow.Infrastructure (plus debugger Delivery and
+// Client is a workflow.Infrastructure (plus memory.Outbox and
 // WaitAnyInfrastructure) bound to ONE run on a debugger server. Create one
 // Client per run.
 // Client 是绑定到 debugger server 上单个运行的 workflow.Infrastructure
-// （另加 debugger Delivery 和 WaitAnyInfrastructure）。每个运行应创建一个 Client。
+// （另加 memory.Outbox 和 WaitAnyInfrastructure）。每个运行应创建一个 Client。
 type Client struct {
 	base string
 	run  string
@@ -28,7 +29,7 @@ type Client struct {
 
 var (
 	_ workflow.Infrastructure        = (*Client)(nil)
-	_ Delivery                       = (*Client)(nil)
+	_ memory.Outbox                  = (*Client)(nil)
 	_ workflow.WaitAnyInfrastructure = (*Client)(nil)
 )
 
@@ -168,7 +169,7 @@ func (c *Client) Resolve(ctx context.Context, key string, version int64, respons
 	return out.OK, err
 }
 
-func (c *Client) Pending(ctx context.Context, now time.Time) ([]workflow.Notification, error) {
+func (c *Client) Pending(ctx context.Context, now time.Time) ([]memory.Notification, error) {
 	var out notificationsResponse
 	err := c.infra(ctx, "pending", pendingRequest{Now: now}, &out)
 	return out.Notifications, err
@@ -262,7 +263,7 @@ func (c *Client) Detail(ctx context.Context) (*RunDetail, error) {
 
 // WaitWake blocks until a WAKE notification is due or timeout elapses.
 // WaitWake 会阻塞，直到 WAKE 通知到期或超时结束。
-func (c *Client) WaitWake(ctx context.Context, timeout time.Duration) ([]workflow.Notification, error) {
+func (c *Client) WaitWake(ctx context.Context, timeout time.Duration) ([]memory.Notification, error) {
 	var out notificationsResponse
 	err := c.call(ctx, http.MethodGet, "/wake?timeout="+url.QueryEscape(timeout.String()), nil, &out)
 	return out.Notifications, err

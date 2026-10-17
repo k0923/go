@@ -21,6 +21,12 @@ const (
 	ActionReplayed EventType = "action_replayed"
 	WaitSuspended  EventType = "wait_suspended"
 	WaitResolved   EventType = "wait_resolved"
+	// InputChanged warns that a replayed step's input differs from the
+	// persisted one. Replay identity is key + kind + type, so the persisted
+	// outcome is still returned; the drive does not fail.
+	// InputChanged 警告回放步骤的输入与持久化输入不同。回放身份是 key + kind + type，
+	// 因此仍返回持久化结果；drive 不会失败。
+	InputChanged EventType = "input_changed"
 )
 
 // Event is a versioned, JSON-serializable observation, not a durable outbox
@@ -182,7 +188,7 @@ func describeEventError(err error) (result *EventError) {
 	var operation *OperationError
 	var leaseErr *lease.Error
 	var permanent *PermanentError
-	var replay *ReplayError
+	var business *ActionError
 	var panicErr *PanicError
 	hasOperation := errors.As(err, &operation)
 	hasLease := errors.As(err, &leaseErr)
@@ -204,10 +210,12 @@ func describeEventError(err error) (result *EventError) {
 		result.Category = "infrastructure"
 	case hasLease:
 		result.Category = "lease"
-	case errors.As(err, &replay):
-		result.Category = "replay"
 	case errors.As(err, &permanent):
 		result.Category = "permanent"
+	case errors.As(err, &business):
+		// Committed business failure: replayed, or retries exhausted.
+		// 已提交的业务失败：回放得到，或重试已用尽。
+		result.Category = "business"
 	case errors.Is(err, ErrInvalid):
 		result.Category = "invalid"
 	case errors.Is(err, ErrChanged):

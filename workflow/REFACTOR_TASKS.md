@@ -40,6 +40,7 @@
 
 - [x] WaitFor/Sleep 信号描述与混合 WaitAny
 - [x] 定时截止时间稳定、超时结算、赢家 Kind 及兼容旧 WaitCase
+- [x] WaitAny 改为异构 Case API（各 Case 独立响应类型，返回赢家 Case），移除 WaitCase / WaitForSignal / SleepSignal
 - [x] 7 个新增场景及混合示例通过，旧 WaitAny 测试保持通过
 - [x] workflow/lease race 和 vet 通过；全仓 fluent 包编译状态已记录
 - [x] 类型注释、使用文档和验证报告已更新

@@ -104,20 +104,20 @@ var prepareFlow = workflow.FlowFunc[Order, Summary](func(f *workflow.FlowContext
 	if _, err := f.Run("validate", workflow.AsAction(validate), order); err != nil {
 		return summary, err
 	}
-	approval, err := f.WaitFor[Approval]("approval", map[string]any{
+	// No error to check: until the UI answers, WaitFor halts this Flow.
+	// 无需检查错误：在 UI 回答之前，WaitFor 会停止此 Flow。
+	approval := f.WaitFor[Approval]("approval", map[string]any{
 		"order": order, "question": "Approve this order?",
 	})
-	if err != nil {
-		return summary, err
-	}
 	summary.Approval = approval
 	if !approval.Approved {
-		return summary, workflow.Permanent(fmt.Errorf("rejected by %s: %s", approval.By, approval.Reason))
+		// A returned error is terminal; no Permanent wrapper is needed in Flow code.
+		// 返回的 error 即为终态；Flow 代码中无需包装 Permanent。
+		return summary, fmt.Errorf("rejected by %s: %s", approval.By, approval.Reason)
 	}
-	if summary.Payment, err = f.Run("charge", workflow.AsAction(charge), order); err != nil {
-		return summary, err
-	}
-	return summary, nil
+	payment, err := f.Run("charge", workflow.AsAction(charge), order)
+	summary.Payment = payment
+	return summary, err
 })
 
 func orchestrateOrder(w *workflow.WorkflowContext, order Order) (Summary, error) {
@@ -130,18 +130,16 @@ func orchestrateOrder(w *workflow.WorkflowContext, order Order) (Summary, error)
 	notice := w.GoFlow("notify", workflow.FlowFunc[string, string](func(f *workflow.FlowContext, id string) (string, error) {
 		// Acks are typed in by hand in the debugger, so accept any JSON shape.
 		// ack 是在 debugger 中手动输入的，因此接受任意 JSON 形状。
-		winner, err := f.WaitAny[json.RawMessage]("channel",
-			workflow.WaitForSignal("email_ack", map[string]string{"order": id, "channel": "email"}),
-			workflow.WaitForSignal("sms_ack", map[string]string{"order": id, "channel": "sms"}),
-			workflow.SleepSignal("give_up", 2*time.Minute),
-		)
-		if err != nil {
-			return "", err
+		email := workflow.OnSignal[json.RawMessage]("email_ack", map[string]string{"order": id, "channel": "email"})
+		sms := workflow.OnSignal[json.RawMessage]("sms_ack", map[string]string{"order": id, "channel": "sms"})
+		winner := f.WaitAny("channel", email, sms, workflow.OnSleep("give_up", 2*time.Minute))
+		switch winner {
+		case email:
+			return winner.Key() + ": " + string(email.Value()), nil
+		case sms:
+			return winner.Key() + ": " + string(sms.Value()), nil
 		}
-		if winner.Kind == workflow.SleepKind {
-			return "no acknowledgement", nil
-		}
-		return winner.Key + ": " + string(winner.Response), nil
+		return "no acknowledgement", nil
 	}), order.ID)
 
 	shipping := workflow.FlowFunc[string, Shipment](func(f *workflow.FlowContext, id string) (Shipment, error) {
@@ -156,7 +154,8 @@ func orchestrateOrder(w *workflow.WorkflowContext, order Order) (Summary, error)
 		return summary, err
 	}
 	cooldown := workflow.FlowFunc[Summary, Summary](func(f *workflow.FlowContext, summary Summary) (Summary, error) {
-		return summary, f.Sleep("cooldown", 5*time.Second)
+		f.Sleep("cooldown", 5*time.Second)
+		return summary, nil
 	})
 	return w.RunFlow("finish", cooldown, summary)
 }

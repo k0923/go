@@ -8,6 +8,7 @@ import (
 	"sync"
 
 	"github.com/k0923/go/workflow"
+	"github.com/k0923/go/workflow/memory"
 )
 
 func main() {
@@ -18,22 +19,22 @@ func main() {
 
 func run() error {
 	ctx := context.Background()
-	store := workflow.NewMemoryInfrastructure()
+	store := memory.New()
 	engine, err := workflow.NewEngine(store, workflow.Options{})
 	if err != nil {
 		return err
 	}
 	flow := workflow.FlowFunc[string, string](func(f *workflow.FlowContext, input string) (string, error) {
-		winner, err := f.WaitAny[string]("providers",
-			workflow.WaitCase[string]{Key: "primary", Request: input},
-			workflow.WaitCase[string]{Key: "secondary", Request: input},
-		)
-		if err != nil {
-			return "", err
+		primary := workflow.OnSignal[string]("primary", input)
+		secondary := workflow.OnSignal[string]("secondary", input)
+		winner := f.WaitAny("providers", primary, secondary)
+		answer := secondary.Value()
+		if winner == primary {
+			answer = primary.Value()
 		}
 		// Downstream work starts without waiting for the other response.
 		// 下游工作会立即开始，而不会等待另一个响应。
-		return f.Run("continue", workflow.Pure(func(answer string) string { return "continued: " + answer }), winner.Response)
+		return f.Run("continue", workflow.Pure(func(answer string) string { return "continued: " + answer }), answer)
 	})
 	definition := workflow.NewWorkflow("approval", "1", func(w *workflow.WorkflowContext, input string) (string, error) {
 		return w.RunFlow("main", flow, input)

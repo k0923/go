@@ -1,50 +1,116 @@
 package workflow
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sync/atomic"
 	"time"
 )
 
-// WaitCase describes a signal. A zero Kind means an external WaitFor signal,
-// preserving existing callers. Duration is used only for relative Sleep;
-// a nonzero Until selects an absolute sleep deadline.
-// WaitCase 描述一个信号。Kind 为零值表示外部 WaitFor 信号，以保持现有调用方兼容。
-// Duration 仅用于相对 Sleep；非零 Until 表示绝对睡眠截止时间。
-type WaitCase[R any] struct {
-	Key      string
-	Request  R
-	Kind     Kind
-	Duration time.Duration
-	Until    time.Time
+// Case is one WaitAny candidate built with OnSignal, OnKind, OnSleep or
+// OnSleepUntil. Every case carries its OWN response type. WaitAny returns the
+// winning Case itself, so compare it with the cases you passed:
+//
+//	reply := workflow.OnSignal[Reply]("reply", request)
+//	timeout := workflow.OnSleep("timeout", time.Hour)
+//	switch f.WaitAny("reply_or_timeout", reply, timeout) {
+//	case reply:
+//		return reply.Value().Text, nil
+//	case timeout:
+//		return "timeout", nil
+//	}
+//
+// A Case is single-use: build it inside the Flow for every WaitAny call.
+// Case 是 WaitAny 的一个候选项，由 OnSignal、OnKind、OnSleep 或 OnSleepUntil 构造。
+// 每个候选项都有自己的响应类型。WaitAny 返回获胜的 Case 本身，因此直接与传入的
+// 候选项比较即可（见上例）。
+//
+// Case 只能使用一次：每次调用 WaitAny 时都要在 Flow 内部重新构造。
+type Case interface {
+	// Key is the resolved storage key once WaitAny ran, the local key before.
+	// Key 在 WaitAny 执行后是解析后的存储 key，之前是局部 key。
+	Key() string
+	Kind() Kind
+	// Failure is this candidate's isolated error; empty if it did not fail.
+	// Failure 是该候选项被隔离的错误；未失败时为空。
+	Failure() string
+	member() *waitCase
 }
 
-// Signal is the heterogeneous, transportable description accepted by WaitAny.
-// Custom kinds require an Infrastructure implementation supporting their
-// registration and resolution semantics; unknown kinds are never silently
-// treated as WaitFor by the reference memory store.
-// Signal 是 WaitAny 接受的异构、可传输描述。自定义 Kind 需要 Infrastructure
-// 实现支持其注册和解析语义；参考内存存储绝不会把未知 Kind 静默当作 WaitFor 处理。
-type Signal = WaitCase[any]
-
-// WaitForSignal describes a signal resolved by an external JSON response.
-// WaitForSignal 描述由外部 JSON 响应解析的信号。
-func WaitForSignal[R any](key string, request R) Signal {
-	return Signal{Key: key, Kind: SignalKind, Request: request}
+type waitCase struct {
+	key      string
+	kind     Kind
+	typ      string // leaf type segment, e.g. "signal[Request,Response]"
+	duration time.Duration
+	until    time.Time
+	encode   func() (json.RawMessage, error) // nil for timers
+	decode   func(json.RawMessage) error     // nil for timers
+	failure  string
+	used     atomic.Bool
 }
 
-// SleepSignal describes a timer whose relative deadline is fixed on registration.
-// SleepSignal 描述一个在注册时固定相对截止时间的计时器。
-func SleepSignal(key string, duration time.Duration) Signal {
-	return Signal{Key: key, Kind: SleepKind, Duration: duration}
+func (c *waitCase) Key() string       { return c.key }
+func (c *waitCase) Kind() Kind        { return c.kind }
+func (c *waitCase) Failure() string   { return c.failure }
+func (c *waitCase) member() *waitCase { return c }
+
+// SignalCase is answered by an external JSON response decoded as Response.
+// SignalCase 由外部 JSON 响应完成，响应会解码为 Response。
+type SignalCase[Response any] struct {
+	waitCase
+	value Response
 }
 
-// SleepUntilSignal describes a timer with an absolute deadline.
-// SleepUntilSignal 描述一个具有绝对截止时间的计时器。
-func SleepUntilSignal(key string, until time.Time) Signal {
-	return Signal{Key: key, Kind: SleepKind, Until: until}
+// Value is the decoded response: the zero value unless this case won.
+// Value 是解码后的响应：只有该候选项获胜时才非零值。
+func (c *SignalCase[Response]) Value() Response { return c.value }
+
+// OnSignal describes a WaitFor candidate. Response is explicit, Request is
+// inferred: OnSignal[Approval]("approval", order).
+// OnSignal 描述一个 WaitFor 候选项。Response 需显式指定，Request 自动推断：
+// OnSignal[Approval]("approval", order)。
+func OnSignal[Response, Request any](key string, request Request) *SignalCase[Response] {
+	return OnKind[Response](SignalKind, key, request)
+}
+
+// OnKind describes a payload-bearing candidate of a custom kind. The
+// Infrastructure must support its registration and resolution; the reference
+// memory store rejects unknown kinds with ErrSignalUnsupported instead of
+// silently treating them as WaitFor.
+// OnKind 描述一个自定义 Kind 的携带负载候选项。Infrastructure 必须支持其注册与解析；
+// 参考内存存储会以 ErrSignalUnsupported 拒绝未知 Kind，而不会静默当作 WaitFor。
+func OnKind[Response, Request any](kind Kind, key string, request Request) *SignalCase[Response] {
+	if kind == "" {
+		kind = SignalKind
+	}
+	c := &SignalCase[Response]{}
+	c.key, c.kind, c.typ = key, kind, signature[Request, Response]("signal")
+	c.encode = func() (json.RawMessage, error) { return json.Marshal(request) }
+	c.decode = func(raw json.RawMessage) error { return decode(raw, &c.value) }
+	return c
+}
+
+// SleepCase fires when its deadline passes; it carries no response.
+// SleepCase 在截止时间到达时触发；它不携带响应。
+type SleepCase struct{ waitCase }
+
+// OnSleep describes a timer whose relative deadline is fixed on registration.
+// OnSleep 描述一个在注册时固定相对截止时间的计时器。
+func OnSleep(key string, duration time.Duration) *SleepCase {
+	c := &SleepCase{}
+	c.key, c.kind, c.typ, c.duration = key, SleepKind, "sleep", duration
+	return c
+}
+
+// OnSleepUntil describes a timer with an absolute deadline.
+// OnSleepUntil 描述一个具有绝对截止时间的计时器。
+func OnSleepUntil(key string, until time.Time) *SleepCase {
+	c := &SleepCase{}
+	c.key, c.kind, c.typ, c.until = key, SleepKind, "sleep", until
+	return c
 }
 
 type WaitFailure struct {
@@ -52,20 +118,16 @@ type WaitFailure struct {
 	Message string
 }
 
-type WaitAnyResult[R any] struct {
-	Key string // resolved winner key, e.g. approval|primary
-	// 已解析的赢家 key，例如 approval|primary。
-	Kind Kind // SleepKind winners have a zero Response, not a JSON payload
-	// SleepKind 赢家的 Response 为零值，而不是 JSON 负载。
-	Response R
-	Failures []WaitFailure // isolated candidate errors; not a drive failure
-	// 被隔离的候选项错误；不属于驱动失败。
-}
-
 // WaitRequest is the transport representation consumed by storage adapters.
 // WaitRequest 是存储适配器消费的传输层表示。
 type WaitRequest struct {
-	Key      string
+	Key string
+	// Type is the member's type path (see Record.Type). When the stored request
+	// has one, replay identity is Key + Kind + Type: Request, Duration, Until
+	// and encoding failure are inputs fixed by the first registration.
+	// Type 是成员的类型路径（见 Record.Type）。已存储的请求带 Type 时，回放身份为
+	// Key + Kind + Type：Request、Duration、Until 及编码是否失败都是以首次注册为准的输入。
+	Type     string `json:",omitempty"`
 	Request  json.RawMessage
 	Kind     Kind
 	Duration time.Duration
@@ -73,6 +135,36 @@ type WaitRequest struct {
 	// Error isolates an unusable request while preserving its ordered identity.
 	// Error 隔离不可用请求，同时保留其有序身份。
 	Error string `json:",omitempty"`
+}
+
+// SameWaitMember reports whether a re-submitted member matches the stored
+// one. Storage adapters use it for every member, in order. A stored request
+// without Type predates type identity and is compared strictly.
+// SameWaitMember 判断重新提交的成员是否与已存储成员匹配。存储适配器按顺序对每个
+// 成员使用它。没有 Type 的已存储请求早于类型身份，按严格方式比较。
+func SameWaitMember(stored, request WaitRequest) bool {
+	if request.Key != stored.Key || request.Kind != stored.Kind {
+		return false
+	}
+	if stored.Type != "" {
+		return request.Type == stored.Type
+	}
+	return request.Duration == stored.Duration && request.Until.Equal(stored.Until) &&
+		(request.Error == "") == (stored.Error == "") && sameJSON(request.Request, stored.Request)
+}
+
+// sameJSON treats an absent payload and JSON null as equal, because a nil
+// RawMessage round-trips through JSON transports as the literal "null".
+// sameJSON 将缺失负载与 JSON null 视为相等，因为 nil RawMessage 经 JSON 传输往返后
+// 会变成字面量 "null"。
+func sameJSON(a, b json.RawMessage) bool {
+	norm := func(raw json.RawMessage) json.RawMessage {
+		if string(raw) == "null" {
+			return nil
+		}
+		return raw
+	}
+	return bytes.Equal(norm(a), norm(b))
 }
 
 type WaitAnyState struct {
@@ -88,8 +180,8 @@ type WaitAnyState struct {
 // remain source-compatible; WaitAny requires an adapter implementing this API.
 //
 // WaitAny atomically registers ALL signals + request notifications, or reads an
-// existing group's snapshot after checking its ordered keys and request bytes.
-// Group ownership must be persisted. The existing Resolve operation MUST, in
+// existing group's snapshot after checking every ordered member with
+// SameWaitMember. Group ownership must be persisted. The existing Resolve operation MUST, in
 // the same transaction, choose the first successful member, cancel every other
 // pending member, remove obsolete notifications and enqueue CANCEL notifications
 // for external providers. Subsequent callbacks cannot
@@ -102,7 +194,7 @@ type WaitAnyState struct {
 // WaitAnyInfrastructure 是可选接口。现有 Infrastructure 实现保持源码兼容；
 // WaitAny 需要适配器实现此 API。
 //
-// WaitAny 会原子地注册所有信号和请求通知，或在检查有序 key 与请求字节后读取
+// WaitAny 会原子地注册所有信号和请求通知，或在用 SameWaitMember 按顺序检查每个成员后读取
 // 现有等待组快照。组归属必须持久化。现有 Resolve 操作必须在同一个事务中选择
 // 第一个成功成员、取消所有其他 pending 成员、移除过期通知，并为外部提供方
 // 入队 CANCEL 通知。后续回调不能覆盖赢家，也不能复活已取消的成员。
@@ -118,105 +210,115 @@ type WaitAnyInfrastructure interface {
 var ErrWaitAnyUnsupported = errors.New("infrastructure does not support WaitAny")
 var ErrSignalUnsupported = errors.New("signal kind unsupported")
 
-// WaitAny registers all candidates simultaneously. It returns a suspended error
-// until one signal completes; Engine.Drive reports ALL pending keys. The first
-// accepted callback cancels losers immediately in storage. On the next Drive
-// the workflow resumes and returns the durable winner, without awaiting losers.
+// WaitAny registers all candidates simultaneously. Until one completes it
+// halts the calling orchestration; Engine.Drive reports ALL pending keys. The
+// first accepted callback cancels losers immediately in storage. On the next
+// Drive the workflow resumes and WaitAny returns the durable winner: one of
+// the cases passed in, with its Value decoded (timers carry no value).
 //
-// Invalid key topology is rejected before registration. A candidate whose
-// request cannot be encoded is isolated in Failures while healthy cases remain.
-// Payload-bearing signals share response type R; callbacks must send matching
-// JSON. A Sleep winner has Kind=SleepKind and a zero response.
-// WaitAny 会同时注册所有候选项。在某个信号完成前，它返回 suspended 错误；
-// Engine.Drive 会报告所有 pending key。第一个被接受的回调会立即在存储中
-// 取消失败方。下一次 Drive 时，工作流会恢复并返回持久化的赢家，而不会等待失败方。
+// Like WaitFor and Sleep it returns no error: candidates are external signals,
+// not business steps. A candidate failure (FailWait, unencodable request) only
+// drops that candidate (see Case.Failure); when NO candidate remains the drive
+// fails terminally with ErrWaitFailed. To let the Flow degrade, have the
+// provider answer with a typed failure value, or add a timer candidate.
+// Invalid key topology and reused cases are rejected before registration.
+// WaitAny 会同时注册所有候选项。在某个候选项完成前，它会停止调用方编排；
+// Engine.Drive 会报告所有 pending key。第一个被接受的回调会立即在存储中取消失败方。
+// 下一次 Drive 时工作流恢复，WaitAny 返回持久化的赢家：即传入的某个 Case，
+// 其 Value 已解码（计时器不携带值）。
 //
-// 无效 key 拓扑会在注册前被拒绝。请求无法编码的候选项会被隔离到 Failures 中，
-// 同时保留健康的候选项。携带负载的信号共享响应类型 R；回调必须发送匹配的 JSON。
-// Sleep 赢家的 Kind=SleepKind，响应为零值。
-func (f *FlowContext) WaitAny[R, Q any](key string, cases ...WaitCase[Q]) (result WaitAnyResult[R], err error) {
-	defer f.remember(&err)
-	group, err := f.claim(key)
-	if err != nil {
-		return result, err
-	}
+// 与 WaitFor、Sleep 一样不返回 error：候选项是外部信号，而不是业务步骤。候选项失败
+// （FailWait、请求无法编码）只会剔除该候选项（见 Case.Failure）；没有候选项剩余时，
+// drive 以 ErrWaitFailed 终态失败。如需让 Flow 降级，请由提供方回答一个类型化的失败值，
+// 或加入计时器候选项。无效 key 拓扑和被重复使用的 Case 会在注册前被拒绝。
+func (f *FlowContext) WaitAny(key string, cases ...Case) Case {
+	group := f.claim(key)
 	api, ok := f.execution.engine.store.(WaitAnyInfrastructure)
 	if !ok {
-		return result, ErrWaitAnyUnsupported
+		f.must(ErrWaitAnyUnsupported)
 	}
 	if len(cases) == 0 {
-		return result, fmt.Errorf("%w: empty waiting group", ErrInvalid)
+		f.must(fmt.Errorf("%w: empty waiting group", ErrInvalid))
 	}
-	child := &FlowContext{execution: f.execution, prefix: group, scope: f.scope}
+	members := make([]*waitCase, len(cases))
+	for i, candidate := range cases {
+		if candidate == nil {
+			f.must(fmt.Errorf("%w: nil case", ErrInvalid))
+		}
+		member := candidate.member()
+		if (member.kind == SleepKind) != (member.encode == nil) {
+			f.must(fmt.Errorf("%w: case %q has kind %s", ErrInvalid, member.key, member.kind))
+		}
+		if !member.used.CompareAndSwap(false, true) {
+			f.must(fmt.Errorf("%w: case %q reused; build cases inside the Flow", ErrInvalid, member.key))
+		}
+		members[i] = member
+	}
 	// Validate every key before any external registration.
 	// 在任何外部注册发生前验证每个 key。
-	keys := make([]string, len(cases))
-	for i, candidate := range cases {
-		keys[i], err = child.claim(candidate.Key)
-		if err != nil {
-			return result, err
-		}
+	child := &FlowContext{execution: f.execution, prefix: group, types: f.typePath("any"), scope: f.scope, strand: f.strand}
+	index := make(map[string]int, len(members))
+	for i, member := range members {
+		member.key = child.claim(member.key)
+		index[member.key] = i
 	}
-	var requests []WaitRequest
-	for i, candidate := range cases {
-		kind := candidate.Kind
-		if kind == "" {
-			kind = SignalKind
+	requests := make([]WaitRequest, len(members))
+	for i, member := range members {
+		request := WaitRequest{Key: member.key, Type: child.typePath(member.typ), Kind: member.kind,
+			Duration: member.duration, Until: member.until}
+		if member.encode != nil {
+			raw, marshalErr := invoke(member.encode)
+			request.Request = raw
+			if marshalErr != nil {
+				request.Error = marshalErr.Error()
+			}
 		}
-		var raw json.RawMessage
-		var marshalErr error
-		if kind != SleepKind {
-			raw, marshalErr = invoke(func() (json.RawMessage, error) { return json.Marshal(candidate.Request) })
-		}
-		request := WaitRequest{
-			Key: keys[i], Request: raw, Kind: kind,
-			Duration: candidate.Duration, Until: candidate.Until,
-		}
-		if marshalErr != nil {
-			request.Error = marshalErr.Error()
-		}
-		requests = append(requests, request)
+		requests[i] = request
 	}
 	state, stateErr := api.WaitAny(f.Context(), group, requests)
 	if stateErr != nil {
-		return result, &OperationError{group, "WaitAny", stateErr}
+		f.must(&OperationError{group, "WaitAny", stateErr})
 	}
 	if state == nil {
-		return result, fmt.Errorf("%w: nil WaitAny snapshot", ErrInvalid)
+		f.must(fmt.Errorf("%w: nil WaitAny snapshot", ErrInvalid))
 	}
-	result.Failures = append([]WaitFailure(nil), state.Failures...)
+	for _, failure := range state.Failures {
+		i, known := index[failure.Key]
+		if !known {
+			f.must(fmt.Errorf("%w: unknown failed member %s", ErrInvalid, failure.Key))
+		}
+		members[i].failure = failure.Message
+	}
 	switch state.Status {
 	case Completed:
-		result.Key = state.WinnerKey
-		result.Kind = state.WinnerKind
-		if result.Kind == "" {
-			result.Kind = SignalKind
+		kind := state.WinnerKind
+		if kind == "" {
+			kind = SignalKind
 		}
-		if result.Kind == SleepKind {
-			return result, nil
+		i, known := index[state.WinnerKey]
+		if !known || kind != members[i].kind {
+			f.must(fmt.Errorf("%w: winner %s (%s)", ErrChanged, state.WinnerKey, kind))
 		}
-		err = json.Unmarshal(state.Response, &result.Response)
-		return result, err
+		if members[i].decode != nil {
+			f.must(members[i].decode(state.Response))
+		}
+		return cases[i]
 	case Failed:
-		return result, Permanent(fmt.Errorf("wait group %s failed: %v", group, state.Failures))
+		f.abort(fatal(fmt.Errorf("%w: %s: %v", ErrWaitFailed, group, state.Failures)))
 	case Suspended:
 		if len(state.Pending) == 0 {
-			return result, fmt.Errorf("%w: suspended group has no pending members", ErrInvalid)
+			f.must(fmt.Errorf("%w: suspended group has no pending members", ErrInvalid))
 		}
-		f.execution.mu.Lock()
-		for _, pending := range state.Pending {
-			f.execution.pending[pending.Key] = pending
-		}
-		f.execution.mu.Unlock()
 		for _, pending := range state.Pending {
 			f.execution.engine.emit(f.Context(), Event{Type: WaitSuspended, Key: pending.Key, Kind: pending.Kind,
 				Status: Suspended, Pending: []Pending{pending},
 			}, nil)
 		}
-		return result, &SuspendedError{Pending: state.Pending[0]}
+		f.suspend(state.Pending...)
 	default:
-		return result, ErrInvalid
+		f.must(ErrInvalid)
 	}
+	panic("unreachable")
 }
 
 // FailWait reports an independent candidate failure. It does not return a

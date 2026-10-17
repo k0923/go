@@ -2,6 +2,7 @@ package workflow
 
 import (
 	"context"
+	"time"
 
 	"github.com/k0923/go/lease"
 )
@@ -27,14 +28,34 @@ type Infrastructure interface {
 	Commit(context.Context, Lease, *Record, int64) (*Record, error)
 	// Put inserts a checkpoint, definition or waiting record if absent, or
 	// returns the existing record. It never overwrites a resolved signal.
-	// For Signal/Sleep, registration AND notification insertion are atomic.
+	// For Signal/Sleep, registration AND its delivery intent are atomic.
 	// Put 在记录不存在时插入 checkpoint、definition 或 waiting 记录，否则返回已有记录。
-	// 它绝不会覆盖已解析的 signal。对于 Signal/Sleep，注册和通知插入是原子的。
+	// 它绝不会覆盖已解析的 signal。对于 Signal/Sleep，注册和其投递意图是原子的。
 	Put(context.Context, *Record) (*Record, error)
 	// Resolve checks suspended status, kind and version; commits the response
-	// AND a distinct Wake notification atomically. Already resolved is a no-op
-	// returning false. A stale version returns ErrConflict.
-	// Resolve 检查 suspended 状态、kind 和版本；并原子地提交响应以及一个独立的 Wake 通知。
-	// 已解析时不执行操作并返回 false。过期版本返回 ErrConflict。
+	// AND a distinct wake-up intent atomically, so the caller's dispatcher can
+	// Drive the run again. Already resolved is a no-op returning false. A stale
+	// version returns ErrConflict. How delivery is exposed (an outbox, MQ, ...)
+	// is the adapter's choice; see package memory for a reference outbox.
+	// Resolve 检查 suspended 状态、kind 和版本；并原子地提交响应以及一个独立的唤醒意图，
+	// 以便调用方的调度器再次 Drive。已解析时不执行操作并返回 false。过期版本返回 ErrConflict。
+	// 投递如何暴露（outbox、MQ 等）由适配器决定；参考 outbox 见 memory 包。
 	Resolve(context.Context, string, int64, []byte) (bool, error)
+}
+
+// RecordLister is OPTIONAL. When implemented, Drive loads the run's records in
+// one call and replays terminal outcomes (finished Actions, resolved waits,
+// checkpoints) without a per-step Get. Returned records must be deep copies.
+// RecordLister 是可选接口。实现后，Drive 会一次性加载 run 的记录，并在不逐步 Get
+// 的情况下回放终态结果（已结束的 Action、已解析的等待、检查点）。返回的记录必须是深拷贝。
+type RecordLister interface {
+	Records(context.Context) ([]*Record, error)
+}
+
+// Clock is OPTIONAL. When Options.Now is nil, NewEngine uses the store's clock
+// so Sleep deadlines and lease expiry are judged by the same time source.
+// Clock 是可选接口。Options.Now 为空时，NewEngine 使用存储时钟，使 Sleep 截止时间与
+// 租约过期由同一时间源判断。
+type Clock interface {
+	Now() time.Time
 }

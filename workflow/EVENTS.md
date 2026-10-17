@@ -1,6 +1,6 @@
 # 对外可观测事件
 
-通过 `Engine.Subscribe(listener, types...)` 订阅，不需要替换现有 Observer。省略 types 订阅全部类型，指定 types 只接收对应事件；返回一个可重复调用的退订函数。
+通过 `Engine.Subscribe(listener, types...)` 订阅（这是唯一的观测入口，旧 Observer 已移除）。省略 types 订阅全部类型，指定 types 只接收对应事件；返回一个可重复调用的退订函数。
 
 ```go
 unsubscribe := engine.Subscribe(func(ctx context.Context, event workflow.Event) {
@@ -18,7 +18,7 @@ unsubscribe := engine.Subscribe(func(ctx context.Context, event workflow.Event) 
 defer unsubscribe()
 ```
 
-完整可执行示例见 `events_example_test.go`。业务、监控和埋点系统可以分别注册独立监听者。
+完整可执行示例见 `example_test.go`。业务、监控和埋点系统可以分别注册独立监听者。
 
 ## 触发时机与条件
 
@@ -31,8 +31,9 @@ defer unsubscribe()
 | ActionReplayed | 读取到 COMPLETED 或 FAILED 的持久化记录，使用该记录回放 | 每次回放一次；解码失败也带 Error；不同时触发 ActionStarted |
 | WaitSuspended | WaitFor/Sleep 成功取得持久化等待记录，判断仍需等待 | 每次经过未解决等待点一次；同一 key 不同 Drive 属于不同观察事件 |
 | WaitResolved | ResolveSignal 或 Sleep 到期时，存储 Resolve 返回 true 且无错误 | 每次实际接受的 Resolve 一次；重复/陈旧/失败回调和已完成 Sleep 回放不触发 |
+| InputChanged | 带类型路径的记录按 key + Kind + 类型通过回放校验，但本次输入 JSON 与持久化输入不同；仍使用持久化结果（重新执行被中断的 Action 时改用本次输入） | 每个此类回放点一次，不改变 Drive 结果；无类型路径的旧记录按严格比较以 `ErrChanged` 失败，不触发 |
 
-ActionReplayed 与 ActionFinished 表达不同阶段，不是重复执行事件。Loop 每个 attempt 是独立 Action；Go/GoFlow 分支采用相同触发规则。Flow 挂载、检查点和租约续租不单独发事件，本次接口范围是驱动、Action 及等待生命周期。
+ActionReplayed 与 ActionFinished 表达不同阶段，不是重复执行事件。Loop 每个 attempt 是独立 Action；Go/GoFlow 分支采用相同触发规则。Flow 挂载、检查点和租约续租不单独发事件，本次接口范围是驱动、Action 及等待生命周期。InputChanged 是告警而不是错误：它提示代码改变了某个步骤的输入构造方式，而在途实例仍沿用旧输入的结果；WaitAny 成员的请求变化由存储比较，不发此事件。
 
 每次 Drive 有独立 ExecutionID；重驱同一个实例会生成新的 ExecutionID。外部 ResolveSignal 不属于一个 Drive，ExecutionID/WorkflowName/WorkflowVersion 为空，监听方按引擎与实例范围内的 Key 关联。
 
@@ -62,7 +63,7 @@ Drive Duration 包括参数校验、初始化和执行。Action Duration 包括�
 
 Action 成功提交后 Release 失败：ActionFinished.Status 仍为 COMPLETED，同时 Error 记录 Release 故障；Drive 返回可重试错误。记录状态与本次调用错误是两个不同维度。
 
-Error.Category 包括 execution、panic、conflict、cancelled、timeout、infrastructure、lease、replay、permanent、invalid、changed。错误合并时按该实现中的优先级选择类别，Message 保留完整合并文本，Operation 尽可能保留存储/租约操作名。
+Error.Category 包括 execution、panic、conflict、cancelled、timeout、infrastructure、lease、permanent、business、invalid、changed。错误合并时按该实现中的优先级选择类别，Message 保留完整合并文本，Operation 尽可能保留存储/租约操作名。
 
 事件不包含业务 input/output 或凭证字段。应用的 error 文本仍可能包含敏感信息，业务应避免将凭证写入错误；监控接入也应遵循自身脱敏规则。
 
@@ -71,7 +72,7 @@ Error.Category 包括 execution、panic、conflict、cancelled、timeout、infra
 - 同步通知：一次事件在 API 返回前通知当前快照中的全部匹配监听者，不使用可能丢消息的有界异步通道。
 - 并发分支可能同时通知，监听者必须线程安全。Sequence 是生成顺序，不承诺不同 goroutine 的到达顺序。
 - 每个监听者收到独立的 Pending/Error 副本，修改不会影响其他监听者或执行结果。
-- 单个监听者 panic 被隔离，后续监听者继续通知；旧 Observer 的 panic 也独立隔离。
+- 单个监听者 panic 被隔离，后续监听者继续通知。
 - 不持订阅锁调用监听者，可以在回调中订阅或退订。
 - 退订幂等；已经取得订阅快照的通知可以在退订后完成。新注册者不接收已取得快照的事件，也不接收历史事件。
 - 同一个函数注册两次视为两个订阅，会分别通知。监听者可以用 ID 去重自己的上报。
@@ -82,6 +83,6 @@ Error.Category 包括 execution、panic、conflict、cancelled、timeout、infra
 
 ## 向后兼容
 
-Options.Observer、Observer、Observation 的公开签名与原有 phase 保持不变；已有接入方不需要改代码。没有订阅时原功能照常执行。新事件通过新增 Subscribe 接口独立发布，不向旧 Observer 增加 Sleep/Resolve 等新阶段。
+`Options.Observer` / `Observation` 已移除，原接入方改用 Subscribe（`action_started` 等类型名与旧 phase 相同）。没有订阅时原功能照常执行。错误分类新增 `business`（已提交业务失败，回放或重试耗尽），替代旧的 `replay`。
 
 SchemaVersion=1 的字段与 EventType 常量是公开契约。未来新增字段或类型应保持已有字段语义，监听者应允许未知事件类型。旧版 workflow/legacy 的 API 不受本次改动影响。

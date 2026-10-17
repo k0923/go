@@ -3,8 +3,10 @@ package workflow_test
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/k0923/go/workflow"
+	"github.com/k0923/go/workflow/memory"
 )
 
 type OrderFlow struct{}
@@ -23,11 +25,11 @@ func (OrderFlow) Run(ctx *workflow.FlowContext, orderID string) (string, error) 
 	if err != nil {
 		return "", err
 	}
-	return ctx.WaitFor[string]("approval", submitted)
+	return ctx.WaitFor[string]("approval", submitted), nil
 }
 
 func ExampleEngine_Drive() {
-	store := workflow.NewMemoryInfrastructure()
+	store := memory.New()
 	engine, err := workflow.NewEngine(store, workflow.Options{})
 	if err != nil {
 		panic(err)
@@ -63,4 +65,126 @@ func exampleDefinition[I, O any](name, version string, flow workflow.Flow[I, O])
 	return workflow.NewWorkflow(name, version, func(ctx *workflow.WorkflowContext, input I) (O, error) {
 		return ctx.RunFlow("main", flow, input)
 	})
+}
+
+func ExampleEngine_Subscribe() {
+	engine, err := workflow.NewEngine(memory.New(), workflow.Options{})
+	if err != nil {
+		panic(err)
+	}
+	unsubscribe := engine.Subscribe(func(_ context.Context, event workflow.Event) {
+		fmt.Println(event.Type, event.Key, event.Status)
+	}, workflow.ActionFinished, workflow.DriveFinished)
+	defer unsubscribe()
+
+	definition := exampleDefinition("demo", "1",
+		workflow.FlowFunc[int, int](func(ctx *workflow.FlowContext, input int) (int, error) {
+			return ctx.Run("increment", workflow.Pure(func(n int) int { return n + 1 }), input)
+		}),
+	)
+	if _, err := engine.Drive(context.Background(), definition, 1); err != nil {
+		panic(err)
+	}
+	// Output:
+	// action_finished main|increment COMPLETED
+	// drive_finished demo COMPLETED
+}
+
+func ExampleOnSignal() {
+	// Every case has its own response type; a timer carries none.
+	// 每个候选项都有自己的响应类型；计时器不携带响应。
+	type reply struct{ Text string }
+	ctx := context.Background()
+	store := memory.New()
+	engine, err := workflow.NewEngine(store, workflow.Options{})
+	if err != nil {
+		panic(err)
+	}
+	flow := exampleDefinition("reply_or_timeout", "1",
+		workflow.FlowFunc[string, string](func(f *workflow.FlowContext, request string) (string, error) {
+			answer := workflow.OnSignal[reply]("reply", request)
+			timeout := workflow.OnSleep("timeout", time.Hour)
+			winner := f.WaitAny("signals", answer, timeout)
+			if winner == timeout {
+				return "timeout", nil
+			}
+			return answer.Value().Text, nil
+		}),
+	)
+	waiting, err := engine.Drive(ctx, flow, "request")
+	if err != nil {
+		panic(err)
+	}
+	fmt.Println("waiting signals:", len(waiting.Pending))
+	record, err := store.Get(ctx, "main|signals|reply")
+	if err != nil {
+		panic(err)
+	}
+	if _, err = engine.ResolveSignal(ctx, record.Key, record.Version, reply{Text: "answer"}); err != nil {
+		panic(err)
+	}
+	completed, err := engine.Drive(ctx, flow, "request")
+	if err != nil {
+		panic(err)
+	}
+	timeout, err := store.Get(ctx, "main|signals|timeout")
+	if err != nil {
+		panic(err)
+	}
+	fmt.Println("completed:", completed.Output)
+	fmt.Println("timeout:", timeout.Status)
+	// Output:
+	// waiting signals: 2
+	// completed: answer
+	// timeout: CANCELLED
+}
+
+func ExampleFlowContext_WaitAny() {
+	ctx := context.Background()
+	store := memory.New()
+	engine, err := workflow.NewEngine(store, workflow.Options{})
+	if err != nil {
+		panic(err)
+	}
+	definition := exampleDefinition("approval", "1",
+		workflow.FlowFunc[string, string](func(f *workflow.FlowContext, input string) (string, error) {
+			primary := workflow.OnSignal[string]("primary", input)
+			secondary := workflow.OnSignal[string]("secondary", input)
+			winner := f.WaitAny("providers", primary, secondary)
+			switch winner {
+			case primary:
+				return winner.Key() + ": " + primary.Value(), nil
+			default:
+				return winner.Key() + ": " + secondary.Value(), nil
+			}
+		}),
+	)
+	waiting, err := engine.Drive(ctx, definition, "order_123")
+	if err != nil {
+		panic(err)
+	}
+	fmt.Println(waiting.Status, len(waiting.Pending))
+	// Both requests are durable and available for independent providers.
+	// 两个请求都是持久化的，并且可供独立提供方使用。
+	secondary, err := store.Get(ctx, "main|providers|secondary")
+	if err != nil {
+		panic(err)
+	}
+	if _, err = engine.ResolveSignal(ctx, secondary.Key, secondary.Version, "approved"); err != nil {
+		panic(err)
+	}
+	primary, err := store.Get(ctx, "main|providers|primary")
+	if err != nil {
+		panic(err)
+	}
+	fmt.Println("primary:", primary.Status)
+	completed, err := engine.Drive(ctx, definition, "order_123")
+	if err != nil {
+		panic(err)
+	}
+	fmt.Println(completed.Status, completed.Output)
+	// Output:
+	// SUSPENDED 2
+	// primary: CANCELLED
+	// COMPLETED main|providers|secondary: approved
 }

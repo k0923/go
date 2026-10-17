@@ -1,31 +1,64 @@
-package workflow
+package tests
 
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
+
+	. "github.com/k0923/go/workflow"
+	"github.com/k0923/go/workflow/memory"
 )
 
-func anyWaitFlow() Workflow[int, WaitAnyResult[string]] {
-	return definition(FlowFunc[int, WaitAnyResult[string]](func(f *FlowContext, input int) (WaitAnyResult[string], error) {
-		return f.WaitAny[string]("race", WaitCase[int]{Key: "a", Request: input}, WaitCase[int]{Key: "b", Request: input})
+// waitOutcome flattens a WaitAny result for assertions.
+// waitOutcome 将 WaitAny 结果展平，便于断言。
+type waitOutcome struct {
+	Key      string
+	Kind     Kind
+	Response string
+	Failures int
+}
+
+func waitAnyOutcome(f *FlowContext, key string, cases ...Case) (waitOutcome, error) {
+	winner := f.WaitAny(key, cases...)
+	var outcome waitOutcome
+	for _, candidate := range cases {
+		if candidate.Failure() != "" {
+			outcome.Failures++
+		}
+	}
+	outcome.Key, outcome.Kind = winner.Key(), winner.Kind()
+	if signal, ok := winner.(*SignalCase[string]); ok {
+		outcome.Response = signal.Value()
+	}
+	return outcome, nil
+}
+
+func anyWaitFlow() Workflow[int, waitOutcome] {
+	return definition(FlowFunc[int, waitOutcome](func(f *FlowContext, input int) (waitOutcome, error) {
+		return waitAnyOutcome(f, "race", OnSignal[string]("a", input), OnSignal[string]("b", input))
 	}))
 }
 
 func TestFlowContextWaitAny(t *testing.T) {
 	t.Run("all registered winner cancels losers and continues", func(t *testing.T) {
 		ctx := context.Background()
-		store := NewMemoryInfrastructure()
+		store := memory.New()
 		e := testEngine(t, store, Options{})
 		calls := 0
 		flow := definition(FlowFunc[int, string](func(f *FlowContext, input int) (string, error) {
-			winner, err := f.WaitAny[string]("race", WaitCase[int]{Key: "a", Request: input}, WaitCase[int]{Key: "b", Request: input})
-			if err != nil {
-				return "", err
+			a, b := OnSignal[string]("a", input), OnSignal[string]("b", input)
+			winner := f.WaitAny("race", a, b)
+			var answer string
+			switch winner {
+			case a:
+				answer = a.Value()
+			case b:
+				answer = b.Value()
 			}
-			return f.Run("after", AsAction(func(context.Context, int) (string, error) { calls++; return winner.Key + ":" + winner.Response, nil }), input)
+			return f.Run("after", AsAction(func(context.Context, int) (string, error) { calls++; return winner.Key() + ":" + answer, nil }), input)
 		}))
 		for i := 0; i < 2; i++ {
 			result, err := e.Drive(ctx, flow, 1)
@@ -56,7 +89,7 @@ func TestFlowContextWaitAny(t *testing.T) {
 		for _, message := range messages {
 			counts[message.Purpose]++
 		}
-		if len(messages) != 2 || counts[WakeNotification] != 1 || counts[CancelNotification] != 1 || counts[RequestNotification] != 0 {
+		if len(messages) != 2 || counts[memory.WakeNotification] != 1 || counts[memory.CancelNotification] != 1 || counts[memory.RequestNotification] != 0 {
 			t.Fatal("missing wake/cancel or residual requests", messages)
 		}
 		if ok, err := e.ResolveSignal(ctx, a.Key, 1, "late"); ok || err != nil {
@@ -74,7 +107,7 @@ func TestFlowContextWaitAny(t *testing.T) {
 	})
 	t.Run("simultaneous callbacks accept one winner", func(t *testing.T) {
 		ctx := context.Background()
-		store := NewMemoryInfrastructure()
+		store := memory.New()
 		e := testEngine(t, store, Options{})
 		if _, err := e.Drive(ctx, anyWaitFlow(), 1); err != nil {
 			t.Fatal(err)
@@ -124,7 +157,7 @@ func TestFlowContextWaitAny(t *testing.T) {
 	})
 	t.Run("candidate failure leaves healthy wait active", func(t *testing.T) {
 		ctx := context.Background()
-		store := NewMemoryInfrastructure()
+		store := memory.New()
 		e := testEngine(t, store, Options{})
 		_, _ = e.Drive(ctx, anyWaitFlow(), 1)
 		if ok, err := e.FailWait(ctx, "race|a", 1, errors.New("provider unavailable")); !ok || err != nil {
@@ -142,27 +175,38 @@ func TestFlowContextWaitAny(t *testing.T) {
 			t.Fatal(err)
 		}
 		result, err = e.Drive(ctx, anyWaitFlow(), 1)
-		if err != nil || result.Output.Response != "healthy" || len(result.Output.Failures) != 1 {
+		if err != nil || result.Output.Response != "healthy" || result.Output.Failures != 1 {
 			t.Fatalf("%+v %v", result, err)
 		}
 	})
-	t.Run("all failed wakes and fails group", func(t *testing.T) {
+	t.Run("all failed wakes and fails the drive terminally", func(t *testing.T) {
 		ctx := context.Background()
-		store := NewMemoryInfrastructure()
+		store := memory.New()
 		e := testEngine(t, store, Options{})
-		_, _ = e.Drive(ctx, anyWaitFlow(), 1)
+		after := 0
+		// The Flow cannot observe the group failure: like WaitFor it is a signal,
+		// so nothing after WaitAny runs and the drive itself fails.
+		// Flow 无法观察到组失败：与 WaitFor 一样它只是信号，WaitAny 之后的代码不会执行，
+		// 由 drive 本身失败。
+		flow := definition(FlowFunc[int, waitOutcome](func(f *FlowContext, input int) (waitOutcome, error) {
+			outcome, err := waitAnyOutcome(f, "race", OnSignal[string]("a", input), OnSignal[string]("b", input))
+			after++
+			return outcome, err
+		}))
+		_, _ = e.Drive(ctx, flow, 1)
 		for _, key := range []string{"race|a", "race|b"} {
 			if _, err := e.FailWait(ctx, key, 1, errors.New("failed")); err != nil {
 				t.Fatal(err)
 			}
 		}
-		result, err := e.Drive(ctx, anyWaitFlow(), 1)
-		var permanent *PermanentError
-		if result.Status != Failed || !errors.As(err, &permanent) {
-			t.Fatalf("%+v %v", result, err)
+		for i := 0; i < 2; i++ {
+			result, err := e.Drive(ctx, flow, 1)
+			if result.Status != Failed || !errors.Is(err, ErrWaitFailed) || after != 0 {
+				t.Fatalf("%+v %v after=%d", result, err, after)
+			}
 		}
 		messages, _ := store.Pending(ctx, time.Now())
-		if len(messages) != 1 || messages[0].Purpose != WakeNotification {
+		if len(messages) != 1 || messages[0].Purpose != memory.WakeNotification {
 			t.Fatal(messages)
 		}
 		if ok, err := e.FailWait(ctx, "race|a", 1, errors.New("again")); ok || err != nil {
@@ -171,9 +215,9 @@ func TestFlowContextWaitAny(t *testing.T) {
 	})
 	t.Run("request encoding failure and panic isolated", func(t *testing.T) {
 		for _, bad := range []any{make(chan int), panicWaitRequest{}} {
-			e := testEngine(t, NewMemoryInfrastructure(), Options{})
-			flow := definition(FlowFunc[int, WaitAnyResult[string]](func(f *FlowContext, in int) (WaitAnyResult[string], error) {
-				return f.WaitAny[string]("race", WaitCase[any]{Key: "bad", Request: bad}, WaitCase[any]{Key: "good", Request: in})
+			e := testEngine(t, memory.New(), Options{})
+			flow := definition(FlowFunc[int, waitOutcome](func(f *FlowContext, in int) (waitOutcome, error) {
+				return waitAnyOutcome(f, "race", OnSignal[string]("bad", bad), OnSignal[string]("good", in))
 			}))
 			result, err := e.Drive(context.Background(), flow, 1)
 			if err != nil || result.Status != Suspended || len(result.Pending) != 1 || result.Pending[0].Key != "race|good" {
@@ -183,16 +227,22 @@ func TestFlowContextWaitAny(t *testing.T) {
 				t.Fatal(err)
 			}
 			result, err = e.Drive(context.Background(), flow, 1)
-			if err != nil || result.Output.Response != "done" || len(result.Output.Failures) != 1 {
+			if err != nil || result.Output.Response != "done" || result.Output.Failures != 1 {
 				t.Fatalf("%+v %v", result, err)
 			}
 		}
 	})
 	t.Run("invalid and duplicate keys register nothing", func(t *testing.T) {
-		for _, cases := range [][]WaitCase[int]{nil, {{Key: "a"}, {Key: "a"}}, {{Key: "a"}, {Key: "b|x"}}} {
-			store := NewMemoryInfrastructure()
+		for _, keys := range [][]string{nil, {"a", "a"}, {"a", "b|x"}} {
+			store := memory.New()
 			e := testEngine(t, store, Options{})
-			flow := definition(FlowFunc[int, WaitAnyResult[string]](func(f *FlowContext, _ int) (WaitAnyResult[string], error) { return f.WaitAny[string]("race", cases...) }))
+			flow := definition(FlowFunc[int, waitOutcome](func(f *FlowContext, in int) (waitOutcome, error) {
+				var cases []Case
+				for _, key := range keys {
+					cases = append(cases, OnSignal[string](key, in))
+				}
+				return waitAnyOutcome(f, "race", cases...)
+			}))
 			_, err := e.Drive(context.Background(), flow, 0)
 			if !errors.Is(err, ErrInvalid) {
 				t.Fatal(err)
@@ -203,8 +253,70 @@ func TestFlowContextWaitAny(t *testing.T) {
 			}
 		}
 	})
+	t.Run("nil reused and mistyped cases register nothing", func(t *testing.T) {
+		shared := OnSignal[string]("shared", 1)
+		for name, build := range map[string]func() []Case{
+			"nil":        func() []Case { return []Case{OnSignal[string]("a", 1), nil} },
+			"same call":  func() []Case { c := OnSignal[string]("a", 1); return []Case{c, c} },
+			"sleep kind": func() []Case { return []Case{OnKind[string](SleepKind, "a", 1)} },
+		} {
+			store := memory.New()
+			e := testEngine(t, store, Options{})
+			flow := definition(FlowFunc[int, waitOutcome](func(f *FlowContext, _ int) (waitOutcome, error) {
+				return waitAnyOutcome(f, "race", build()...)
+			}))
+			result, err := e.Drive(context.Background(), flow, 0)
+			if result.Status != Failed || !errors.Is(err, ErrInvalid) {
+				t.Fatalf("%s: %+v %v", name, result, err)
+			}
+			if messages, _ := store.Pending(context.Background(), time.Now()); len(messages) != 0 {
+				t.Fatal(name, "partially registered", messages)
+			}
+		}
+		// A case declared outside the Flow is consumed by the first drive.
+		// 在 Flow 外部声明的 Case 会被第一次 drive 消耗。
+		e := testEngine(t, memory.New(), Options{})
+		flow := definition(FlowFunc[int, waitOutcome](func(f *FlowContext, _ int) (waitOutcome, error) {
+			return waitAnyOutcome(f, "race", shared)
+		}))
+		if result, err := e.Drive(context.Background(), flow, 0); err != nil || result.Status != Suspended {
+			t.Fatalf("%+v %v", result, err)
+		}
+		if _, err := e.Drive(context.Background(), flow, 0); !errors.Is(err, ErrInvalid) {
+			t.Fatal("reused case accepted", err)
+		}
+	})
+	t.Run("heterogeneous response types", func(t *testing.T) {
+		type approval struct{ By string }
+		ctx := context.Background()
+		e := testEngine(t, memory.New(), Options{})
+		flow := definition(FlowFunc[int, string](func(f *FlowContext, in int) (string, error) {
+			approve := OnSignal[approval]("approve", in)
+			reject := OnSignal[int]("reject", in)
+			timeout := OnSleep("timeout", time.Hour)
+			switch f.WaitAny("decision", approve, reject, timeout) {
+			case approve:
+				return "approved by " + approve.Value().By, nil
+			case reject:
+				return fmt.Sprintf("rejected code %d", reject.Value()), nil
+			case timeout:
+				return "timeout", nil
+			}
+			return "", errors.New("unknown winner")
+		}))
+		if _, err := e.Drive(ctx, flow, 1); err != nil {
+			t.Fatal(err)
+		}
+		if ok, err := e.Signal(ctx, "decision|reject", 42); !ok || err != nil {
+			t.Fatalf("%t %v", ok, err)
+		}
+		result, err := e.Drive(ctx, flow, 1)
+		if err != nil || result.Output != "rejected code 42" {
+			t.Fatalf("%+v %v", result, err)
+		}
+	})
 	t.Run("optional infrastructure and cancellation", func(t *testing.T) {
-		store := NewMemoryInfrastructure()
+		store := memory.New()
 		e := testEngine(t, struct{ Infrastructure }{store}, Options{})
 		if _, err := e.Drive(context.Background(), anyWaitFlow(), 0); !errors.Is(err, ErrWaitAnyUnsupported) {
 			t.Fatal(err)
@@ -220,7 +332,7 @@ func TestFlowContextWaitAny(t *testing.T) {
 	})
 	t.Run("registration snapshots and inputs cannot be mutated", func(t *testing.T) {
 		ctx := context.Background()
-		store := NewMemoryInfrastructure()
+		store := memory.New()
 		requests := []WaitRequest{{Key: "race|a", Request: []byte(`"a"`)}, {Key: "race|b", Request: []byte(`"b"`)}}
 		state, err := store.WaitAny(ctx, "race", requests)
 		if err != nil {
@@ -253,7 +365,7 @@ func TestFlowContextWaitAny(t *testing.T) {
 		}
 		// Repeated replay retains only the bounded history for this one group.
 		// 重复回放只会保留这个组的有界历史。
-		if len(store.waitGroups) != 1 || len(store.waitOwners) != 2 {
+		if _, _, groups, members := store.Stats(); groups != 1 || members != 2 {
 			t.Fatal("unexpected waiting registrations")
 		}
 	})

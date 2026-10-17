@@ -1,4 +1,4 @@
-package workflow
+package tests
 
 import (
 	"bytes"
@@ -10,6 +10,9 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	. "github.com/k0923/go/workflow"
+	"github.com/k0923/go/workflow/memory"
 )
 
 type eventCollector struct {
@@ -45,7 +48,7 @@ func eventsOfType(events []Event, eventType EventType) []Event {
 
 func TestEngineEvents(t *testing.T) {
 	t.Run("normal execution and replay have distinct exactly counted events", func(t *testing.T) {
-		engine := testEngine(t, NewMemoryInfrastructure(), Options{})
+		engine := testEngine(t, memory.New(), Options{})
 		collector := &eventCollector{}
 		unsubscribe := engine.Subscribe(collector.listen)
 		defer unsubscribe()
@@ -99,7 +102,7 @@ func TestEngineEvents(t *testing.T) {
 		}
 	})
 	t.Run("rejected and cancelled drives still finish", func(t *testing.T) {
-		engine := testEngine(t, NewMemoryInfrastructure(), Options{})
+		engine := testEngine(t, memory.New(), Options{})
 		collector := &eventCollector{}
 		engine.Subscribe(collector.listen)
 		_, err := engine.Drive(context.Background(), Workflow[int, int]{}, 0)
@@ -124,7 +127,7 @@ func TestEngineEvents(t *testing.T) {
 	t.Run("transient permanent panic and timeout outcomes", func(t *testing.T) {
 		for _, scenario := range []string{"transient", "permanent", "panic", "timeout"} {
 			t.Run(scenario, func(t *testing.T) {
-				engine := testEngine(t, NewMemoryInfrastructure(), Options{})
+				engine := testEngine(t, memory.New(), Options{})
 				collector := &eventCollector{}
 				engine.Subscribe(collector.listen)
 				cause := errors.New("action failed")
@@ -162,7 +165,7 @@ func TestEngineEvents(t *testing.T) {
 					}
 					_, _ = engine.Drive(context.Background(), flow, 0)
 					replay := eventsOfType(collector.snapshot(), ActionReplayed)
-					if len(replay) != 1 || replay[0].Status != Failed || replay[0].Error.Category != "replay" {
+					if len(replay) != 1 || replay[0].Status != Failed || replay[0].Error.Category != "business" {
 						t.Fatal(replay)
 					}
 				} else if finished.Status != Running {
@@ -172,7 +175,7 @@ func TestEngineEvents(t *testing.T) {
 		}
 	})
 	t.Run("subscription panic and payload mutation do not affect other listeners", func(t *testing.T) {
-		engine := testEngine(t, NewMemoryInfrastructure(), Options{Observer: func(context.Context, Observation) { panic("observer") }})
+		engine := testEngine(t, memory.New(), Options{})
 		engine.Subscribe(func(_ context.Context, event Event) {
 			if len(event.Pending) > 0 {
 				event.Pending[0].Key = "mutated"
@@ -185,8 +188,8 @@ func TestEngineEvents(t *testing.T) {
 		collector := &eventCollector{}
 		engine.Subscribe(collector.listen)
 		flow := definition(FlowFunc[int, int](func(f *FlowContext, in int) (int, error) {
-			_, err := f.WaitFor[string]("wait", in)
-			return 0, err
+			f.WaitFor[string]("wait", in)
+			return 0, nil
 		}))
 		result, err := engine.Drive(context.Background(), flow, 0)
 		if err != nil || result.Status != Suspended || result.Pending[0].Key != "wait" {
@@ -207,7 +210,7 @@ func TestEngineEvents(t *testing.T) {
 	})
 	t.Run("claim conflicts and read failures finish without action start", func(t *testing.T) {
 		for _, scenario := range []string{"conflict", "read"} {
-			store := NewMemoryInfrastructure()
+			store := memory.New()
 			var infrastructure Infrastructure = store
 			if scenario == "conflict" {
 				if _, err := store.Claim(context.Background(), "action", time.Hour); err != nil {
@@ -243,7 +246,7 @@ func TestEngineEvents(t *testing.T) {
 		}
 	})
 	t.Run("broken error formatter does not drop events", func(t *testing.T) {
-		engine := testEngine(t, NewMemoryInfrastructure(), Options{})
+		engine := testEngine(t, memory.New(), Options{})
 		collector := &eventCollector{}
 		engine.Subscribe(collector.listen)
 		cause := &unformattableEventError{}
@@ -265,32 +268,11 @@ func TestEngineEvents(t *testing.T) {
 			}
 		}
 	})
-	t.Run("old observer phases unchanged", func(t *testing.T) {
-		var phases []string
-		engine := testEngine(t, NewMemoryInfrastructure(), Options{Observer: func(_ context.Context, o Observation) { phases = append(phases, o.Phase) }})
-		collector := &eventCollector{}
-		engine.Subscribe(collector.listen)
-		flow := definition(FlowFunc[int, int](func(f *FlowContext, in int) (int, error) {
-			return f.Run("action", Pure(func(n int) int { return n }), in)
-		}))
-		for i := 0; i < 2; i++ {
-			if _, err := engine.Drive(context.Background(), flow, 0); err != nil {
-				t.Fatal(err)
-			}
-		}
-		want := []string{"drive_started", "action_started", "action_finished", "drive_finished", "drive_started", "action_replayed", "action_finished", "drive_finished"}
-		if !reflect.DeepEqual(phases, want) {
-			t.Fatal(phases)
-		}
-		if len(collector.snapshot()) != 8 {
-			t.Fatal("new subscriptions not delivered")
-		}
-	})
 }
 
 func TestEngineSubscribe(t *testing.T) {
 	t.Run("filter and reentrant idempotent unsubscribe", func(t *testing.T) {
-		engine := testEngine(t, NewMemoryInfrastructure(), Options{})
+		engine := testEngine(t, memory.New(), Options{})
 		engine.Subscribe(nil)()
 		count := 0
 		var unsubscribe func()
@@ -306,7 +288,7 @@ func TestEngineSubscribe(t *testing.T) {
 		}
 	})
 	t.Run("parallel branches and subscription changes", func(t *testing.T) {
-		engine := testEngine(t, NewMemoryInfrastructure(), Options{})
+		engine := testEngine(t, memory.New(), Options{})
 		collector := &eventCollector{}
 		engine.Subscribe(collector.listen)
 		var ephemeral atomic.Int32
@@ -344,11 +326,11 @@ func TestEngineSubscribe(t *testing.T) {
 
 func TestEngineWaitEvents(t *testing.T) {
 	t.Run("signal resolve emits once and repeated drives are distinct", func(t *testing.T) {
-		store := NewMemoryInfrastructure()
+		store := memory.New()
 		engine := testEngine(t, store, Options{})
 		collector := &eventCollector{}
 		engine.Subscribe(collector.listen)
-		flow := definition(FlowFunc[int, string](func(f *FlowContext, in int) (string, error) { return f.WaitFor[string]("wait", in) }))
+		flow := definition(FlowFunc[int, string](func(f *FlowContext, in int) (string, error) { return f.WaitFor[string]("wait", in), nil }))
 		for i := 0; i < 2; i++ {
 			result, err := engine.Drive(context.Background(), flow, 0)
 			if err != nil || result.Status != Suspended {
@@ -383,12 +365,12 @@ func TestEngineWaitEvents(t *testing.T) {
 	t.Run("sleep and immediate sleep resolve exactly once", func(t *testing.T) {
 		for _, interval := range []time.Duration{0, time.Hour} {
 			now := time.Now()
-			store := NewMemoryInfrastructure()
-			store.now = func() time.Time { return now }
+			store := memory.New()
+			store.SetClock(func() time.Time { return now })
 			engine := testEngine(t, store, Options{Now: func() time.Time { return now }})
 			collector := &eventCollector{}
 			engine.Subscribe(collector.listen)
-			flow := definition(FlowFunc[int, int](func(f *FlowContext, in int) (int, error) { return in, f.Sleep("sleep", interval) }))
+			flow := definition(FlowFunc[int, int](func(f *FlowContext, in int) (int, error) { f.Sleep("sleep", interval); return in, nil }))
 			for i := 0; i < 3; i++ {
 				result, err := engine.Drive(context.Background(), flow, 0)
 				if err != nil {

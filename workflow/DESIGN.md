@@ -20,7 +20,7 @@ flowchart TD
     Resolve --> Store
     Store --> Delivery["REQUEST / WAKE 持久化投递"]
     Delivery --> Caller
-    Engine --> Observer["Observer：执行、回放、挂起、错误"]
+    Engine --> Observer["Subscribe：执行、回放、挂起、错误"]
 ```
 
 ## 原设计与处理
@@ -32,7 +32,9 @@ flowchart TD
 | 根 RunFlow 接收却不使用 input | Workflow 泛型定义，Drive 显式传入顶层 handler |
 | 同步、异步、Loop 分叉维护错误和状态 | 同一个 runAction；Go 复用，Loop 每 attempt 复用 |
 | Flow 递归挂载导致层级混乱 | FlowContext 无 RunFlow/GoFlow；WorkflowContext 无 Action/信号方法，编译期隔离 |
-| panic 混用业务失败、存储故障、挂起和冲突 | 普通 error、Permanent、SuspendedError 和驱动 Result |
+| panic 混用业务失败、存储故障、挂起和冲突 | 挂起与框架故障用私有 panic + strand 停止标记（不可吞、不可伪造）；业务失败用 `*ActionError` 返回；Drive 以 Result 报告 |
+| 挂起以 error 传递，被忽略后零值副作用被提交 | 挂起不再是 error；recover 后同一 strand 的原语再次停止 |
+| 原语出错即取消执行，补偿不可达 | 只有 handler 返回的 error 决定失败 |
 | 事件 CAS 未携带租约导致旧 owner 写入 | Commit 同时验证当前 lease generation、expiry 和 record version |
 | 更新挂起状态与信号登记不同事务 | 等待原语单独 Put，等待记录和消息一次原子提交 |
 | 请求 outbox 确认可能掩盖后续恢复投递 | REQUEST 与 WAKE 是不同幂等消息 |
@@ -78,8 +80,11 @@ WorkflowContext 只拥有 RunFlow/GoFlow，FlowContext 只拥有 Action 和信�
 ## 扩展与边界
 
 - 存储扩展：Infrastructure 明确原子方法契约，生产适配器独立实现；实例隔离仍在包装层。
-- 投递扩展：Delivery 可选，通知中实例路由由适配器绑定；调度器遇到冲突和暂时错误必须保留 WAKE 重试。
-- 观测扩展：Observer 支持生命周期、回放和错误，panic 被隔离；审计日志与 CAS 快照分离。
+- 投递扩展：投递不在内核契约内，参考契约为 `memory.Outbox`（Pending/Ack，至少一次），引擎不调用它；通知中实例路由由适配器绑定；调度器遇到冲突和暂时错误必须保留 WAKE 重试。
+- 回放扩展：可选 RecordLister 让 Drive 一次预加载终态记录，回放不再逐步读写；只缓存不可变结果，未结束的记录仍走原子方法。
+- 时钟扩展：可选 Clock 在 Options.Now 为空时作为默认时钟，使 Sleep 截止与租约到期同源。
+- 等待扩展：WaitAny 的 Case 各自携带响应类型（OnSignal/OnSleep/OnSleepUntil/OnKind），按指针身份返回赢家；自定义 Kind 由 WaitAnyInfrastructure 实现识别。
+- 观测扩展：Subscribe 事件覆盖生命周期、回放和错误，panic 被隔离；审计日志与 CAS 快照分离。
 - 定义扩展：Flow 接口保留具名类型和函数适配；Workflow 负责稳定名称与版本。
 - 当前边界：没有生产数据库适配器、自动调度器、工作流代码沙箱、历史代码热迁移、实例终止或补偿事务。
 

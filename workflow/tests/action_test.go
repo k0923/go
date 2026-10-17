@@ -1,10 +1,13 @@
-package workflow
+package tests
 
 import (
 	"context"
 	"errors"
 	"sync/atomic"
 	"testing"
+
+	. "github.com/k0923/go/workflow"
+	"github.com/k0923/go/workflow/memory"
 )
 
 type interfaceTestAction struct{ calls *atomic.Int32 }
@@ -20,9 +23,9 @@ func (a interfaceTestAction) Run(ctx context.Context, input int) (pollOutput, er
 func TestActionFn(t *testing.T) {
 	t.Run("forwards context input output and error", func(t *testing.T) {
 		cause := errors.New("action rejected")
-		ctx := context.WithValue(context.Background(), actionKey{}, "step")
+		ctx := context.WithValue(context.Background(), "trace", "step")
 		fn := ActionFn[int, int](func(received context.Context, input int) (int, error) {
-			if received != ctx || input != 3 || ActionKey(received) != "step" {
+			if received != ctx || input != 3 || received.Value("trace") != "step" {
 				t.Fatal("context or input lost")
 			}
 			return 7, cause
@@ -52,7 +55,7 @@ func TestAsAction(t *testing.T) {
 func TestInterfaceActionExecution(t *testing.T) {
 	for _, mode := range []string{"Run", "Go", "Loop"} {
 		t.Run(mode, func(t *testing.T) {
-			store := NewMemoryInfrastructure()
+			store := memory.New()
 			engine := testEngine(t, store, Options{})
 			var calls atomic.Int32
 			action := &interfaceTestAction{calls: &calls}
@@ -80,7 +83,7 @@ func TestInterfaceActionExecution(t *testing.T) {
 	t.Run("value receiver is supported", func(t *testing.T) {
 		var calls atomic.Int32
 		action := interfaceTestAction{calls: &calls}
-		engine := testEngine(t, NewMemoryInfrastructure(), Options{})
+		engine := testEngine(t, memory.New(), Options{})
 		result, err := engine.Drive(context.Background(), definition(FlowFunc[int, pollOutput](
 			func(f *FlowContext, input int) (pollOutput, error) { return f.Run("step", action, input) },
 		)), 3)
@@ -97,7 +100,7 @@ func TestInvalidAction(t *testing.T) {
 				nil, (*interfaceTestAction)(nil), ActionFn[int, pollOutput](nil),
 				AsAction[int, pollOutput](nil), Pure[int, pollOutput](nil),
 			} {
-				store := NewMemoryInfrastructure()
+				store := memory.New()
 				engine := testEngine(t, store, Options{})
 				started := 0
 				engine.Subscribe(func(context.Context, Event) { started++ }, ActionStarted)
@@ -112,10 +115,12 @@ func TestInvalidAction(t *testing.T) {
 					}
 				}))
 				result, err := engine.Drive(context.Background(), flow, 3)
-				if !errors.Is(err, ErrInvalid) || result.Status != Running || started != 0 {
+				// Misuse is deterministic, so replaying cannot fix it: terminal.
+				// 误用是确定性的，重放无法修复：终态。
+				if !errors.Is(err, ErrInvalid) || result.Status != Failed || started != 0 {
 					t.Fatalf("%+v %v starts=%d", result, err, started)
 				}
-				if len(store.leases) != 0 || len(store.records) != 1 {
+				if leases, records, _, _ := store.Stats(); leases != 0 || records != 1 {
 					t.Fatal("invalid action acquired lease or wrote a step record")
 				}
 			}

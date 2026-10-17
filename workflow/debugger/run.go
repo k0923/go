@@ -11,6 +11,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/k0923/go/workflow"
+	"github.com/k0923/go/workflow/memory"
 )
 
 // Options configures Run. Zero values are usable.
@@ -86,7 +87,7 @@ func Run[I, O any](ctx context.Context, definition workflow.Workflow[I, O], inpu
 	defer unsubscribe()
 	defer events.close()
 
-	var wakes []workflow.Notification
+	var wakes []memory.Notification
 	for {
 		due, pollErr := client.WaitWake(ctx, time.Nanosecond)
 		if errors.Is(pollErr, workflow.ErrNotFound) {
@@ -106,7 +107,7 @@ func Run[I, O any](ctx context.Context, definition workflow.Workflow[I, O], inpu
 		events.flush()
 		var ackErr error
 		if ctx.Err() == nil && (driveErr == nil || result.Status == workflow.Failed) {
-			var remaining []workflow.Notification
+			var remaining []memory.Notification
 			for _, notification := range wakes {
 				ackCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 				err := client.Ack(ackCtx, notification.ID)
@@ -182,7 +183,7 @@ func Run[I, O any](ctx context.Context, definition workflow.Workflow[I, O], inpu
 // Recheck durable waits so a redundant worker cannot retain a stale suspension.
 // 返回唤醒但不确认，由下一次成功 Drive 确认。复核持久等待，
 // 避免冗余 worker 一直持有陈旧的挂起快照。
-func waitForWake(ctx context.Context, client *Client, pending []workflow.Pending) ([]workflow.Notification, error) {
+func waitForWake(ctx context.Context, client *Client, pending []workflow.Pending) ([]memory.Notification, error) {
 	for {
 		for _, wait := range pending {
 			record, err := client.Get(ctx, wait.Key)

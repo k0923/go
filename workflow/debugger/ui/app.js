@@ -604,6 +604,7 @@ function openDrawer(key, refresh = false) {
       ${field('Updated', ago(record.updated_at))}
     </div>
     ${record.error ? `<div class="rounded-lg bg-rose-500/10 ring-1 ring-rose-500/20 px-4 py-3 text-sm text-rose-200 font-mono break-all">${esc(record.error)}</div>` : ''}
+    ${record.type ? `<div><div class="text-[11px] uppercase tracking-wider text-slate-500">Type</div><div class="mt-0.5 text-xs text-slate-300 font-mono break-all">${esc(record.type)}</div></div>` : ''}
     <div><div class="text-[11px] uppercase tracking-wider text-slate-500 mb-1.5">Input</div>${jsonBlock(decodeRaw(record.input))}</div>
     <div><div class="text-[11px] uppercase tracking-wider text-slate-500 mb-1.5">Result</div>${jsonBlock(decodeRaw(record.result))}</div>
     <div>

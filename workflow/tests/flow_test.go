@@ -1,4 +1,4 @@
-package workflow
+package tests
 
 import (
 	"context"
@@ -7,10 +7,13 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	. "github.com/k0923/go/workflow"
+	"github.com/k0923/go/workflow/memory"
 )
 
 func TestFlowContextWaitFor(t *testing.T) {
-	store := NewMemoryInfrastructure()
+	store := memory.New()
 	e := testEngine(t, store, Options{})
 	var calls int
 	flow := definition(FlowFunc[int, string](func(f *FlowContext, in int) (string, error) {
@@ -21,7 +24,7 @@ func TestFlowContextWaitFor(t *testing.T) {
 		if err != nil {
 			return "", err
 		}
-		return f.WaitFor[string]("callback", in)
+		return f.WaitFor[string]("callback", in), nil
 	}))
 	for i := 0; i < 3; i++ {
 		result, err := e.Drive(context.Background(), flow, 2)
@@ -33,7 +36,7 @@ func TestFlowContextWaitFor(t *testing.T) {
 		t.Fatalf("submit repeated: %d", calls)
 	}
 	requests, _ := store.Pending(context.Background(), time.Now())
-	if len(requests) != 1 || requests[0].Purpose != RequestNotification {
+	if len(requests) != 1 || requests[0].Purpose != memory.RequestNotification {
 		t.Fatal(requests)
 	}
 	request, _ := store.Get(context.Background(), "callback")
@@ -52,7 +55,7 @@ func TestFlowContextWaitFor(t *testing.T) {
 		t.Fatal(err)
 	}
 	messages, _ := store.Pending(context.Background(), time.Now())
-	if len(messages) != 1 || messages[0].Purpose != WakeNotification {
+	if len(messages) != 1 || messages[0].Purpose != memory.WakeNotification {
 		t.Fatal(messages)
 	}
 	if ok, err := e.ResolveSignal(context.Background(), "callback", request.Version, "replacement"); ok || err != nil {
@@ -75,13 +78,11 @@ func TestFlowContextWaitFor(t *testing.T) {
 func TestFlowContextSleep(t *testing.T) {
 	t.Run("durable deadline", func(t *testing.T) {
 		now := time.Now()
-		store := NewMemoryInfrastructure()
-		store.now = func() time.Time { return now }
+		store := memory.New()
+		store.SetClock(func() time.Time { return now })
 		e := testEngine(t, store, Options{Now: func() time.Time { return now }})
 		flow := definition(FlowFunc[int, string](func(f *FlowContext, _ int) (string, error) {
-			if err := f.Sleep("delay", time.Hour); err != nil {
-				return "", err
-			}
+			f.Sleep("delay", time.Hour)
 			return "awake", nil
 		}))
 		first, err := e.Drive(context.Background(), flow, 0)
@@ -107,14 +108,10 @@ func TestFlowContextSleep(t *testing.T) {
 		}
 	})
 	t.Run("immediate and sleep until", func(t *testing.T) {
-		e := testEngine(t, NewMemoryInfrastructure(), Options{})
+		e := testEngine(t, memory.New(), Options{})
 		flow := definition(FlowFunc[int, int](func(f *FlowContext, in int) (int, error) {
-			if err := f.Sleep("zero", 0); err != nil {
-				return 0, err
-			}
-			if err := f.SleepUntil("past", time.Now().Add(-time.Hour)); err != nil {
-				return 0, err
-			}
+			f.Sleep("zero", 0)
+			f.SleepUntil("past", time.Now().Add(-time.Hour))
 			return in, nil
 		}))
 		result, err := e.Drive(context.Background(), flow, 8)
@@ -126,19 +123,14 @@ func TestFlowContextSleep(t *testing.T) {
 
 func TestFlowContextCheckpoint(t *testing.T) {
 	now := time.Now()
-	store := NewMemoryInfrastructure()
+	store := memory.New()
 	e := testEngine(t, store, Options{Now: func() time.Time { return now }})
 	type output struct {
 		ID string
 		At time.Time
 	}
 	flow := definition(FlowFunc[int, output](func(f *FlowContext, _ int) (output, error) {
-		id, err := f.UUID("id")
-		if err != nil {
-			return output{}, err
-		}
-		at, err := f.Now("at")
-		return output{ID: id, At: at}, err
+		return output{ID: f.UUID("id"), At: f.Now("at")}, nil
 	}))
 	first, err := e.Drive(context.Background(), flow, 0)
 	if err != nil || first.Output.ID == "" || !first.Output.At.Equal(now) {
@@ -162,8 +154,8 @@ func TestFlowContextLoop(t *testing.T) {
 	for _, finish := range []bool{true, false} {
 		t.Run(map[bool]string{true: "completed", false: "exhausted"}[finish], func(t *testing.T) {
 			now := time.Now()
-			store := NewMemoryInfrastructure()
-			store.now = func() time.Time { return now }
+			store := memory.New()
+			store.SetClock(func() time.Time { return now })
 			e := testEngine(t, store, Options{Now: func() time.Time { return now }})
 			calls := 0
 			flow := definition(FlowFunc[int, pollOutput](func(f *FlowContext, _ int) (pollOutput, error) {
@@ -184,8 +176,7 @@ func TestFlowContextLoop(t *testing.T) {
 				if finish && (err != nil || result.Output.Count != 2 || result.Status != Completed) {
 					t.Fatalf("%+v %v", result, err)
 				}
-				var permanent *PermanentError
-				if !finish && (!errors.As(err, &permanent) || result.Status != Failed) {
+				if !finish && (!errors.Is(err, ErrLoopExhausted) || result.Status != Failed) {
 					t.Fatalf("%+v %v", result, err)
 				}
 			}
@@ -197,7 +188,7 @@ func TestFlowContextLoop(t *testing.T) {
 }
 
 func TestFutureWait(t *testing.T) {
-	store := NewMemoryInfrastructure()
+	store := memory.New()
 	e := testEngine(t, store, Options{})
 	var calls atomic.Int32
 	flow := definition(FlowFunc[int, int](func(f *FlowContext, in int) (int, error) {
@@ -228,18 +219,12 @@ func TestFutureWait(t *testing.T) {
 	if err != nil || result.Output != 21 || calls.Load() != 1 {
 		t.Fatalf("%+v %v", result, err)
 	}
-	unfinished := &Future[int]{done: make(chan struct{})}
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-	if _, err := unfinished.WaitContext(ctx); !errors.Is(err, context.Canceled) {
-		t.Fatal(err)
-	}
 }
 
 func TestWorkflowContextGoFlow(t *testing.T) {
 	t.Run("all suspensions collected", func(t *testing.T) {
-		e := testEngine(t, NewMemoryInfrastructure(), Options{})
-		child := FlowFunc[int, string](func(f *FlowContext, in int) (string, error) { return f.WaitFor[string]("callback", in) })
+		e := testEngine(t, memory.New(), Options{})
+		child := FlowFunc[int, string](func(f *FlowContext, in int) (string, error) { return f.WaitFor[string]("callback", in), nil })
 		flow := NewWorkflow("test", "1", func(f *WorkflowContext, in int) (int, error) {
 			f.GoFlow("left", child, in)
 			f.GoFlow("right", child, in)
@@ -254,7 +239,7 @@ func TestWorkflowContextGoFlow(t *testing.T) {
 		}
 	})
 	t.Run("unwaited errors propagated and siblings joined", func(t *testing.T) {
-		e := testEngine(t, NewMemoryInfrastructure(), Options{})
+		e := testEngine(t, memory.New(), Options{})
 		started := make(chan struct{})
 		finished := make(chan struct{})
 		cause := errors.New("notify failed")

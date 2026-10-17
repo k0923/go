@@ -8,6 +8,7 @@ import (
 	"sync/atomic"
 
 	"github.com/k0923/go/workflow"
+	"github.com/k0923/go/workflow/memory"
 )
 
 type Order struct {
@@ -52,7 +53,7 @@ func (flow OrderFlow) Run(base *workflow.FlowContext, input string) (Order, erro
 }
 
 func main() {
-	engine, err := workflow.NewEngine(workflow.NewMemoryInfrastructure(), workflow.Options{})
+	engine, err := workflow.NewEngine(memory.New(), workflow.Options{})
 	if err != nil {
 		panic(err)
 	}
