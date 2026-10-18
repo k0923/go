@@ -45,7 +45,7 @@
 //
 // CommitProtected is an example business storage operation. It is not part of
 // Infrastructure. Each caller defines its own lease-protected write method; in
-// the workflow package, the equivalent operation is Infrastructure.Commit.
+// the cflow package, the equivalent operation is Infrastructure.Commit.
 //
 // # Lifecycle
 //
@@ -98,15 +98,15 @@
 // failure during cleanup can leave the release result unknown; the storage TTL
 // is the final expiration mechanism. Renewal is stopped before cleanup starts.
 //
-// # Relationship to workflow
+// # Relationship to cflow
 //
-// workflow.Infrastructure embeds lease.Infrastructure, and workflow.Lease is a
-// type alias for lease.Token, so existing workflow storage signatures can still
-// use the workflow type name. workflow.ErrConflict reuses lease.ErrConflict.
-// Lease errors use *lease.Error, while workflow event read/write errors still
-// use *workflow.OperationError.
+// cflow.Infrastructure embeds lease.Infrastructure, and cflow.Lease is a
+// type alias for lease.Token, so existing cflow storage signatures can still
+// use the cflow type name. cflow.ErrConflict reuses lease.ErrConflict.
+// Lease errors use *lease.Error, while cflow event read/write errors still
+// use *cflow.OperationError.
 //
-// This package does not depend on workflow. The old workflow/legacy
+// This package does not depend on cflow. The old workflow/legacy
 // implementation keeps its independent lease code and historical API.
 //
 // # Verification
