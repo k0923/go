@@ -1,11 +1,12 @@
 // Command wfdebug serves the local workflow debugger: an SQLite backed
 // Infrastructure over HTTP plus a web UI.
 //
-//	go run ./workflow/cmd/wfdebug -addr 127.0.0.1:7788 -db wfdebug.db
+//	go run ./cflow/cmd/wfdebug -addr 127.0.0.1:7788 -db wfdebug.db
+//
 // Command wfdebug 提供本地 workflow debugger：通过 HTTP 暴露 SQLite 支持的
 // Infrastructure，并提供 Web UI。
 //
-//	go run ./workflow/cmd/wfdebug -addr 127.0.0.1:7788 -db wfdebug.db
+//	go run ./cflow/cmd/wfdebug -addr 127.0.0.1:7788 -db wfdebug.db
 package main
 
 import (
@@ -16,7 +17,7 @@ import (
 	"os/signal"
 	"syscall"
 
-	"github.com/k0923/go/workflow/debugger"
+	"github.com/k0923/go/cflow/debugger"
 )
 
 func main() {

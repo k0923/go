@@ -1,5 +1,5 @@
-// Run with: go run ./workflow/examples/wait_any
-// 运行方式：go run ./workflow/examples/wait_any
+// Run with: go run ./cflow/examples/wait_any
+// 运行方式：go run ./cflow/examples/wait_any
 package main
 
 import (
@@ -7,8 +7,8 @@ import (
 	"fmt"
 	"sync"
 
-	"github.com/k0923/go/workflow"
-	"github.com/k0923/go/workflow/memory"
+	"github.com/k0923/go/cflow"
+	"github.com/k0923/go/cflow/memory"
 )
 
 func main() {

@@ -1,6 +1,6 @@
 # Cflow 流程开发规范
 
-本规范基于 `github.com/k0923/go/workflow` 包当前代码编写，适用于使用该包开发可重放、可恢复、可并发调度的业务流程。
+本规范基于 `github.com/k0923/go/cflow` 包当前代码编写，适用于使用该包开发可重放、可恢复、可并发调度的业务流程。
 
 ## 核心模型
 
@@ -41,7 +41,7 @@ import (
 	"encoding/json"
 	"time"
 
-	"github.com/k0923/go/workflow"
+	"github.com/k0923/go/cflow"
 )
 
 type ActionFunc[Input any, Output any] func(*cflow.ActionContext, Input) Output

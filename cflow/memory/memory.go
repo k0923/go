@@ -12,7 +12,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/k0923/go/workflow"
+	"github.com/k0923/go/cflow"
 )
 
 // Infrastructure is a concurrency-safe reference implementation.

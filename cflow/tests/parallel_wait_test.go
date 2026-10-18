@@ -13,8 +13,8 @@ import (
 	"testing"
 	"time"
 
-	. "github.com/k0923/go/workflow"
-	"github.com/k0923/go/workflow/memory"
+	. "github.com/k0923/go/cflow"
+	"github.com/k0923/go/cflow/memory"
 )
 
 // One context remains: Flows compose Actions, waits and Flows. What stays
@@ -24,7 +24,7 @@ import (
 func TestFlowCallHierarchy(t *testing.T) {
 	// Compile external business code, rather than merely inspecting private flags.
 	source := `package boundary
-import "github.com/k0923/go/workflow"
+import "github.com/k0923/go/cflow"
 func forbidden(f *cflow.FlowContext, root cflow.Workflow[int, int]) {
 	root.Run(f, 1)
 	f.RunFlow[int, int]("root", root, 1)

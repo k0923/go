@@ -5,8 +5,8 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/k0923/go/workflow"
-	"github.com/k0923/go/workflow/memory"
+	"github.com/k0923/go/cflow"
+	"github.com/k0923/go/cflow/memory"
 )
 
 // A dispatcher owned by the caller drains the outbox: REQUEST goes to the

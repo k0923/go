@@ -1,5 +1,5 @@
 // Interface Action with explicit dependency injection and durable replay.
-// Run: go run ./workflow/examples/action_context_design
+// Run: go run ./cflow/examples/action_context_design
 package main
 
 import (
@@ -7,8 +7,8 @@ import (
 	"fmt"
 	"sync/atomic"
 
-	"github.com/k0923/go/workflow"
-	"github.com/k0923/go/workflow/memory"
+	"github.com/k0923/go/cflow"
+	"github.com/k0923/go/cflow/memory"
 )
 
 type Order struct {

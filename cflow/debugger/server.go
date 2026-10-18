@@ -14,8 +14,8 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/k0923/go/workflow"
-	"github.com/k0923/go/workflow/memory"
+	"github.com/k0923/go/cflow"
+	"github.com/k0923/go/cflow/memory"
 )
 
 //go:embed ui

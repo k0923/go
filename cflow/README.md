@@ -9,13 +9,13 @@ Engine 每次 `Drive` 从入口回放一遍定义，并返回本次结果。run 
 | 包 | 用途 |
 | --- | --- |
 | `cflow` | 引擎、编排原语、错误与事件模型、存储契约 |
-| `workflow/memory` | 进程内参考存储 `memory.New()` 和参考投递契约 `memory.Outbox`，用于测试、示例和本地调试 |
-| `workflow/debugger` | HTTP + SQLite 调试服务与 Web UI，`debugger.Run` 一行接入 |
-| `workflow/tests` | 主包的黑盒行为测试 |
-| `workflow/examples` | 可运行示例：`action_context_design`、`wait_any`、`debugger` |
+| `cflow/memory` | 进程内参考存储 `memory.New()` 和参考投递契约 `memory.Outbox`，用于测试、示例和本地调试 |
+| `cflow/debugger` | HTTP + SQLite 调试服务与 Web UI，`debugger.Run` 一行接入 |
+| `cflow/tests` | 主包的黑盒行为测试 |
+| `cflow/examples` | [可运行示例](examples/README.md)：`action_context_design`、`wait_any`、`debugger`、`react_agent` |
 | `github.com/k0923/go/lease` | 通用租约 Runner，cflow 复用它；lease 不依赖 cflow |
 
-`workflow/legacy` 是旧实现，只保留做历史对照，与新版的数据格式不互通。
+`cflow/legacy` 是旧实现，只保留做历史对照，与新版的数据格式不互通。
 
 ## 快速开始
 
@@ -174,7 +174,7 @@ case timeout:
 - 单个候选失败（请求无法编码，或提供方调用 `engine.FailWait(ctx, key, version, cause)`）只剔除该候选。**全部候选都失败**时 Drive 以 `FAILED` + `ErrWaitFailed` 终止。需要降级时，让提供方回答一个带类型的失败值，或者在组里加一个 Sleep 兜底。
 - 需要存储实现可选的 `WaitAnyInfrastructure`；不支持时以 `FAILED` + `ErrWaitAnyUnsupported` 终止。
 
-运行示例：`go run ./workflow/examples/wait_any`。
+运行示例：`go run ./cflow/examples/wait_any`。
 
 ## 并发与 Loop
 
@@ -276,7 +276,7 @@ WaitAny 存储的要求：
 - 回放时对每个成员按顺序调用 `cflow.SameWaitMember(stored, request)`（比较 Key、Kind、Path），并持久化 `WaitRequest.Path` 和 `WaitRequest.Type`。
 - 编码失败的候选（`WaitRequest.Error` 非空）也要按顺序保存，计入 Failures，不为它登记投递。
 
-`workflow/memory` 是完整的参考实现。
+`cflow/memory` 是完整的参考实现。
 
 ## 观测
 
@@ -317,8 +317,8 @@ defer unsubscribe()
 ## 调试工具
 
 ```bash
-go run ./workflow/cmd/wfdebug -addr 127.0.0.1:7788 -db wfdebug.db   # 启动调试服务
-go run ./workflow/examples/debugger -run order-1                     # 运行示例 worker
+go run ./cflow/cmd/wfdebug -addr 127.0.0.1:7788 -db wfdebug.db   # 启动调试服务
+go run ./cflow/examples/debugger -run order-1                     # 运行示例 worker
 # 打开 http://127.0.0.1:7788
 ```
 
@@ -350,7 +350,7 @@ UI 功能：
 ## 验证
 
 ```sh
-go vet ./workflow/... ./lease/...
-go test -race ./workflow/... ./lease/...
-node --test workflow/debugger/ui_regression_test.cjs
+go vet ./cflow/... ./lease/...
+go test -race ./cflow/... ./lease/...
+node --test cflow/debugger/ui_regression_test.cjs
 ```

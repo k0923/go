@@ -106,11 +106,11 @@
 // Lease errors use *lease.Error, while cflow event read/write errors still
 // use *cflow.OperationError.
 //
-// This package does not depend on cflow. The old workflow/legacy
+// This package does not depend on cflow. The old cflow/legacy
 // implementation keeps its independent lease code and historical API.
 //
 // # Verification
 //
-//	go test -race ./lease ./workflow
-//	go vet ./lease ./workflow
+//	go test -race ./lease ./cflow
+//	go vet ./lease ./cflow
 package lease

@@ -5,7 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 
-	"github.com/k0923/go/workflow"
+	"github.com/k0923/go/cflow"
 )
 
 type memoryWaitGroup struct {

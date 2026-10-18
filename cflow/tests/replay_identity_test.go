@@ -9,8 +9,8 @@ import (
 	"testing"
 	"time"
 
-	. "github.com/k0923/go/workflow"
-	"github.com/k0923/go/workflow/memory"
+	. "github.com/k0923/go/cflow"
+	"github.com/k0923/go/cflow/memory"
 )
 
 // Replay identity is the built key + kind (+ the stored path). Inputs and

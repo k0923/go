@@ -4,7 +4,7 @@
 //
 // Start the server:
 //
-//	go run ./workflow/cmd/wfdebug -addr 127.0.0.1:7788 -db wfdebug.db
+//	go run ./cflow/cmd/wfdebug -addr 127.0.0.1:7788 -db wfdebug.db
 //
 // Then drive a workflow against it:
 //
@@ -16,7 +16,7 @@
 //
 // 启动服务：
 //
-//	go run ./workflow/cmd/wfdebug -addr 127.0.0.1:7788 -db wfdebug.db
+//	go run ./cflow/cmd/wfdebug -addr 127.0.0.1:7788 -db wfdebug.db
 //
 // 然后让工作流连接到它执行：
 //
@@ -27,8 +27,8 @@ import (
 	"encoding/json"
 	"time"
 
-	"github.com/k0923/go/workflow"
-	"github.com/k0923/go/workflow/memory"
+	"github.com/k0923/go/cflow"
+	"github.com/k0923/go/cflow/memory"
 )
 
 // DefaultServer is the address used by Run and NewClient when none is given.

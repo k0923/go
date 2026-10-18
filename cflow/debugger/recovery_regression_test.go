@@ -15,7 +15,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/k0923/go/workflow"
+	"github.com/k0923/go/cflow"
 )
 
 func TestWriterLockPrecedesLeaseClock(t *testing.T) {

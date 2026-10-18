@@ -1,4 +1,4 @@
-// Run with: node --test workflow/debugger/ui_regression_test.cjs
+// Run with: node --test cflow/debugger/ui_regression_test.cjs
 const { readFileSync } = require('node:fs')
 const { join } = require('node:path')
 const vm = require('node:vm')

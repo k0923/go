@@ -1,4 +1,4 @@
-# workflow/debugger
+# cflow/debugger
 
 本地调试 workflow 的工具：一个带 Web UI 的调试服务。工作流跑在你自己的进程里，存储放在调试服务上，你可以在浏览器里：
 
@@ -13,7 +13,7 @@
 **1. 启动调试服务**
 
 ```bash
-go run ./workflow/cmd/wfdebug
+go run ./cflow/cmd/wfdebug
 # 默认监听 127.0.0.1:7788，数据写入 ./wfdebug.db
 ```
 
@@ -25,7 +25,7 @@ go run ./workflow/cmd/wfdebug
 **2. 运行示例 worker**（另开一个终端）
 
 ```bash
-go run ./workflow/examples/debugger -run order-1
+go run ./cflow/examples/debugger -run order-1
 ```
 
 | 参数 | 默认值 | 说明 |
@@ -52,7 +52,7 @@ go run ./workflow/examples/debugger -run order-1
 把 `engine.Drive` 换成 `debugger.Run`：
 
 ```go
-import "github.com/k0923/go/workflow/debugger"
+import "github.com/k0923/go/cflow/debugger"
 
 result, err := debugger.Run(ctx, definition, input, debugger.Options{
     RunID: "order-1", // 可选；复用同一 ID 可在进程重启后恢复
@@ -137,6 +137,6 @@ curl localhost:7788/api/runs/order-1
 ## 开发本工具
 
 ```sh
-go test -race ./workflow/debugger
-node --test workflow/debugger/ui_regression_test.cjs
+go test -race ./cflow/debugger
+node --test cflow/debugger/ui_regression_test.cjs
 ```

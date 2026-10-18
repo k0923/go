@@ -10,8 +10,8 @@ import (
 	"testing"
 	"time"
 
-	. "github.com/k0923/go/workflow"
-	"github.com/k0923/go/workflow/memory"
+	. "github.com/k0923/go/cflow"
+	"github.com/k0923/go/cflow/memory"
 )
 
 // These tests exercise the nesting introduced by FlowContext.RunFlow/GoFlow:

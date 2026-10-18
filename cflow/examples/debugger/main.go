@@ -1,15 +1,15 @@
 // Demo worker for the workflow debugger. Start the server first:
 //
-//	go run ./workflow/cmd/wfdebug
-//	go run ./workflow/examples/debugger -run order-1
+//	go run ./cflow/cmd/wfdebug
+//	go run ./cflow/examples/debugger -run order-1
 //
 // Open http://127.0.0.1:7788, answer the "approval" WaitFor with a JSON such
 // as {"approved": true, "by": "alice"}, or fire the Sleep timers early.
 // Start several workers with different -run values to debug them side by side.
 // workflow debugger 的演示 worker。请先启动服务：
 //
-//	go run ./workflow/cmd/wfdebug
-//	go run ./workflow/examples/debugger -run order-1
+//	go run ./cflow/cmd/wfdebug
+//	go run ./cflow/examples/debugger -run order-1
 //
 // 打开 http://127.0.0.1:7788，用类似 {"approved": true, "by": "alice"} 的 JSON
 // 回答 "approval" WaitFor，或提前触发 Sleep 计时器。使用不同 -run 值启动多个 worker，
@@ -28,8 +28,8 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/k0923/go/workflow"
-	"github.com/k0923/go/workflow/debugger"
+	"github.com/k0923/go/cflow"
+	"github.com/k0923/go/cflow/debugger"
 )
 
 type Order struct {

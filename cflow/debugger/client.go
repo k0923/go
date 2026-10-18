@@ -12,8 +12,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/k0923/go/workflow"
-	"github.com/k0923/go/workflow/memory"
+	"github.com/k0923/go/cflow"
+	"github.com/k0923/go/cflow/memory"
 )
 
 // Client is a cflow.Infrastructure (plus memory.Outbox and
@@ -29,7 +29,7 @@ type Client struct {
 
 var (
 	_ cflow.Infrastructure        = (*Client)(nil)
-	_ memory.Outbox                  = (*Client)(nil)
+	_ memory.Outbox               = (*Client)(nil)
 	_ cflow.WaitAnyInfrastructure = (*Client)(nil)
 )
 
