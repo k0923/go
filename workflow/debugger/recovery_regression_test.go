@@ -329,32 +329,42 @@ func TestEventOutageRetainsBatchAndReportsIncompleteTimeline(t *testing.T) {
 	}
 }
 
-func TestStoreMigratesRecordsWithoutTypePath(t *testing.T) {
+func TestStoreRejectsDatabaseWithoutPath(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "old.db")
 	db, err := sql.Open("sqlite", path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	// The records table as it existed before Record.Type.
-	// Record.Type 引入之前的 records 表结构。
+	// The records table as it existed before Record.Path.
+	// Record.Path 引入之前的 records 表结构。
 	_, err = db.Exec(`CREATE TABLE records (run_id TEXT NOT NULL, key TEXT NOT NULL, kind TEXT NOT NULL,
 		status TEXT NOT NULL, version INTEGER NOT NULL, input BLOB, result BLOB, error TEXT NOT NULL DEFAULT '',
 		until INTEGER NOT NULL DEFAULT 0, started_at INTEGER NOT NULL DEFAULT 0, ended_at INTEGER NOT NULL DEFAULT 0,
-		updated_at INTEGER NOT NULL DEFAULT 0, group_key TEXT NOT NULL DEFAULT '', PRIMARY KEY (run_id, key));
-		INSERT INTO records (run_id, key, kind, status, version, input, result) VALUES ('old', 'step', 'ACTION', 'COMPLETED', 1, '1', '5')`)
+		updated_at INTEGER NOT NULL DEFAULT 0, group_key TEXT NOT NULL DEFAULT '', type_path TEXT NOT NULL DEFAULT '',
+		PRIMARY KEY (run_id, key))`)
 	db.Close()
 	if err != nil {
 		t.Fatal(err)
 	}
-	for range 2 { // reopening an upgraded database is a no-op
-		store, err := OpenStore(path)
-		if err != nil {
-			t.Fatal(err)
+	if store, err := OpenStore(path); err == nil || !strings.Contains(err.Error(), "predates Record.Path") {
+		if store != nil {
+			store.Close()
 		}
-		record, err := store.Get(context.Background(), "old", "step")
-		store.Close()
-		if err != nil || record == nil || record.Type != "" || string(record.Result) != "5" {
-			t.Fatalf("%+v %v", record, err)
-		}
+		t.Fatalf("old schema must be rejected: %v", err)
+	}
+}
+
+func TestStorePersistsPath(t *testing.T) {
+	f := newFixture(t)
+	_, client := f.engine(t, "pathrun")
+	ctx := context.Background()
+	want := workflow.Path{{Name: "agent", ID: "a|b"}, {Name: "approve"}}
+	if _, err := client.Put(ctx, &workflow.Record{Key: workflow.DefaultKey(want), Path: want, Kind: workflow.SignalKind,
+		Status: workflow.Suspended, Input: json.RawMessage(`1`)}); err != nil {
+		t.Fatal(err)
+	}
+	record, err := client.Get(ctx, `agent[a\|b]|approve`)
+	if err != nil || record == nil || !record.Path.Equal(want) {
+		t.Fatalf("%+v %v", record, err)
 	}
 }

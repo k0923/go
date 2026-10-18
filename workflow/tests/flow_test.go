@@ -221,15 +221,15 @@ func TestFutureWait(t *testing.T) {
 	}
 }
 
-func TestWorkflowContextGoFlow(t *testing.T) {
+func TestRootGoFlow(t *testing.T) {
 	t.Run("all suspensions collected", func(t *testing.T) {
 		e := testEngine(t, memory.New(), Options{})
 		child := FlowFunc[int, string](func(f *FlowContext, in int) (string, error) { return f.WaitFor[string]("callback", in), nil })
-		flow := NewWorkflow("test", "1", func(f *WorkflowContext, in int) (int, error) {
+		flow := NewWorkflow("test", "1", FlowFunc[int, int](func(f *FlowContext, in int) (int, error) {
 			f.GoFlow("left", child, in)
 			f.GoFlow("right", child, in)
 			return 99, nil
-		})
+		}))
 		result, err := e.Drive(context.Background(), flow, 0)
 		if err != nil || result.Status != Suspended || len(result.Pending) != 2 {
 			t.Fatalf("%+v %v", result, err)

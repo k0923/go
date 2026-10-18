@@ -66,15 +66,14 @@ func TestOptionalInfrastructure(t *testing.T) {
 		if store.gets.Load() != 0 || store.puts.Load() != 0 || calls != 1 {
 			t.Fatalf("gets=%d puts=%d calls=%d", store.gets.Load(), store.puts.Load(), calls)
 		}
-		// A changed input replays the preloaded record; a changed type is drift.
-		// 输入变化时回放预加载记录；类型变化才是漂移。
+		// A changed input replays the preloaded record; a changed kind is drift.
+		// 输入变化时回放预加载记录；Kind 变化才是漂移。
 		input = 2
 		if result, err := e.Drive(ctx, flow, 1); err != nil || result.Status != Completed || calls != 1 {
 			t.Fatalf("%+v %v calls=%d", result, err, calls)
 		}
 		changed := definition(FlowFunc[int, string](func(f *FlowContext, in int) (string, error) {
-			out, err := f.Run("step", Pure(func(int) int { return 0 }), input)
-			return fmt.Sprint(out), err
+			return fmt.Sprint(f.WaitFor[int]("step", input)), nil
 		}))
 		if result, err := e.Drive(ctx, changed, 1); result.Status != Failed || !errors.Is(err, ErrChanged) {
 			t.Fatalf("%+v %v", result, err)
@@ -98,7 +97,7 @@ func TestOptionalInfrastructure(t *testing.T) {
 	t.Run("single Flow workflow stores unprefixed keys", func(t *testing.T) {
 		store := memory.New()
 		e := testEngine(t, store, Options{})
-		flow := NewWorkflowFromFlow("order", "1", FlowFunc[int, int](func(f *FlowContext, in int) (int, error) {
+		flow := NewWorkflow("order", "1", FlowFunc[int, int](func(f *FlowContext, in int) (int, error) {
 			return f.Run("charge", Pure(func(in int) int { return in * 2 }), in)
 		}))
 		if result, err := e.Drive(ctx, flow, 2); err != nil || result.Output != 4 {
@@ -107,7 +106,7 @@ func TestOptionalInfrastructure(t *testing.T) {
 		if record, _ := store.Get(ctx, "charge"); record == nil || record.Status != Completed {
 			t.Fatal("charge not stored at its local key", record)
 		}
-		if _, err := e.Drive(ctx, NewWorkflowFromFlow[int, int]("order", "1", nil), 2); !errors.Is(err, ErrInvalid) {
+		if _, err := e.Drive(ctx, NewWorkflow[int, int]("order", "1", nil), 2); !errors.Is(err, ErrInvalid) {
 			t.Fatal(err)
 		}
 	})

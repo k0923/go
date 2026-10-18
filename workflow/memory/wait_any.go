@@ -67,8 +67,9 @@ func (m *Infrastructure) WaitAny(ctx context.Context, key string, requests []wor
 		raw := append(json.RawMessage(nil), request.Request...)
 		storedRequest := request
 		storedRequest.Request = raw
+		storedRequest.Path = append(workflow.Path(nil), request.Path...)
 		group.requests = append(group.requests, storedRequest)
-		record := &workflow.Record{Key: request.Key, Kind: request.Kind, Status: workflow.Suspended, Version: 1, Type: request.Type,
+		record := &workflow.Record{Key: request.Key, Path: append(workflow.Path(nil), request.Path...), Kind: request.Kind, Status: workflow.Suspended, Version: 1, Type: request.Type,
 			Input: raw, StartedAt: m.now()}
 		if request.Error != "" {
 			record.Status, record.Error, record.EndedAt = workflow.Failed, request.Error, m.now()
@@ -105,6 +106,9 @@ func (m *Infrastructure) WaitAny(ctx context.Context, key string, requests []wor
 func copyWaitAnyState(state workflow.WaitAnyState) *workflow.WaitAnyState {
 	state.Response = append(json.RawMessage(nil), state.Response...)
 	state.Pending = append([]workflow.Pending(nil), state.Pending...)
+	for i := range state.Pending {
+		state.Pending[i].Path = append(workflow.Path(nil), state.Pending[i].Path...)
+	}
 	state.Failures = append([]workflow.WaitFailure(nil), state.Failures...)
 	return &state
 }
@@ -186,7 +190,7 @@ func (m *Infrastructure) FailWait(ctx context.Context, key string, version int64
 }
 
 func pendingRecord(record *workflow.Record) workflow.Pending {
-	return workflow.Pending{Key: record.Key, Kind: record.Kind, Until: record.Until}
+	return workflow.Pending{Key: record.Key, Path: append(workflow.Path(nil), record.Path...), Kind: record.Kind, Until: record.Until}
 }
 
 // A due timer is resolved under the same lock used by callbacks. Among due

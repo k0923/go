@@ -17,18 +17,19 @@ import (
 	"github.com/k0923/go/workflow/memory"
 )
 
+// One context remains: Flows compose Actions, waits and Flows. What stays
+// forbidden at compile time is executing a Workflow as a step or outside Drive.
+// 只保留一种上下文：Flow 组合 Action、等待与 Flow。编译期仍禁止的是把 Workflow
+// 当作步骤执行，或在 Drive 之外执行它。
 func TestFlowCallHierarchy(t *testing.T) {
 	// Compile external business code, rather than merely inspecting private flags.
 	source := `package boundary
 import "github.com/k0923/go/workflow"
-func forbidden(f *workflow.FlowContext, w *workflow.WorkflowContext, root workflow.Workflow[int, int], leaf workflow.Flow[int, int]) {
-	f.RunFlow("nested", leaf, 1)
-	f.GoFlow("nested", leaf, 1)
-	w.Run("action", workflow.Pure(func(i int) int { return i }), 1)
-	w.Sleep("timer", 0)
-	root.Run(w, 1)
-	w.RunFlow[int, int]("root", root, 1)
-	_ = (*workflow.WorkflowContext)(f)
+func forbidden(f *workflow.FlowContext, root workflow.Workflow[int, int]) {
+	root.Run(f, 1)
+	f.RunFlow[int, int]("root", root, 1)
+	var _ workflow.Flow[int, int] = root
+	_ = workflow.WorkflowContext{}
 }
 `
 	path := filepath.Join(t.TempDir(), "boundary.go")
@@ -42,8 +43,7 @@ func forbidden(f *workflow.FlowContext, w *workflow.WorkflowContext, root workfl
 		t.Fatalf("expected compile-time rejection, got %v: %s", err, output)
 	}
 	for _, want := range []string{
-		"f.RunFlow undefined", "f.GoFlow undefined", "w.Run undefined",
-		"w.Sleep undefined", "root.Run undefined", "missing method Run", "cannot convert f",
+		"root.Run undefined", "missing method Run", "undefined: workflow.WorkflowContext",
 	} {
 		if !strings.Contains(string(output), want) {
 			t.Errorf("missing compiler rejection %q:\n%s", want, output)
@@ -70,7 +70,7 @@ func TestParallelFlowWaitRecovery(t *testing.T) {
 			r := &run{store: memory.New()}
 			r.store.SetClock(now)
 			r.engine = testEngine(t, r.store, Options{Now: now})
-			r.flow = NewWorkflow("test", "1", func(f *WorkflowContext, input int) (int, error) {
+			r.flow = NewWorkflow("test", "1", FlowFunc[int, int](func(f *FlowContext, input int) (int, error) {
 				futures := make([]*Future[int], branches)
 				for index := range branches {
 					child := FlowFunc[int, int](func(child *FlowContext, input int) (int, error) {
@@ -101,7 +101,7 @@ func TestParallelFlowWaitRecovery(t *testing.T) {
 					total += value
 				}
 				return total, nil
-			})
+			}))
 			all[i] = r
 		}
 		for stage := range 4 {
@@ -180,7 +180,7 @@ func TestParallelFlowWaitRecovery(t *testing.T) {
 			}
 		}
 	})
-	t.Run("same scope replays a changed request and rejects a changed type", func(t *testing.T) {
+	t.Run("same scope replays a changed request and a changed type", func(t *testing.T) {
 		store := memory.New()
 		engine := testEngine(t, store, Options{})
 		var changed atomic.Int32
@@ -199,11 +199,13 @@ func TestParallelFlowWaitRecovery(t *testing.T) {
 		if err != nil || second.Status != Suspended || record == nil || string(record.Input) != "1" || changed.Load() != 1 {
 			t.Fatalf("%+v %v %+v changed=%d", second, err, record, changed.Load())
 		}
+		var typeChanged atomic.Int32
+		defer engine.Subscribe(func(context.Context, Event) { typeChanged.Add(1) }, TypeChanged)()
 		typed := definition(FlowFunc[int, string](func(f *FlowContext, _ int) (string, error) {
 			return fmt.Sprint(f.WaitFor[int]("reply", request)), nil
 		}))
-		if _, err = engine.Drive(context.Background(), typed, 0); !errors.Is(err, ErrChanged) {
-			t.Fatal(err)
+		if result, err := engine.Drive(context.Background(), typed, 0); err != nil || result.Status != Suspended || typeChanged.Load() != 1 {
+			t.Fatalf("%+v %v type_changed=%d", result, err, typeChanged.Load())
 		}
 	})
 	t.Run("redundant drives enqueue one request and one wake", func(t *testing.T) {
@@ -267,7 +269,7 @@ func TestFlowScopeJoinsActions(t *testing.T) {
 				return 1, nil
 			})
 			var continued atomic.Int32
-			root := NewWorkflow("test", "1", func(f *WorkflowContext, input int) (int, error) {
+			root := NewWorkflow("test", "1", FlowFunc[int, int](func(f *FlowContext, input int) (int, error) {
 				var value int
 				var err error
 				if mode == "RunFlow" {
@@ -280,7 +282,7 @@ func TestFlowScopeJoinsActions(t *testing.T) {
 				}
 				continued.Add(1)
 				return value, nil
-			})
+			}))
 			result, err := engine.Drive(context.Background(), root, 1)
 			if !errors.Is(err, cause) || result.Status != Running || continued.Load() != 0 {
 				t.Fatalf("%+v %v", result, err)
@@ -305,7 +307,7 @@ func TestFlowScopeJoinsActions(t *testing.T) {
 			f.WaitFor[string]("reply", input)
 			return 0, nil
 		})
-		root := NewWorkflow("test", "1", func(f *WorkflowContext, input int) (int, error) { return f.GoFlow("child", child, input).Wait() })
+		root := NewWorkflow("test", "1", FlowFunc[int, int](func(f *FlowContext, input int) (int, error) { return f.GoFlow("child", child, input).Wait() }))
 		result, err := engine.Drive(ctx, root, 1)
 		if !errors.Is(err, context.Canceled) || result.Status != Running {
 			t.Fatalf("%+v %v", result, err)
@@ -333,7 +335,7 @@ func TestParallelFlowWaitAny(t *testing.T) {
 		winner := f.WaitAny("race", OnSignal[string]("reply", input), OnSleep("timeout", time.Hour))
 		return string(winner.Kind()), nil
 	})
-	root := NewWorkflow("test", "1", func(f *WorkflowContext, input int) (string, error) {
+	root := NewWorkflow("test", "1", FlowFunc[int, string](func(f *FlowContext, input int) (string, error) {
 		left := f.GoFlow("left", candidate, input)
 		right := f.GoFlow("right", candidate, input)
 		l, err := left.Wait()
@@ -342,7 +344,7 @@ func TestParallelFlowWaitAny(t *testing.T) {
 		}
 		r, err := right.Wait()
 		return l + "+" + r, err
-	})
+	}))
 	ctx := context.Background()
 	result, err := engine.Drive(ctx, root, 1)
 	if err != nil || result.Status != Suspended || len(result.Pending) != 4 {

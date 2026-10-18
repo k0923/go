@@ -54,6 +54,7 @@ CREATE TABLE IF NOT EXISTS records (
 	updated_at INTEGER NOT NULL DEFAULT 0,
 	group_key TEXT NOT NULL DEFAULT '',
 	type_path TEXT NOT NULL DEFAULT '',
+	path TEXT NOT NULL DEFAULT '',
 	PRIMARY KEY (run_id, key)
 );
 CREATE TABLE IF NOT EXISTS leases (
@@ -134,12 +135,12 @@ func OpenStore(path string) (*Store, error) {
 		db.Close()
 		return nil, err
 	}
-	// Databases created before Record.Type lack the column; their records keep
-	// an empty type path and therefore strict input comparison.
-	// Record.Type 之前创建的数据库缺少该列；其中的记录类型路径为空，因此仍按输入严格比较。
-	var hasType int
-	if err = db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('records') WHERE name = 'type_path'`).Scan(&hasType); err == nil && hasType == 0 {
-		_, err = db.Exec(`ALTER TABLE records ADD COLUMN type_path TEXT NOT NULL DEFAULT ''`)
+	// The schema is pre-release: an older database without the path column is
+	// not migrated. Delete it (or pass a new -db) to start fresh.
+	// schema 尚未发布：缺少 path 列的旧数据库不做迁移，删除它（或换一个 -db）重新开始。
+	var hasPath int
+	if err = db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('records') WHERE name = 'path'`).Scan(&hasPath); err == nil && hasPath == 0 {
+		err = fmt.Errorf("debugger database %s predates Record.Path; delete it to start fresh", path)
 	}
 	if err != nil {
 		db.Close()
@@ -275,9 +276,9 @@ func (t *txn) record(key string) (*workflow.Record, string, error) {
 	var r workflow.Record
 	var group string
 	var until, started, ended int64
-	err := t.tx.QueryRow(`SELECT key, kind, status, version, type_path, input, result, error, until, started_at, ended_at, group_key
+	err := t.tx.QueryRow(`SELECT key, path, kind, status, version, type_path, input, result, error, until, started_at, ended_at, group_key
 		FROM records WHERE run_id = ? AND key = ?`, t.run, key).
-		Scan(&r.Key, &r.Kind, &r.Status, &r.Version, &r.Type, blob{&r.Input}, blob{&r.Result}, &r.Error, &until, &started, &ended, &group)
+		Scan(&r.Key, pathColumn{&r.Path}, &r.Kind, &r.Status, &r.Version, &r.Type, blob{&r.Input}, blob{&r.Result}, &r.Error, &until, &started, &ended, &group)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, "", nil
 	}
@@ -291,9 +292,9 @@ func (t *txn) record(key string) (*workflow.Record, string, error) {
 
 func (t *txn) saveRecord(r *workflow.Record, group string) error {
 	_, err := t.exec(`INSERT OR REPLACE INTO records
-		(run_id, key, kind, status, version, type_path, input, result, error, until, started_at, ended_at, updated_at, group_key)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		t.run, r.Key, r.Kind, r.Status, r.Version, r.Type, []byte(r.Input), []byte(r.Result), r.Error,
+		(run_id, key, path, kind, status, version, type_path, input, result, error, until, started_at, ended_at, updated_at, group_key)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		t.run, r.Key, encodePath(r.Path), r.Kind, r.Status, r.Version, r.Type, []byte(r.Input), []byte(r.Result), r.Error,
 		ts(r.Until), ts(r.StartedAt), ts(r.EndedAt), ts(t.now), group)
 	return err
 }
@@ -725,7 +726,7 @@ func (s *Store) WaitAny(ctx context.Context, run, key string, requests []workflo
 		for _, request := range requests {
 			request.Request = clone(request.Request)
 			g.Requests = append(g.Requests, request)
-			record := &workflow.Record{Key: request.Key, Kind: request.Kind, Status: workflow.Suspended,
+			record := &workflow.Record{Key: request.Key, Path: request.Path, Kind: request.Kind, Status: workflow.Suspended,
 				Version: 1, Type: request.Type, Input: clone(request.Request), StartedAt: t.now}
 			if request.Error != "" {
 				record.Status, record.Error, record.EndedAt = workflow.Failed, request.Error, t.now
@@ -775,7 +776,38 @@ func (s *Store) WaitAny(ctx context.Context, run, key string, requests []workflo
 }
 
 func pendingOf(r *workflow.Record) workflow.Pending {
-	return workflow.Pending{Key: r.Key, Kind: r.Kind, Until: r.Until}
+	return workflow.Pending{Key: r.Key, Path: r.Path, Kind: r.Kind, Until: r.Until}
+}
+
+// The path column stores Record.Path as JSON, so queries and the UI get the
+// structured address instead of splitting the key.
+// path 列以 JSON 存储 Record.Path，查询与 UI 拿到结构化地址，而不必拆分 key。
+func encodePath(p workflow.Path) string {
+	if len(p) == 0 {
+		return ""
+	}
+	raw, _ := json.Marshal(p)
+	return string(raw)
+}
+
+type pathColumn struct{ dst *workflow.Path }
+
+func (c pathColumn) Scan(value any) error {
+	var raw []byte
+	switch v := value.(type) {
+	case nil:
+	case string:
+		raw = []byte(v)
+	case []byte:
+		raw = v
+	default:
+		return fmt.Errorf("unsupported path %T", value)
+	}
+	*c.dst = nil
+	if len(raw) == 0 {
+		return nil
+	}
+	return json.Unmarshal(raw, c.dst)
 }
 
 // settleGroup selects the winner, cancels losers and withdraws their
@@ -1197,7 +1229,7 @@ func (s *Store) Detail(ctx context.Context, run string) (*RunDetail, error) {
 		return nil, err
 	}
 	detail := &RunDetail{Run: info, Records: []RecordView{}, Groups: []GroupView{}, Messages: []MessageView{}, Now: s.now()}
-	rows, err := s.db.QueryContext(ctx, `SELECT key, kind, status, version, type_path, input, result, error, until, started_at, ended_at, updated_at, group_key
+	rows, err := s.db.QueryContext(ctx, `SELECT key, path, kind, status, version, type_path, input, result, error, until, started_at, ended_at, updated_at, group_key
 		FROM records WHERE run_id = ? ORDER BY started_at, rowid`, run)
 	if err != nil {
 		return nil, err
@@ -1205,7 +1237,7 @@ func (s *Store) Detail(ctx context.Context, run string) (*RunDetail, error) {
 	for rows.Next() {
 		var v RecordView
 		var until, started, ended, updated int64
-		if err = rows.Scan(&v.Key, &v.Kind, &v.Status, &v.Version, &v.Type, blob{&v.Input}, blob{&v.Result}, &v.Error,
+		if err = rows.Scan(&v.Key, pathColumn{&v.Path}, &v.Kind, &v.Status, &v.Version, &v.Type, blob{&v.Input}, blob{&v.Result}, &v.Error,
 			&until, &started, &ended, &updated, &v.Group); err != nil {
 			rows.Close()
 			return nil, err

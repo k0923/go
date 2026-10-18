@@ -36,9 +36,9 @@ func run() error {
 		// 下游工作会立即开始，而不会等待另一个响应。
 		return f.Run("continue", workflow.Pure(func(answer string) string { return "continued: " + answer }), answer)
 	})
-	definition := workflow.NewWorkflow("approval", "1", func(w *workflow.WorkflowContext, input string) (string, error) {
-		return w.RunFlow("main", flow, input)
-	})
+	definition := workflow.NewWorkflow("approval", "1", workflow.FlowFunc[string, string](func(f *workflow.FlowContext, input string) (string, error) {
+		return f.RunFlow("main", flow, input)
+	}))
 	waiting, err := engine.Drive(ctx, definition, "order_123")
 	if err != nil {
 		return err

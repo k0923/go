@@ -58,9 +58,9 @@ func main() {
 		panic(err)
 	}
 	repository := &Repository{}
-	definition := workflow.NewWorkflow("order", "1", func(w *workflow.WorkflowContext, input string) (Order, error) {
-		return w.RunFlow("order", OrderFlow{LoadOrder: LoadOrderAction{Repository: repository}}, input)
-	})
+	definition := workflow.NewWorkflow("order", "1", workflow.FlowFunc[string, Order](func(f *workflow.FlowContext, input string) (Order, error) {
+		return f.RunFlow("order", OrderFlow{LoadOrder: LoadOrderAction{Repository: repository}}, input)
+	}))
 	for i := 0; i < 2; i++ {
 		result, err := engine.Drive(context.Background(), definition, "order_123")
 		if err != nil {

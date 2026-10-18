@@ -82,6 +82,7 @@ func copyRecord(r *workflow.Record) *workflow.Record {
 		return nil
 	}
 	c := *r
+	c.Path = append(workflow.Path(nil), r.Path...)
 	c.Input = append(json.RawMessage(nil), r.Input...)
 	c.Result = append(json.RawMessage(nil), r.Result...)
 	return &c

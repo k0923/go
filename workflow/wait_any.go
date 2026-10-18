@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"sync/atomic"
 	"time"
 )
@@ -30,9 +31,12 @@ import (
 //
 // Case 只能使用一次：每次调用 WaitAny 时都要在 Flow 内部重新构造。
 type Case interface {
-	// Key is the resolved storage key once WaitAny ran, the local key before.
-	// Key 在 WaitAny 执行后是解析后的存储 key，之前是局部 key。
+	// Key is the built storage key once WaitAny ran, the local name before.
+	// Key 在 WaitAny 执行后是构建出的存储 key，之前是局部名字。
 	Key() string
+	// Path is the structured address once WaitAny ran.
+	// Path 是 WaitAny 执行后的结构化地址。
+	Path() Path
 	Kind() Kind
 	// Failure is this candidate's isolated error; empty if it did not fail.
 	// Failure 是该候选项被隔离的错误；未失败时为空。
@@ -41,7 +45,10 @@ type Case interface {
 }
 
 type waitCase struct {
-	key      string
+	key      string // local name before WaitAny, built key after
+	id       string // request.StepKey() for signals
+	idErr    error
+	path     Path
 	kind     Kind
 	typ      string // leaf type segment, e.g. "signal[Request,Response]"
 	duration time.Duration
@@ -53,6 +60,7 @@ type waitCase struct {
 }
 
 func (c *waitCase) Key() string       { return c.key }
+func (c *waitCase) Path() Path        { return slices.Clone(c.path) }
 func (c *waitCase) Kind() Kind        { return c.kind }
 func (c *waitCase) Failure() string   { return c.failure }
 func (c *waitCase) member() *waitCase { return c }
@@ -69,9 +77,10 @@ type SignalCase[Response any] struct {
 func (c *SignalCase[Response]) Value() Response { return c.value }
 
 // OnSignal describes a WaitFor candidate. Response is explicit, Request is
-// inferred: OnSignal[Approval]("approval", order).
+// inferred: OnSignal[Approval]("approval", order). A request implementing
+// StepKeyer addresses the member as name[request.StepKey()].
 // OnSignal 描述一个 WaitFor 候选项。Response 需显式指定，Request 自动推断：
-// OnSignal[Approval]("approval", order)。
+// OnSignal[Approval]("approval", order)。请求实现 StepKeyer 时成员地址为 name[request.StepKey()]。
 func OnSignal[Response, Request any](key string, request Request) *SignalCase[Response] {
 	return OnKind[Response](SignalKind, key, request)
 }
@@ -88,6 +97,7 @@ func OnKind[Response, Request any](kind Kind, key string, request Request) *Sign
 	}
 	c := &SignalCase[Response]{}
 	c.key, c.kind, c.typ = key, kind, signature[Request, Response]("signal")
+	c.id, c.idErr = stepID(request)
 	c.encode = func() (json.RawMessage, error) { return json.Marshal(request) }
 	c.decode = func(raw json.RawMessage) error { return decode(raw, &c.value) }
 	return c
@@ -119,14 +129,15 @@ type WaitFailure struct {
 }
 
 // WaitRequest is the transport representation consumed by storage adapters.
-// WaitRequest 是存储适配器消费的传输层表示。
+// Replay identity of a member is Key + Kind (+ Path): Request, Duration, Until,
+// Type and encoding failure are inputs fixed by the first registration.
+// WaitRequest 是存储适配器消费的传输层表示。成员的回放身份为 Key + Kind（+ Path）：
+// Request、Duration、Until、Type 及编码是否失败都是以首次注册为准的输入。
 type WaitRequest struct {
-	Key string
-	// Type is the member's type path (see Record.Type). When the stored request
-	// has one, replay identity is Key + Kind + Type: Request, Duration, Until
-	// and encoding failure are inputs fixed by the first registration.
-	// Type 是成员的类型路径（见 Record.Type）。已存储的请求带 Type 时，回放身份为
-	// Key + Kind + Type：Request、Duration、Until 及编码是否失败都是以首次注册为准的输入。
+	Key  string
+	Path Path `json:",omitempty"`
+	// Type is the member's leaf signature, kept for observation only.
+	// Type 是成员的叶子签名，仅用于观测。
 	Type     string `json:",omitempty"`
 	Request  json.RawMessage
 	Kind     Kind
@@ -138,19 +149,11 @@ type WaitRequest struct {
 }
 
 // SameWaitMember reports whether a re-submitted member matches the stored
-// one. Storage adapters use it for every member, in order. A stored request
-// without Type predates type identity and is compared strictly.
-// SameWaitMember 判断重新提交的成员是否与已存储成员匹配。存储适配器按顺序对每个
-// 成员使用它。没有 Type 的已存储请求早于类型身份，按严格方式比较。
+// one. Storage adapters use it for every member, in order.
+// SameWaitMember 判断重新提交的成员是否与已存储成员匹配。存储适配器按顺序对每个成员使用它。
 func SameWaitMember(stored, request WaitRequest) bool {
-	if request.Key != stored.Key || request.Kind != stored.Kind {
-		return false
-	}
-	if stored.Type != "" {
-		return request.Type == stored.Type
-	}
-	return request.Duration == stored.Duration && request.Until.Equal(stored.Until) &&
-		(request.Error == "") == (stored.Error == "") && sameJSON(request.Request, stored.Request)
+	return request.Key == stored.Key && request.Kind == stored.Kind &&
+		(stored.Path == nil || stored.Path.Equal(request.Path))
 }
 
 // sameJSON treats an absent payload and JSON null as equal, because a nil
@@ -231,8 +234,12 @@ var ErrSignalUnsupported = errors.New("signal kind unsupported")
 // （FailWait、请求无法编码）只会剔除该候选项（见 Case.Failure）；没有候选项剩余时，
 // drive 以 ErrWaitFailed 终态失败。如需让 Flow 降级，请由提供方回答一个类型化的失败值，
 // 或加入计时器候选项。无效 key 拓扑和被重复使用的 Case 会在注册前被拒绝。
+// The group name is fixed; give it an identity with a Scope when the same
+// WaitAny runs in a loop: f.Scope("call", call.ID).WaitAny("approve", ...).
+// 组名固定；同一个 WaitAny 在循环中运行时，用 Scope 赋予身份：
+// f.Scope("call", call.ID).WaitAny("approve", ...)。
 func (f *FlowContext) WaitAny(key string, cases ...Case) Case {
-	group := f.claim(key)
+	groupPath, group := f.claim(key, "")
 	api, ok := f.execution.engine.store.(WaitAnyInfrastructure)
 	if !ok {
 		f.must(ErrWaitAnyUnsupported)
@@ -256,15 +263,18 @@ func (f *FlowContext) WaitAny(key string, cases ...Case) Case {
 	}
 	// Validate every key before any external registration.
 	// 在任何外部注册发生前验证每个 key。
-	child := &FlowContext{execution: f.execution, prefix: group, types: f.typePath("any"), scope: f.scope, strand: f.strand}
+	child := &FlowContext{execution: f.execution, path: groupPath, depth: f.depth, scope: f.scope, strand: f.strand}
 	index := make(map[string]int, len(members))
 	for i, member := range members {
-		member.key = child.claim(member.key)
+		if member.idErr != nil {
+			child.fail(member.idErr)
+		}
+		member.path, member.key = child.claim(member.key, member.id)
 		index[member.key] = i
 	}
 	requests := make([]WaitRequest, len(members))
 	for i, member := range members {
-		request := WaitRequest{Key: member.key, Type: child.typePath(member.typ), Kind: member.kind,
+		request := WaitRequest{Key: member.key, Path: member.path, Type: member.typ, Kind: member.kind,
 			Duration: member.duration, Until: member.until}
 		if member.encode != nil {
 			raw, marshalErr := invoke(member.encode)
@@ -309,12 +319,16 @@ func (f *FlowContext) WaitAny(key string, cases ...Case) Case {
 		if len(state.Pending) == 0 {
 			f.must(fmt.Errorf("%w: suspended group has no pending members", ErrInvalid))
 		}
-		for _, pending := range state.Pending {
-			f.execution.engine.emit(f.Context(), Event{Type: WaitSuspended, Key: pending.Key, Kind: pending.Kind,
-				Status: Suspended, Pending: []Pending{pending},
+		pendings := slices.Clone(state.Pending)
+		for j, pending := range pendings {
+			if i, known := index[pending.Key]; known && pending.Path == nil {
+				pendings[j].Path = members[i].path
+			}
+			f.execution.engine.emit(f.Context(), Event{Type: WaitSuspended, Key: pending.Key, Path: pendings[j].Path, Kind: pending.Kind,
+				Status: Suspended, Pending: []Pending{pendings[j]},
 			}, nil)
 		}
-		f.suspend(state.Pending...)
+		f.suspend(pendings...)
 	default:
 		f.must(ErrInvalid)
 	}

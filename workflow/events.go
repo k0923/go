@@ -27,6 +27,13 @@ const (
 	// InputChanged 警告回放步骤的输入与持久化输入不同。回放身份是 key + kind + type，
 	// 因此仍返回持久化结果；drive 不会失败。
 	InputChanged EventType = "input_changed"
+	// TypeChanged warns that a replayed step's leaf I/O signature differs from
+	// the recorded one (a renamed or moved type, or a real change). Types are
+	// not replay identity: the persisted outcome is decoded and the drive goes
+	// on. StepType is the current signature, StoredType the recorded one.
+	// TypeChanged 警告回放步骤的叶子 I/O 签名与记录不同（类型改名、换包，或真实变更）。
+	// 类型不属于回放身份：仍解码持久化结果、drive 继续。StepType 为当前签名，StoredType 为记录值。
+	TypeChanged EventType = "type_changed"
 )
 
 // Event is a versioned, JSON-serializable observation, not a durable outbox
@@ -41,24 +48,30 @@ const (
 // 没有 ExecutionID；需要通过带作用域的 key 关联。Sequence 仅对一个 Engine 内的
 // 事件生产排序，不对并发回调投递排序。
 type Event struct {
-	SchemaVersion   int           `json:"schema_version"`
-	ID              string        `json:"id"`
-	EngineID        string        `json:"engine_id"`
-	Sequence        uint64        `json:"sequence"`
-	ExecutionID     string        `json:"execution_id,omitempty"`
-	WorkflowName    string        `json:"workflow_name,omitempty"`
-	WorkflowVersion string        `json:"workflow_version,omitempty"`
-	Type            EventType     `json:"type"`
-	Key             string        `json:"key"`
-	Kind            Kind          `json:"kind,omitempty"`
-	Status          Status        `json:"status"`
-	At              time.Time     `json:"at"`
-	StartedAt       time.Time     `json:"started_at"`
-	Duration        time.Duration `json:"duration_ns"`
-	Replayed        bool          `json:"replayed,omitempty"`
-	RecordVersion   int64         `json:"record_version,omitempty"`
-	Pending         []Pending     `json:"pending,omitempty"`
-	Error           *EventError   `json:"error,omitempty"`
+	SchemaVersion   int       `json:"schema_version"`
+	ID              string    `json:"id"`
+	EngineID        string    `json:"engine_id"`
+	Sequence        uint64    `json:"sequence"`
+	ExecutionID     string    `json:"execution_id,omitempty"`
+	WorkflowName    string    `json:"workflow_name,omitempty"`
+	WorkflowVersion string    `json:"workflow_version,omitempty"`
+	Type            EventType `json:"type"`
+	Key             string    `json:"key"`
+	Path            Path      `json:"path,omitempty"`
+	Kind            Kind      `json:"kind,omitempty"`
+	// StepType is the step's leaf I/O signature in the CURRENT code, e.g.
+	// "action[main.Order,int]"; StoredType is the recorded one (type_changed).
+	// StepType 是当前代码中步骤的叶子 I/O 签名；StoredType 是记录中的签名（type_changed）。
+	StepType      string        `json:"step_type,omitempty"`
+	StoredType    string        `json:"stored_type,omitempty"`
+	Status        Status        `json:"status"`
+	At            time.Time     `json:"at"`
+	StartedAt     time.Time     `json:"started_at"`
+	Duration      time.Duration `json:"duration_ns"`
+	Replayed      bool          `json:"replayed,omitempty"`
+	RecordVersion int64         `json:"record_version,omitempty"`
+	Pending       []Pending     `json:"pending,omitempty"`
+	Error         *EventError   `json:"error,omitempty"`
 }
 
 // EventError contains transportable diagnostic data. It does not retain the

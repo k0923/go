@@ -3,6 +3,7 @@ package tests
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -22,13 +23,13 @@ func testEngine(t *testing.T, store Infrastructure, options Options) *Engine {
 }
 
 func definition[I, O any](fn FlowFunc[I, O]) Workflow[I, O] {
-	// Primitive tests use the single-Flow definition, so keys carry no prefix.
-	// Public orchestration is exercised separately through RunFlow/GoFlow.
-	return NewWorkflowFromFlow("test", "1", Flow[I, O](fn))
+	// The root Flow adds no namespace, so keys carry no prefix.
+	// 根 Flow 不追加命名空间，因此 key 不带前缀。
+	return NewWorkflow("test", "1", Flow[I, O](fn))
 }
 
 func TestNewEngine(t *testing.T) {
-	for _, option := range []Options{{LeaseTTL: -1}, {CleanupTimeout: -1}, {LeaseTTL: 1}} {
+	for _, option := range []Options{{LeaseTTL: -1}, {CleanupTimeout: -1}, {LeaseTTL: 1}, {MaxFlowDepth: -1}} {
 		if _, err := NewEngine(memory.New(), option); !errors.Is(err, ErrInvalid) {
 			t.Fatalf("invalid options: %v", err)
 		}
@@ -386,18 +387,50 @@ func TestFlowContextRun(t *testing.T) {
 			t.Fatalf("%+v", changed)
 		}
 	})
-	t.Run("action type change rejected", func(t *testing.T) {
+	t.Run("action type change replays with type_changed", func(t *testing.T) {
+		e := testEngine(t, memory.New(), Options{})
+		var events []Event
+		e.Subscribe(func(_ context.Context, event Event) { events = append(events, event) }, TypeChanged)
+		type v1 struct{ N int }
+		type v2 struct{ N int } // renamed type, same JSON shape
+		if _, err := e.Drive(context.Background(), definition(FlowFunc[int, int](func(f *FlowContext, _ int) (int, error) {
+			out, err := f.Run("step", Pure(func(n int) v1 { return v1{n} }), 1)
+			return out.N, err
+		})), 0); err != nil {
+			t.Fatal(err)
+		}
+		// Same key, renamed output type: replayed, not rejected.
+		// key 相同、输出类型改名：照常回放，不拒绝。
+		result, err := e.Drive(context.Background(), definition(FlowFunc[int, int](func(f *FlowContext, _ int) (int, error) {
+			out, err := f.Run("step", Pure(func(n int) v2 { t.Fatal("re-executed"); return v2{} }), 1)
+			return out.N, err
+		})), 0)
+		if err != nil || result.Status != Completed || result.Output != 1 {
+			t.Fatalf("%+v %v", result, err)
+		}
+		if len(events) != 1 || events[0].Key != "step" || events[0].StoredType == events[0].StepType ||
+			!strings.Contains(events[0].StoredType, "v1") || !strings.Contains(events[0].StepType, "v2") {
+			t.Fatalf("%+v", events)
+		}
+		// An incompatible shape still fails to decode, deterministically.
+		// 结构不兼容时解码仍会确定地失败。
+		result, err = e.Drive(context.Background(), definition(FlowFunc[int, int](func(f *FlowContext, _ int) (int, error) {
+			out, err := f.Run("step", Pure(func(n int) string { return "x" }), 1)
+			return len(out), err
+		})), 0)
+		if err == nil || result.Status != Failed {
+			t.Fatalf("%+v %v", result, err)
+		}
+	})
+	t.Run("kind change rejected", func(t *testing.T) {
 		e := testEngine(t, memory.New(), Options{})
 		if _, err := e.Drive(context.Background(), definition(FlowFunc[int, int](func(f *FlowContext, _ int) (int, error) {
 			return f.Run("step", Pure(func(n int) int { return n }), 1)
 		})), 0); err != nil {
 			t.Fatal(err)
 		}
-		// Same key and same input bytes, different output type.
-		// key 与输入字节都相同，但输出类型不同。
 		result, err := e.Drive(context.Background(), definition(FlowFunc[int, int](func(f *FlowContext, _ int) (int, error) {
-			out, err := f.Run("step", Pure(func(n int) string { return "x" }), 1)
-			return len(out), err
+			return f.WaitFor[int]("step", 1), nil
 		})), 0)
 		if !errors.Is(err, ErrChanged) || result.Status != Failed {
 			t.Fatalf("%+v %v", result, err)
@@ -405,14 +438,21 @@ func TestFlowContextRun(t *testing.T) {
 	})
 }
 
-func TestWorkflowContextRunFlow(t *testing.T) {
+func TestRootRunFlow(t *testing.T) {
 	e := testEngine(t, memory.New(), Options{})
 	leaf := FlowFunc[int, string](func(f *FlowContext, in int) (string, error) {
 		return f.Run("action", AsAction(func(ctx context.Context, _ int) (string, error) { return ActionKey(ctx), nil }), in)
 	})
-	flow := NewWorkflow("test", "1", func(f *WorkflowContext, in int) (string, error) { return f.RunFlow("leaf", leaf, in) })
+	flow := NewWorkflow("test", "1", FlowFunc[int, string](func(f *FlowContext, in int) (string, error) { return f.RunFlow("leaf", leaf, in) }))
 	result, err := e.Drive(context.Background(), flow, 1)
 	if err != nil || result.Output != "leaf|action" {
 		t.Fatalf("%+v %v", result, err)
+	}
+	// A nil root, including a typed nil FlowFunc, is rejected before running.
+	// nil 根（包括带类型的 nil FlowFunc）会在执行前被拒绝。
+	for _, root := range []Flow[int, string]{nil, FlowFunc[int, string](nil)} {
+		if result, err := e.Drive(context.Background(), NewWorkflow("test", "1", root), 1); !errors.Is(err, ErrInvalid) || result.Status == Completed {
+			t.Fatalf("%+v %v", result, err)
+		}
 	}
 }

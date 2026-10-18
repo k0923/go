@@ -15,8 +15,9 @@ import (
 	"github.com/k0923/go/lease"
 )
 
-// Flow composes Actions and signals using a context without Flow-call methods.
-// Flow 使用不含跨流程调用方法的上下文，组合 Action 和信号。
+// Flow composes Actions, waits and other Flows (nesting bounded by
+// Options.MaxFlowDepth).
+// Flow 组合 Action、等待和其他 Flow（嵌套深度受 Options.MaxFlowDepth 限制）。
 type Flow[I, O any] interface {
 	Run(*FlowContext, I) (O, error)
 }
@@ -25,36 +26,25 @@ type FlowFunc[I, O any] func(*FlowContext, I) (O, error)
 
 func (f FlowFunc[I, O]) Run(ctx *FlowContext, input I) (O, error) { return f(ctx, input) }
 
-// Workflow is a named top-level definition whose entry is invoked by Engine.
-// Construct it with NewWorkflow; it does not implement Flow or expose Run.
-// Workflow 是由引擎调用的具名顶层定义，使用 NewWorkflow 构造；
-// 它不实现 Flow，也不公开 Run 方法。
+// Workflow is a named, versioned definition rooted at ONE Flow. It does not
+// implement Flow and has no public Run: only Engine.Drive executes it. The
+// root Flow adds no namespace, so Run("charge") is stored as "charge"; it can
+// compose further Flows with RunFlow/GoFlow.
+// Workflow 是以一个 Flow 为根的具名、带版本定义。它不实现 Flow，也没有公开的 Run：
+// 只能由 Engine.Drive 执行。根 Flow 不追加命名空间，Run("charge") 存为 "charge"；
+// 它可以用 RunFlow/GoFlow 继续组合其他 Flow。
 type Workflow[I, O any] struct {
 	Name    string
 	Version string
-	run     func(*WorkflowContext, I) (O, error)
+	root    Flow[I, O]
 }
 
-// NewWorkflow defines orchestration with access only to Flow-call primitives.
-// Engine.Drive validates the name, version and handler before executing it.
-// NewWorkflow 定义顶层编排，仅提供 Flow 调用原语；
-// Engine.Drive 会在执行前校验名称、版本和处理函数。
-func NewWorkflow[I, O any](name, version string, handler func(*WorkflowContext, I) (O, error)) Workflow[I, O] {
-	return Workflow[I, O]{Name: name, Version: version, run: handler}
-}
-
-// NewWorkflowFromFlow is the one-step definition for a workflow that is a single
-// Flow. Keys carry no extra namespace: Run("charge") is stored as "charge".
-// Use NewWorkflow with RunFlow/GoFlow to compose several Flows.
-// NewWorkflowFromFlow 是“整个工作流就是一个 Flow”时的一步式定义。key 不带额外命名空间：
-// Run("charge") 存储为 "charge"。需要组合多个 Flow 时使用 NewWorkflow 加 RunFlow/GoFlow。
-func NewWorkflowFromFlow[I, O any](name, version string, flow Flow[I, O]) Workflow[I, O] {
-	if flow == nil {
-		return Workflow[I, O]{Name: name, Version: version} // Drive rejects it with ErrInvalid
-	}
-	return NewWorkflow(name, version, func(w *WorkflowContext, input I) (O, error) {
-		return w.state.runChildFlow("", flow, input)
-	})
+// NewWorkflow defines a workflow whose entry is root. Use FlowFunc for an
+// inline entry. Engine.Drive validates name, version and root before running.
+// NewWorkflow 定义一个以 root 为入口的工作流；入口可以用 FlowFunc 内联书写。
+// Engine.Drive 会在执行前校验名称、版本和 root。
+func NewWorkflow[I, O any](name, version string, root Flow[I, O]) Workflow[I, O] {
+	return Workflow[I, O]{Name: name, Version: version, root: root}
 }
 
 type Status string
@@ -80,21 +70,24 @@ const (
 )
 
 // Record is a versioned snapshot, not an append-only execution history.
-// Record 是带版本的快照，而不是仅追加的执行历史。
+// Key is BuildKey(Path): the engine and every Infrastructure lookup use Key;
+// Path is the structured address handed to storage for persistence.
+// Record 是带版本的快照，而不是仅追加的执行历史。Key 即 BuildKey(Path)：引擎和所有
+// Infrastructure 查找都用 Key；Path 是交给存储层持久化的结构化地址。
 type Record struct {
-	Key     string
-	Kind    Kind
+	Key  string
+	Path Path `json:",omitempty"`
+	Kind Kind
+	// Status/Version are the snapshot state.
+	// Status/Version 是快照状态。
 	Status  Status
 	Version int64
-	// Type is the step's type path, aligned with the key path: one segment
-	// per Flow/Loop/WaitAny namespace plus the leaf, e.g.
-	// "flow[main.Order,string]|action[main.Order,int]". Replay identity is
-	// Key + Kind + Type; Input is kept for observation. Records written
-	// before Type existed have it empty and keep strict Input comparison.
-	// Type 是步骤的类型路径，与 key 路径对齐：每个 Flow/Loop/WaitAny 命名空间一段，
-	// 再加叶子段，例如 "flow[main.Order,string]|action[main.Order,int]"。回放身份为
-	// Key + Kind + Type；Input 仅用于观测。引入 Type 之前写入的记录该字段为空，
-	// 仍按 Input 严格比较。
+	// Type is the leaf I/O signature recorded for observation, e.g.
+	// "action[main.Order,int]". It is NOT part of replay identity: renaming a
+	// type or moving it to another package keeps replaying; a mismatch only
+	// emits a type_changed event. Replay identity is Key + Kind (+ Path).
+	// Type 是为观测记录的叶子 I/O 签名，例如 "action[main.Order,int]"。它不参与回放身份：
+	// 类型改名或换包照常回放，不一致时只发出 type_changed 事件。回放身份为 Key + Kind（+ Path）。
 	Type      string `json:",omitempty"`
 	Input     json.RawMessage
 	Result    json.RawMessage
@@ -112,7 +105,12 @@ var (
 	ErrConflict = lease.ErrConflict
 	ErrNotFound = errors.New("workflow record not found")
 	ErrInvalid  = errors.New("invalid workflow operation")
-	ErrChanged  = errors.New("workflow definition changed")
+	// ErrChanged means replay found a record that cannot belong to the current
+	// step: the definition name/version/input changed, the step's kind changed
+	// (a WaitFor became a Run), or the stored Path differs from the expected one.
+	// ErrChanged 表示回放找到的记录不可能属于当前步骤：定义的名称/版本/输入变了、
+	// 步骤 Kind 变了（WaitFor 变成了 Run），或存储的 Path 与期望路径不同。
+	ErrChanged = errors.New("workflow definition changed")
 	// ErrWaitFailed is the terminal Drive error when every WaitAny candidate failed.
 	// ErrWaitFailed 是 WaitAny 所有候选项都失败时 Drive 返回的终态错误。
 	ErrWaitFailed = errors.New("wait group failed")
@@ -216,6 +214,7 @@ func invoke[T any](fn func() (T, error)) (output T, err error) {
 
 type Pending struct {
 	Key   string
+	Path  Path `json:",omitempty"`
 	Kind  Kind
 	Until time.Time
 }

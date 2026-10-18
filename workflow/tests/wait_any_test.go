@@ -345,7 +345,13 @@ func TestFlowContextWaitAny(t *testing.T) {
 		if err != nil || state.Pending[0].Key != "race|a" {
 			t.Fatalf("%+v %v", state, err)
 		}
-		if _, err := store.WaitAny(ctx, "race", requests); !errors.Is(err, ErrChanged) {
+		// A changed payload is an input, not identity; a changed member key is drift.
+		// 负载变化属于输入而非身份；成员 key 变化才是漂移。
+		if _, err := store.WaitAny(ctx, "race", requests); err != nil {
+			t.Fatal(err)
+		}
+		renamed := []WaitRequest{{Key: "race|c", Request: []byte(`"a"`)}, {Key: "race|b", Request: []byte(`"b"`)}}
+		if _, err := store.WaitAny(ctx, "race", renamed); !errors.Is(err, ErrChanged) {
 			t.Fatal(err)
 		}
 		if _, err := store.Resolve(ctx, "race|a", 1, []byte(`invalid`)); !errors.Is(err, ErrInvalid) {

@@ -11,36 +11,40 @@ import (
 	"github.com/google/uuid"
 )
 
-// RunFlow is available only to top-level orchestration. It creates a namespace,
-// not another lease or workflow state. A called Flow cannot invoke another Flow.
+// RunFlow mounts a Flow under name[input.StepKey()] (or name) on the current
+// strand. It creates a namespace, not another lease or workflow state.
 // Returning includes joining the Flow's async Actions. err is whatever the
 // Flow returned; a waiting Flow halts the caller instead of returning.
-// RunFlow 仅允许顶层编排调用；被调用的 Flow 不可继续调用 Flow。
-// 返回前会汇合该 Flow 的异步 Action。err 即 Flow 返回的错误；
-// 处于等待中的 Flow 会停止调用方，而不是返回。
-func (w *WorkflowContext) RunFlow[I, O any](key string, flow Flow[I, O], input I) (O, error) {
-	f := w.state
-	resolved := f.claim(key)
-	if flow == nil {
+// Nesting deeper than Options.MaxFlowDepth fails the drive with ErrInvalid.
+// RunFlow 在当前 strand 上把 Flow 挂载到 name[input.StepKey()]（或 name）之下。它创建的是
+// 命名空间，而不是另一个租约或工作流状态。返回前会汇合该 Flow 的异步 Action。err 即 Flow
+// 返回的错误；处于等待中的 Flow 会停止调用方，而不是返回。嵌套超过 Options.MaxFlowDepth
+// 时 drive 以 ErrInvalid 失败。
+func (f *FlowContext) RunFlow[I, O any](name string, flow Flow[I, O], input I) (O, error) {
+	path, _ := f.claimInput(name, input)
+	if invalidFlow(flow) {
 		f.abort(fatal(ErrInvalid))
 	}
-	return f.runChildFlow(resolved, flow, input)
+	return f.runChildFlow(path, flow, input)
 }
 
 // runChildFlow runs a Flow on the CURRENT strand and joins its async tasks.
-// A mounted Flow adds a "flow[I,O]" segment to the type path, so changing its
-// I/O signature is drift even when every inner step keeps its own types. The
-// root of NewWorkflowFromFlow (resolved == "") adds no segment, like no key.
-// runChildFlow 在当前 strand 上运行 Flow，并汇合其异步任务。挂载的 Flow 会向类型路径
-// 追加 "flow[I,O]" 段，因此即使内部每个步骤类型不变，改变 Flow 的 I/O 签名也属于漂移。
-// NewWorkflowFromFlow 的根（resolved == ""）与不加 key 一样，不追加类型段。
-func (f *FlowContext) runChildFlow[I, O any](resolved string, flow Flow[I, O], input I) (output O, err error) {
-	scope := &flowScope{}
-	types := f.types
-	if resolved != "" {
-		types = f.typePath(signature[I, O]("flow"))
+// The workflow root (path == nil) adds no namespace and depth.
+// runChildFlow 在当前 strand 上运行 Flow，并汇合其异步任务。
+// 工作流根（path == nil）不追加命名空间，也不增加深度。
+func (f *FlowContext) runChildFlow[I, O any](path Path, flow Flow[I, O], input I) (output O, err error) {
+	depth := f.depth
+	if path != nil {
+		depth++
 	}
-	child := &FlowContext{execution: f.execution, prefix: resolved, types: types, scope: scope, strand: f.strand}
+	if depth > f.execution.engine.options.MaxFlowDepth {
+		f.abort(fatal(fmt.Errorf("%w: flow %s exceeds MaxFlowDepth %d", ErrInvalid, path, f.execution.engine.options.MaxFlowDepth)))
+	}
+	scope := &flowScope{}
+	child := &FlowContext{execution: f.execution, path: path, depth: depth, scope: scope, strand: f.strand}
+	if path == nil {
+		child.path = f.path
+	}
 	defer func() {
 		// Join descendants even while unwinding, so Drive never returns early.
 		// 即使在展开过程中也要汇合后代，确保 Drive 不会提前返回。
@@ -62,29 +66,30 @@ func (f *FlowContext) runChildFlow[I, O any](resolved string, flow Flow[I, O], i
 // WaitFor registers a durable request in the Flow, outside any Action lease.
 // Until a response is resolved it halts the calling orchestration; the drive
 // then reports Suspended. On a later drive it returns the persisted response.
+// The address is name[request.StepKey()] when the request implements StepKeyer.
 // WaitFor 在 Flow 中注册一个持久请求，该请求位于任何 Action 租约之外。
 // 在响应被解析前，它会停止调用方编排，drive 随后报告 Suspended。
-// 之后的 drive 中，它返回已持久化的响应。
-func (f *FlowContext) WaitFor[Response, Request any](key string, request Request) Response {
-	resolved := f.claim(key)
+// 之后的 drive 中，它返回已持久化的响应。请求实现 StepKeyer 时地址为 name[request.StepKey()]。
+func (f *FlowContext) WaitFor[Response, Request any](name string, request Request) Response {
+	path, resolved := f.claimInput(name, request)
 	raw, err := json.Marshal(request)
 	f.must(fatal(err))
-	typ := f.typePath(signature[Request, Response]("signal"))
+	typ := signature[Request, Response]("signal")
 	e := f.execution.engine
 	record := f.execution.records[resolved]
 	if record == nil {
 		if record, err = e.store.Put(f.Context(), &Record{
-			Key: resolved, Kind: SignalKind, Status: Suspended, Type: typ, Input: raw, StartedAt: e.options.Now(),
+			Key: resolved, Path: path, Kind: SignalKind, Status: Suspended, Type: typ, Input: raw, StartedAt: e.options.Now(),
 		}); err != nil {
 			f.must(&OperationError{resolved, "Put", err})
 		}
 	}
-	if !sameStep(record, SignalKind, typ, raw) {
+	if !sameStep(record, SignalKind, path) {
 		f.must(ErrChanged)
 	}
 	// A changed request is not re-sent: the registered one is still answered.
 	// 变化后的请求不会重新发送：仍以已注册的请求等待回答。
-	f.inputChanged(record, raw)
+	f.replayed(record, typ, raw)
 	if record.Status == Completed {
 		var output Response
 		f.must(decode(record.Result, &output))
@@ -93,39 +98,44 @@ func (f *FlowContext) WaitFor[Response, Request any](key string, request Request
 	if record.Status != Suspended {
 		f.must(ErrInvalid)
 	}
+	pending := Pending{Key: resolved, Path: path, Kind: SignalKind}
 	e.emit(f.Context(), Event{
-		Type: WaitSuspended, Key: resolved, Kind: SignalKind, Status: Suspended,
-		StartedAt: record.StartedAt, RecordVersion: record.Version,
-		Pending: []Pending{{Key: resolved, Kind: SignalKind}},
+		Type: WaitSuspended, Key: resolved, Path: path, Kind: SignalKind, Status: Suspended, StepType: typ,
+		StartedAt: record.StartedAt, RecordVersion: record.Version, Pending: []Pending{pending},
 	}, nil)
-	f.suspend(Pending{Key: resolved, Kind: SignalKind})
+	f.suspend(pending)
 	panic("unreachable")
 }
 
 // Sleep durably waits for duration; the deadline is fixed on first registration.
 // Sleep 持久地等待 duration；截止时间在首次注册时固定。
-func (f *FlowContext) Sleep(key string, duration time.Duration) {
-	resolved := f.claim(key)
-	f.sleep(resolved, f.execution.engine.options.Now().Add(duration))
+// A Sleep has no input to derive an identity from: its name is fixed and its
+// uniqueness comes from the enclosing namespace (a Scope, a keyed Flow, a
+// WaitAny group, or Loop's own sleep_N).
+// Sleep 没有可推导身份的输入：名字固定，唯一性来自外层命名空间
+// （Scope、带 key 的 Flow、WaitAny 组，或 Loop 自带的 sleep_N）。
+func (f *FlowContext) Sleep(name string, duration time.Duration) {
+	path, key := f.claim(name, "")
+	f.sleep(path, key, f.execution.engine.options.Now().Add(duration))
 }
 
-func (f *FlowContext) SleepUntil(key string, until time.Time) {
-	f.sleep(f.claim(key), until)
+func (f *FlowContext) SleepUntil(name string, until time.Time) {
+	path, key := f.claim(name, "")
+	f.sleep(path, key, until)
 }
 
-func (f *FlowContext) sleep(key string, until time.Time) {
+func (f *FlowContext) sleep(path Path, key string, until time.Time) {
 	e := f.execution.engine
-	typ := f.typePath("sleep")
 	record := f.execution.records[key]
 	if record == nil {
 		var err error
 		if record, err = e.store.Put(f.Context(), &Record{
-			Key: key, Kind: SleepKind, Status: Suspended, Type: typ, Until: until, StartedAt: e.options.Now(),
+			Key: key, Path: path, Kind: SleepKind, Status: Suspended, Type: "sleep", Until: until, StartedAt: e.options.Now(),
 		}); err != nil {
 			f.must(&OperationError{key, "Put", err})
 		}
 	}
-	if !sameStep(record, SleepKind, typ, nil) {
+	if !sameStep(record, SleepKind, path) {
 		f.must(ErrChanged)
 	}
 	if record.Status == Completed {
@@ -140,22 +150,22 @@ func (f *FlowContext) sleep(key string, until time.Time) {
 			f.must(&OperationError{key, "Resolve", err})
 		}
 		if resolved {
-			e.emit(f.Context(), Event{Type: WaitResolved, Key: key, Kind: SleepKind,
+			e.emit(f.Context(), Event{Type: WaitResolved, Key: key, Path: path, Kind: SleepKind, StepType: "sleep",
 				Status: Completed, StartedAt: record.StartedAt, RecordVersion: record.Version + 1,
 			}, nil)
 		}
 		return
 	}
+	pending := Pending{Key: key, Path: path, Kind: SleepKind, Until: record.Until}
 	e.emit(f.Context(), Event{
-		Type: WaitSuspended, Key: key, Kind: SleepKind, Status: Suspended,
-		StartedAt: record.StartedAt, RecordVersion: record.Version,
-		Pending: []Pending{{Key: key, Kind: SleepKind, Until: record.Until}},
+		Type: WaitSuspended, Key: key, Path: path, Kind: SleepKind, Status: Suspended, StepType: "sleep",
+		StartedAt: record.StartedAt, RecordVersion: record.Version, Pending: []Pending{pending},
 	}, nil)
-	f.suspend(Pending{Key: key, Kind: SleepKind, Until: record.Until})
+	f.suspend(pending)
 }
 
-func (f *FlowContext) checkpoint[T any](key, primitive string, generate func() T) T {
-	resolved := f.claim(key)
+func (f *FlowContext) checkpoint[T any](name, primitive string, generate func() T) T {
+	path, resolved := f.claim(name, "")
 	e := f.execution.engine
 	record := f.execution.records[resolved]
 	var err error
@@ -165,21 +175,24 @@ func (f *FlowContext) checkpoint[T any](key, primitive string, generate func() T
 		}
 	}
 	tag, _ := json.Marshal(primitive)
-	typ := f.typePath(primitive + "[" + reflect.TypeFor[T]().String() + "]")
+	typ := primitive + "[" + reflect.TypeFor[T]().String() + "]"
 	if record == nil {
 		raw, marshalErr := json.Marshal(generate())
 		f.must(fatal(marshalErr))
 		record, err = e.store.Put(f.Context(), &Record{
-			Key: resolved, Kind: CheckpointKind, Status: Completed, Type: typ, Input: tag, Result: raw,
+			Key: resolved, Path: path, Kind: CheckpointKind, Status: Completed, Type: typ, Input: tag, Result: raw,
 			StartedAt: e.options.Now(), EndedAt: e.options.Now(),
 		})
 		if err != nil {
 			f.must(&OperationError{resolved, "Put", err})
 		}
 	}
-	if !sameStep(record, CheckpointKind, typ, tag) {
+	// Now and UUID share CheckpointKind; the primitive tag tells them apart.
+	// Now 与 UUID 共用 CheckpointKind，由原语标签区分。
+	if !sameStep(record, CheckpointKind, path) || !sameJSON(record.Input, tag) {
 		f.must(ErrChanged)
 	}
+	f.replayed(record, typ, tag)
 	var output T
 	f.must(decode(record.Result, &output))
 	return output
@@ -187,14 +200,14 @@ func (f *FlowContext) checkpoint[T any](key, primitive string, generate func() T
 
 // Now returns a durable timestamp: the first drive's value on every replay.
 // Now 返回持久化时间戳：每次回放都返回首次 drive 的值。
-func (f *FlowContext) Now(key string) time.Time {
-	return f.checkpoint(key, "now", f.execution.engine.options.Now)
+func (f *FlowContext) Now(name string) time.Time {
+	return f.checkpoint(name, "now", f.execution.engine.options.Now)
 }
 
 // UUID returns a durable random identifier.
 // UUID 返回持久化的随机标识。
-func (f *FlowContext) UUID(key string) string {
-	return f.checkpoint(key, "uuid", uuid.NewString)
+func (f *FlowContext) UUID(name string) string {
+	return f.checkpoint(name, "uuid", uuid.NewString)
 }
 
 type LoopOptions struct {
@@ -211,20 +224,26 @@ type LoopOutput interface{ Done() bool }
 // Loop 将每一次 attempt 都记录为一个 Action，因此 attempt 之后崩溃不会重复
 // 已完成的 attempt。它的间隔是一个独立的持久化 sleep。
 // err 只会是 nil、某次 attempt 的 *ActionError，或包装后的 ErrLoopExhausted。
-func (f *FlowContext) Loop[I any, O LoopOutput](key string, action Action[I, O], input I, options LoopOptions) (output O, err error) {
-	resolved := f.claim(key)
+func (f *FlowContext) Loop[I any, O LoopOutput](name string, action Action[I, O], input I, options LoopOptions) (output O, err error) {
+	path, resolved := f.claimInput(name, input)
 	if options.Interval <= 0 || options.MaxAttempts <= 0 {
 		f.must(ErrInvalid)
 	}
-	child := &FlowContext{execution: f.execution, prefix: resolved, types: f.typePath(signature[I, O]("loop")),
-		scope: f.scope, strand: f.strand}
+	child := &FlowContext{execution: f.execution, path: path, depth: f.depth, scope: f.scope, strand: f.strand}
 	for attempt := 0; attempt < options.MaxAttempts; attempt++ {
 		if attempt > 0 {
 			child.Sleep(fmt.Sprintf("sleep_%d", attempt), options.Interval)
 		}
-		output, err = child.Run(fmt.Sprintf("attempt_%d", attempt), action, input, options.Action)
-		if err != nil {
-			return output, err
+		// Attempts are keyed by their own name, not by input.StepKey(): the
+		// loop namespace already carries it.
+		// 每次尝试按自身名字寻址，而不是 input.StepKey()：Loop 命名空间已带上它。
+		attemptPath, attemptKey := child.claim(fmt.Sprintf("attempt_%d", attempt), "")
+		var business *ActionError
+		var runErr error
+		output, business, runErr = child.runAction(attemptPath, attemptKey, action, input, options.Action)
+		child.must(runErr)
+		if business != nil {
+			return output, business
 		}
 		// Done is user code on replayed data; a panic here is a definition bug.
 		// Done 是作用于回放数据的用户代码；这里的 panic 属于定义缺陷。

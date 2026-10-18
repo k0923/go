@@ -34,9 +34,9 @@ func ExampleEngine_Drive() {
 	if err != nil {
 		panic(err)
 	}
-	order := workflow.NewWorkflow("order", "1", func(ctx *workflow.WorkflowContext, id string) (string, error) {
-		return ctx.RunFlow("order", OrderFlow{}, id)
-	})
+	order := workflow.NewWorkflow("order", "1", workflow.FlowFunc[string, string](func(f *workflow.FlowContext, id string) (string, error) {
+		return f.RunFlow("order", OrderFlow{}, id)
+	}))
 	ctx := context.Background()
 	first, err := engine.Drive(ctx, order, "order_123")
 	if err != nil {
@@ -62,9 +62,9 @@ func ExampleEngine_Drive() {
 }
 
 func exampleDefinition[I, O any](name, version string, flow workflow.Flow[I, O]) workflow.Workflow[I, O] {
-	return workflow.NewWorkflow(name, version, func(ctx *workflow.WorkflowContext, input I) (O, error) {
-		return ctx.RunFlow("main", flow, input)
-	})
+	return workflow.NewWorkflow(name, version, workflow.FlowFunc[I, O](func(f *workflow.FlowContext, input I) (O, error) {
+		return f.RunFlow("main", flow, input)
+	}))
 }
 
 func ExampleEngine_Subscribe() {

@@ -39,11 +39,17 @@ func Pure[I, O any](fn func(I) O) Action[I, O] {
 	return ActionFn[I, O](func(_ context.Context, input I) (O, error) { return fn(input), nil })
 }
 
-func invalidAction[I, O any](action Action[I, O]) bool {
-	if action == nil {
+func invalidAction[I, O any](action Action[I, O]) bool { return nilValue(action) }
+
+// invalidFlow also catches a typed nil such as FlowFunc(nil).
+// invalidFlow 同样能识别 FlowFunc(nil) 这类带类型的 nil。
+func invalidFlow[I, O any](flow Flow[I, O]) bool { return nilValue(flow) }
+
+func nilValue(v any) bool {
+	if v == nil {
 		return true
 	}
-	value := reflect.ValueOf(action)
+	value := reflect.ValueOf(v)
 	switch value.Kind() {
 	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map, reflect.Pointer, reflect.Slice:
 		return value.IsNil()

@@ -20,7 +20,7 @@ func ExampleOutbox() {
 	if err != nil {
 		panic(err)
 	}
-	definition := workflow.NewWorkflowFromFlow("approval", "1",
+	definition := workflow.NewWorkflow("approval", "1",
 		workflow.FlowFunc[string, string](func(f *workflow.FlowContext, order string) (string, error) {
 			return order + " " + f.WaitFor[string]("approval", order), nil
 		}),

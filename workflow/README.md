@@ -40,27 +40,35 @@ func (f OrderFlow) Run(ctx *workflow.FlowContext, in OrderInput) (OrderOutput, e
 }
 
 engine, err := workflow.NewEngine(store, workflow.Options{})
-definition := workflow.NewWorkflowFromFlow("order", "1", OrderFlow{Submit: SubmitOrder{client}})
+definition := workflow.NewWorkflow("order", "1", OrderFlow{Submit: SubmitOrder{client}})
 result, err := engine.Drive(ctx, definition, input)
 // result.Status: COMPLETED / SUSPENDED / RUNNING / FAILED
 ```
 
 完整的可运行例子（提交 → 挂起 → 回调 → 恢复）见 [example_test.go](example_test.go)。
 
-## 三层模型
+## 分层模型
 
-框架只允许 **顶层编排 → Flow → Action** 这一种调用关系，由类型在编译期保证：
+只有两层，一种编排上下文：
 
 | 层 | 定义 | 上下文 | 可用原语 |
 | --- | --- | --- | --- |
-| 顶层编排 | `NewWorkflow(name, version, func(*WorkflowContext, I) (O, error))` | `WorkflowContext` | `RunFlow`、`GoFlow` |
-| Flow | `Flow[I, O]` 接口或 `FlowFunc` | `FlowContext` | `Run`、`Go`、`Loop`、`WaitFor`、`WaitAny`、`Sleep`、`SleepUntil`、`Now`、`UUID` |
+| Flow | `Flow[I, O]` 接口或 `FlowFunc` | `FlowContext` | `Run`、`Go`、`Loop`、`WaitFor`、`WaitAny`、`Sleep`、`SleepUntil`、`Now`、`UUID`、`Scope`、`RunFlow`、`GoFlow` |
 | Action | `Action[I, O]` 接口或 `ActionFn` / `AsAction` / `Pure` | 标准 `context.Context` | 无编排能力 |
 
-- 两种上下文是相互独立的类型，没有嵌入关系，也不能互相转换。Flow 拿不到 `RunFlow`/`GoFlow`，因此 Flow 嵌套 Flow 会直接编译失败；顶层也不能直接调用 Action 或等待原语。
-- 整个工作流只有一个 Flow 时，用 `NewWorkflowFromFlow(name, version, flow)`，Flow 直接作为根，key 不带前缀。
-- `Workflow` 不实现 Flow，也没有公开的 Run 方法，只能通过 `Engine.Drive` 执行。
-- Go 不是沙箱：直接调用另一个 Flow 的 `Run` 方法，或在闭包里捕获 Engine/上下文，这些绕过手段类型系统拦不住，要靠代码审查。
+- **工作流 = 名称 + 版本 + 根 Flow**：`NewWorkflow(name, version, root)`。根 Flow 不追加命名空间（`Run("charge")` 存为 `charge`），深度从 0 开始。入口逻辑想内联书写时，传入 `FlowFunc` 即可：
+
+  ```go
+  order := workflow.NewWorkflow("order", "1", workflow.FlowFunc[Order, Result](
+      func(f *workflow.FlowContext, in Order) (Result, error) {
+          pay := f.GoFlow("pay", payFlow, in)
+          ship, err := f.RunFlow("ship", shipFlow, in)
+          // ...
+      }))
+  ```
+
+- **Flow 可以挂载 Flow**（`f.RunFlow` / `f.GoFlow`），适合子 Agent、按数据动态扇出等场景。嵌套深度由 `Options.MaxFlowDepth` 限制（默认 8），超过时以 `FAILED` + `ErrInvalid` 终止，每次回放都确定复现，防止递归无限展开。
+- `Workflow` 不实现 Flow，也没有公开的 Run，只能通过 `Engine.Drive` 执行，不能被当作步骤挂载。nil 根（包括 `FlowFunc(nil)`）在执行前以 `ErrInvalid` 拒绝。
 
 ## 控制流与错误语义
 
@@ -69,7 +77,7 @@ result, err := engine.Drive(ctx, definition, input)
 | 情况 | 编排代码看到什么 |
 | --- | --- |
 | 等待未就绪（WaitFor / Sleep / WaitAny / 等待中的 Future） | 不返回，当前 goroutine 被展开 |
-| 框架故障：存储、租约、可重试 Action 失败、误用、定义漂移、WaitAny 全部候选失败 | 同上，本次 Drive 中止 |
+| 框架故障：存储、租约、可重试 Action 失败、误用、定义漂移（Kind/Path/版本）、超过 MaxFlowDepth、WaitAny 全部候选失败 | 同上，本次 Drive 中止 |
 | 已提交的业务失败 | `Run`/`Go`/`Loop` 返回 `*ActionError`；`Loop` 次数耗尽返回包装过的 `ErrLoopExhausted` |
 
 - 等待原语（`WaitFor`、`Sleep`、`WaitAny`、`Now`、`UUID`）只返回值，不返回 error。
@@ -83,7 +91,7 @@ result, err := engine.Drive(ctx, definition, input)
 | `COMPLETED` | nil | 编排完成，`Output` 有效 | 记录终态 |
 | `SUSPENDED` | nil | 存在挂起点，`Pending` 列出全部 | 等待投递的唤醒后再 Drive |
 | `RUNNING` | 非 nil | 可重试：IO、存储、租约冲突、可重试 Action 失败、取消 | 退避后重新 Drive，上限自定 |
-| `FAILED` | 非 nil | 终态：handler 返回的 error、定义/类型漂移（`ErrChanged`）、误用（`ErrInvalid`）、编排 panic、WaitAny 全部失败（`ErrWaitFailed`）、没人 Wait 的 Go/GoFlow 业务错误 | 终止或人工处理；修复通过发布新版本 |
+| `FAILED` | 非 nil | 终态：handler 返回的 error、定义漂移（`ErrChanged`）、误用或超深嵌套（`ErrInvalid`）、结果解码失败、编排 panic、WaitAny 全部失败（`ErrWaitFailed`）、没人 Wait 的 Go/GoFlow 业务错误 | 终止或人工处理；修复通过发布新版本 |
 
 - 只有 handler **最终返回**的 error 才决定失败。编排代码处理掉的 `*ActionError` 不会让 run 失败，因此可以写补偿逻辑。
 - 框架故障优先于挂起：任一分支中止时，即使其他分支在挂起，也报告 `RUNNING` 或 `FAILED`。
@@ -171,8 +179,8 @@ case timeout:
 ## 并发与 Loop
 
 ```go
-left := w.GoFlow("left", leftFlow, in) // 先全部启动
-right := w.GoFlow("right", rightFlow, in)
+left := f.GoFlow("left", leftFlow, in) // 先全部启动
+right := f.GoFlow("right", rightFlow, in)
 a, err := left.Wait() // 左侧还在等待时，这里直接挂起
 if err != nil {
     return Out{}, err
@@ -188,17 +196,53 @@ b, err := right.Wait()
 
 `Loop(key, action, input, LoopOptions{Interval, MaxAttempts, Action})` 把每次尝试记录为独立的 Action（`key|attempt_N`），间隔是独立的持久化 Sleep（`key|sleep_N`）。输出实现 `Done() bool`。已提交的尝试不会重复执行。
 
-## Key、回放身份与版本
+## Key、Path 与回放身份
 
-- 局部 key 必须匹配 `^[A-Za-z0-9_]+$`，需要手写。不做自动编号，因为 Go/GoFlow 的调度顺序不确定，自动序号会让回放错位。
-- key 按挂载层级拼接：`RunFlow("pay")` 里的 `Run("charge")` 存为 `pay|charge`；Loop 和 WaitAny 组也各贡献一层。同一次 Drive 中 resolved key 不能重复；非法或重复的 key 会在登记前以 `FAILED` + `ErrInvalid` 拒绝。
-- **回放身份 = resolved key + Kind + 类型路径（`Record.Type`）**，输入不参与比较。
-  - 类型路径与 key 路径逐层对应：挂载的 Flow 为 `flow[I,O]`，Loop 为 `loop[I,O]`，WaitAny 组为 `any`；叶子为 `action[I,O]`、`signal[Req,Resp]`、`sleep`、`now[time.Time]`、`uuid[string]`。例如 `pay|charge` 对应 `flow[main.Order,string]|action[main.Order,int]`。
-  - 任意一层的 I/O 类型变化都算漂移，返回 `FAILED` + `ErrChanged`。类型串取自 `reflect` 的类型名，因此类型改名或换包也算漂移；换成 I/O 相同的另一个 Action 实现不算。
-  - 类型相同但输入变了：继续使用已持久化的结果（WaitFor 不重发请求，Sleep 不改截止时间），并发出 `input_changed` 事件。被中断的 `RUNNING` Action 重新执行时，改用本次的输入。
-  - 没有类型路径的记录按输入严格比较。
-- **版本绑定**：`$definition` 记录启动 run 时的名称、版本和输入，并严格比较。换版本或换输入后再 Drive 同一实例，返回 `FAILED` + `ErrChanged`。热修复以新版本发布、只用于新 run，在途 run 继续路由到原来的代码。内核不提供迁移。
-- **实例隔离**：一个 Infrastructure 实例只绑定一个 run。内核接口里没有 RunID 或 TenantID，隔离由存储实现或装饰器负责。
+### 名字固定，身份来自数据
+
+代码里写的是**固定的语义名**（`llm`、`tool_call`、`approve`），重复步骤的唯一性由**数据**提供，框架不做任何隐式计数：
+
+| 机制 | 用法 | 地址 |
+| --- | --- | --- |
+| `StepKeyer` | 输入实现 `StepKey() string`，适用于 `Run`、`Go`、`Loop`、`RunFlow`、`GoFlow`、`WaitFor` 和 `OnSignal` 的请求 | `tool_call[call_7]` |
+| `Scope(name, id)` | 为循环或分支显式开一层命名空间，不产生记录 | `step[0]\|llm` |
+| 外层命名空间 | 没有输入的原语（`Sleep`、`Now`、`UUID`、WaitAny 组名）只写固定名，唯一性继承自外层 | `approve[call_7]\|timeout` |
+
+```go
+func (c ToolCall) StepKey() string { return c.ID }
+
+for i := range maxSteps {
+    s := f.Scope("step", strconv.Itoa(i))
+    resp, _ := s.Run("llm", llm, req)                 // step[0]|llm
+    for _, call := range resp.ToolCalls {
+        c := s.Scope("call", call.ID)
+        c.WaitAny("approve", decision, timeout)        // step[0]|call[call_7]|approve|timeout
+        s.Go("tool_call", tools, call)                 // step[0]|tool_call[call_7]
+    }
+}
+```
+
+- 名字必须匹配 `^[A-Za-z0-9_]+$`；ID 是任意 UTF-8，最长 `MaxIDLength`（256）字节。
+- `StepKey` 只能由输入数据推导，不能包含时间或随机数。它的输入本身来自已持久化的结果（例如 LLM 返回的 tool call ID），因此回放时保持一致。`StepKey` panic 按定义缺陷处理（`ErrInvalid`）。
+- 同一次 Drive 中，相同地址出现两次会以 `FAILED` + `ErrInvalid` 拒绝。
+
+### Path 与 BuildKey
+
+- 每个步骤的结构化地址是 `Path []Segment{Name, ID}`。`Record`、`WaitRequest`、`Pending`、`Event` 都会带上它，**存储层按自己的方式持久化**：拆成列、存成数组或建成树。
+- 引擎、租约、`Get`/`Commit`/`Resolve`、`Signal` 仍然使用字符串 key，它由 `BuildKey(path)` 生成：
+  - 存储层可以实现可选接口 `KeyBuilder` 自定义编码，否则使用 `DefaultKey`。
+  - `DefaultKey` 编码为 `name[id]`，各段用 `|` 连接，ID 中的 `\`、`[`、`]`、`|` 用反斜杠转义，因此编码是单射的。
+- `BuildKey` 必须是纯函数、跨版本稳定、单射。框架有两层兜底：
+  - 同一次 Drive 内，两个不同 Path 映射到同一个 key 时，报 `ErrInvalid: BuildKey not injective`。
+  - 跨 Drive 时，存储的 `Record.Path` 与期望路径不一致，报 `ErrChanged`。
+
+### 回放身份 = key + Kind（+ Path）
+
+- **类型不参与身份。** `Record.Type` 只记录叶子 I/O 签名（如 `action[main.Order,int]`）用于观测。类型改名、换包都照常回放；不一致时发出 `type_changed` 事件，事件里带 `StepType`（当前）和 `StoredType`（记录值）。真正不兼容的结构仍会在 JSON 解码时以 fatal 失败。
+- **输入不参与身份。** 输入变化时继续使用已持久化的结果（WaitFor 不重发请求，Sleep 不改截止时间），并发出 `input_changed` 事件。被中断的 `RUNNING` Action 重新执行时，改用本次的输入和类型。
+- **Kind 变化**（例如同一个地址从 WaitFor 改成 Run），或者 Now 与 UUID 互换，都报 `ErrChanged`。
+- **版本绑定**：`$definition` 记录启动 run 时的名称、版本和输入，并严格比较。改变语义时请升版本：热修复以新版本发布给新 run，在途 run 继续运行原来的代码。内核不提供迁移。
+- **实例隔离**：一个 Infrastructure 实例只绑定一个 run，key 只在这个实例内有意义。RunID/TenantID 由存储实现拼进实际的存储键。
 
 ## 存储契约
 
@@ -221,14 +265,15 @@ type Infrastructure interface {
 
 | 接口 | 作用 |
 | --- | --- |
-| `RecordLister` | `Records(ctx)` 一次性返回全部记录。Drive 开始时预加载终态结果（已结束的 Action、已解析的等待、检查点），回放时不再逐步读写，类型漂移校验照常进行 |
+| `RecordLister` | `Records(ctx)` 一次性返回全部记录。Drive 开始时预加载终态结果（已结束的 Action、已解析的等待、检查点），回放时不再逐步读写，身份校验照常进行 |
+| `KeyBuilder` | `BuildKey(Path) string` 决定 Path 到字符串 key 的编码；不实现时使用 `DefaultKey` |
 | `Clock` | `Options.Now` 为空时作为默认时钟，让 Sleep 截止与租约到期同源 |
 | `WaitAnyInfrastructure` | `WaitAny(ctx, group, []WaitRequest)` / `FailWait(ctx, key, version, msg)` |
 
 WaitAny 存储的要求：
 - 原子登记全部候选和组归属，持久化请求、失败列表和赢家。
 - `Resolve` 必须同时升级：完成组成员时，在同一事务里选出赢家、取消其余成员、清理过时通知并登记 CANCEL。
-- 回放时对每个成员按顺序调用 `workflow.SameWaitMember(stored, request)`，并持久化 `WaitRequest.Type`。
+- 回放时对每个成员按顺序调用 `workflow.SameWaitMember(stored, request)`（比较 Key、Kind、Path），并持久化 `WaitRequest.Path` 和 `WaitRequest.Type`。
 - 编码失败的候选（`WaitRequest.Error` 非空）也要按顺序保存，计入 Failures，不为它登记投递。
 
 `workflow/memory` 是完整的参考实现。
@@ -251,8 +296,10 @@ defer unsubscribe()
 | `wait_suspended` | 每次经过一个未解决的等待点 |
 | `wait_resolved` | 存储实际接受一次 Resolve 时（包括 Sleep 到期） |
 | `input_changed` | 回放校验通过但输入与持久化输入不同时，仅作告警 |
+| `type_changed` | 回放校验通过但叶子类型签名与记录不同时（改名、换包或真实变更），仅作告警；带 `step_type` / `stored_type` |
 
-- `Event` 可以 JSON 编解码（`SchemaVersion=1`），包含 `ID`、`EngineID`、`Sequence`、`ExecutionID`（每次 Drive 一个；Drive 之外的 ResolveSignal 为空）、名称和版本、`Kind`、`Status`、时间与耗时、`Replayed`、`RecordVersion`、`Pending`，以及 `Error{Category, Message, Operation}`。
+- `Event` 可以 JSON 编解码（`SchemaVersion=1`），包含 `ID`、`EngineID`、`Sequence`、`ExecutionID`（每次 Drive 一个；Drive 之外的 ResolveSignal 为空）、名称和版本、`Key`、`Path`、`Kind`、`StepType`（当前代码的叶子类型）、`Status`、时间与耗时、`Replayed`、`RecordVersion`、`Pending`，以及 `Error{Category, Message, Operation}`。
+- 类型信息只在事件中提供，用于排查。是否记录全部事件由业务方决定。
 - 错误类别：execution、panic、conflict、cancelled、timeout、infrastructure、lease、permanent、business、invalid、changed。
 - 事件不包含业务输入输出，但错误文本由应用产生，注意不要写入凭证。
 - 通知是同步的。监听者必须线程安全、快速返回，单个监听者的 panic 会被隔离。退订是幂等的，也可以在回调里调用。
@@ -260,8 +307,8 @@ defer unsubscribe()
 
 ## 选项与租约
 
-`Options{LeaseTTL, CleanupTimeout, Now}`：
-- `LeaseTTL` 默认 30s，`CleanupTimeout` 默认 5s。
+`Options{LeaseTTL, CleanupTimeout, MaxFlowDepth, Now}`：
+- `LeaseTTL` 默认 30s，`CleanupTimeout` 默认 5s，`MaxFlowDepth` 默认 8。
 - 租约每 TTL/3 续一次，续租一直持续到结果提交完成。
 - `Now` 为空时，若存储实现了 `Clock` 就用存储时钟，否则用 `time.Now`。显式注入的时钟必须与存储时钟一致。
 

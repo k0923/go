@@ -154,7 +154,7 @@ func TestAbortWinsOverSiblingSuspension(t *testing.T) {
 	engine := testEngine(t, memory.New(), Options{})
 	cause := errors.New("503")
 	waiting := make(chan struct{})
-	root := NewWorkflow("test", "1", func(w *WorkflowContext, input int) (int, error) {
+	root := NewWorkflow("test", "1", FlowFunc[int, int](func(w *FlowContext, input int) (int, error) {
 		w.GoFlow("wait", FlowFunc[int, int](func(f *FlowContext, input int) (int, error) {
 			defer close(waiting)
 			return f.WaitFor[int]("reply", input), nil
@@ -163,7 +163,7 @@ func TestAbortWinsOverSiblingSuspension(t *testing.T) {
 			<-waiting
 			return f.Run("io", AsAction(func(context.Context, int) (int, error) { return 0, cause }), input)
 		}), input)
-	})
+	}))
 	result, err := engine.Drive(context.Background(), root, 1)
 	if !errors.Is(err, cause) || result.Status != Running || len(result.Pending) != 1 {
 		t.Fatalf("%+v %v", result, err)

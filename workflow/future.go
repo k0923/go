@@ -49,13 +49,12 @@ func (f *Future[O]) unobserved() error {
 	return f.err
 }
 
-// async starts a task on its own strand. The task must not touch the caller's
-// strand: a halt in the task is reported through the Future.
-// async 在独立 strand 上启动任务。任务不得触及调用方 strand：任务中的 halt 通过 Future 报告。
-func (f *FlowContext) async[O any](key string, fn func(child *FlowContext, resolved string) (O, error)) *Future[O] {
-	resolved := f.claim(key)
+// async starts a task on its own strand at path/key. The task must not touch
+// the caller's strand: a halt in the task is reported through the Future.
+// async 在独立 strand 上于 path/key 启动任务。任务不得触及调用方 strand：任务中的 halt 通过 Future 报告。
+func (f *FlowContext) async[O any](path Path, key string, fn func(child *FlowContext) (O, error)) *Future[O] {
 	result := &Future[O]{done: make(chan struct{}), owner: f}
-	child := &FlowContext{execution: f.execution, prefix: f.prefix, types: f.types, scope: f.scope, strand: &strand{}}
+	child := &FlowContext{execution: f.execution, path: f.path, depth: f.depth, scope: f.scope, strand: &strand{}}
 	ex := f.execution
 	ex.mu.Lock()
 	if ex.closed || (f.scope != nil && f.scope.closed) {
@@ -75,7 +74,7 @@ func (f *FlowContext) async[O any](key string, fn func(child *FlowContext, resol
 		}
 		defer close(result.done)
 		var err error
-		result.output, err, result.halted = runStrand(child.strand, func() (O, error) { return fn(child, resolved) })
+		result.output, err, result.halted = runStrand(child.strand, func() (O, error) { return fn(child) })
 		var fatalErr *fatalError
 		if errors.As(err, &fatalErr) {
 			// An orchestration panic inside GoFlow is a definition bug.
@@ -92,11 +91,13 @@ func (f *FlowContext) async[O any](key string, fn func(child *FlowContext, resol
 	return result
 }
 
-// Go starts an Action concurrently. Its Future reports nil or *ActionError.
-// Go 并发启动一个 Action。它的 Future 报告 nil 或 *ActionError。
-func (f *FlowContext) Go[I, O any](key string, action Action[I, O], input I, options ...ActionOptions) *Future[O] {
-	return f.async(key, func(child *FlowContext, resolved string) (O, error) {
-		output, business, err := child.runAction(resolved, action, input, options...)
+// Go starts an Action concurrently at name[input.StepKey()] (or name). Its
+// Future reports nil or *ActionError.
+// Go 在 name[input.StepKey()]（或 name）并发启动一个 Action。它的 Future 报告 nil 或 *ActionError。
+func (f *FlowContext) Go[I, O any](name string, action Action[I, O], input I, options ...ActionOptions) *Future[O] {
+	path, key := f.claimInput(name, input)
+	return f.async(path, key, func(child *FlowContext) (O, error) {
+		output, business, err := child.runAction(path, key, action, input, options...)
 		child.must(err)
 		if business != nil {
 			return output, business
@@ -105,14 +106,16 @@ func (f *FlowContext) Go[I, O any](key string, action Action[I, O], input I, opt
 	})
 }
 
-// GoFlow is available only to top-level orchestration. Its Future completes
-// after the called Flow and its async Actions exit.
-// GoFlow 仅属于顶层编排；Future 在 Flow 及其异步 Action 全部退出后完成。
-func (w *WorkflowContext) GoFlow[I, O any](key string, flow Flow[I, O], input I) *Future[O] {
-	return w.state.async(key, func(child *FlowContext, resolved string) (output O, err error) {
-		if flow == nil {
+// GoFlow mounts a Flow on its own strand, like RunFlow but concurrent. Its
+// Future completes after the called Flow and its async Actions exit.
+// GoFlow 在独立 strand 上挂载 Flow，语义同 RunFlow 但并发执行；Future 在 Flow 及其
+// 异步 Action 全部退出后完成。
+func (f *FlowContext) GoFlow[I, O any](name string, flow Flow[I, O], input I) *Future[O] {
+	path, key := f.claimInput(name, input)
+	return f.async(path, key, func(child *FlowContext) (output O, err error) {
+		if invalidFlow(flow) {
 			child.abort(fatal(ErrInvalid))
 		}
-		return child.runChildFlow(resolved, flow, input)
+		return child.runChildFlow(path, flow, input)
 	})
 }

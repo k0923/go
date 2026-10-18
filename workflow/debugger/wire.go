@@ -86,6 +86,7 @@ type RunInfo struct {
 // 空负载会被省略，因此 nil 可以在往返中保留，而不是变成 "null"。
 type RecordView struct {
 	Key       string          `json:"key"`
+	Path      workflow.Path   `json:"path,omitempty"`
 	Kind      workflow.Kind   `json:"kind"`
 	Status    workflow.Status `json:"status"`
 	Version   int64           `json:"version"`
@@ -191,7 +192,7 @@ func toView(r *workflow.Record, group string) *RecordView {
 		return nil
 	}
 	return &RecordView{
-		Key: r.Key, Kind: r.Kind, Status: r.Status, Version: r.Version, Type: r.Type,
+		Key: r.Key, Path: append(workflow.Path(nil), r.Path...), Kind: r.Kind, Status: r.Status, Version: r.Version, Type: r.Type,
 		Input: clone(r.Input), Result: clone(r.Result), Error: r.Error,
 		Until: r.Until, StartedAt: r.StartedAt, EndedAt: r.EndedAt, Group: group,
 	}
@@ -202,7 +203,7 @@ func fromView(v *RecordView) *workflow.Record {
 		return nil
 	}
 	return &workflow.Record{
-		Key: v.Key, Kind: v.Kind, Status: v.Status, Version: v.Version, Type: v.Type,
+		Key: v.Key, Path: append(workflow.Path(nil), v.Path...), Kind: v.Kind, Status: v.Status, Version: v.Version, Type: v.Type,
 		Input: clone(v.Input), Result: clone(v.Result), Error: v.Error,
 		Until: v.Until, StartedAt: v.StartedAt, EndedAt: v.EndedAt,
 	}

@@ -1,7 +1,6 @@
 package workflow
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -9,6 +8,7 @@ import (
 	"reflect"
 	"regexp"
 	"runtime/debug"
+	"slices"
 	"sort"
 	"sync"
 	"time"
@@ -20,6 +20,12 @@ import (
 type Options struct {
 	LeaseTTL       time.Duration
 	CleanupTimeout time.Duration
+	// MaxFlowDepth bounds how deeply Flows may mount Flows (RunFlow/GoFlow
+	// from inside a Flow). Default 8. Exceeding it fails the drive with
+	// ErrInvalid, deterministically on every replay.
+	// MaxFlowDepth 限制 Flow 挂载 Flow 的深度（在 Flow 内调用 RunFlow/GoFlow）。默认 8。
+	// 超过时 drive 以 ErrInvalid 失败，且每次回放都确定复现。
+	MaxFlowDepth int
 	// Now supplies workflow clock reads; production must agree with the store
 	// clock. Lease validity is ALWAYS decided by the store. When nil, a store
 	// implementing Clock supplies it, otherwise time.Now.
@@ -36,11 +42,12 @@ type Options struct {
 // 调度与版本管理归调用方。每个 run 绑定启动它的定义版本；热修复以新版本发布给
 // 新 run，老 run 继续运行原代码。
 type Engine struct {
-	store   Infrastructure
-	options Options
-	leases  *lease.Runner
-	eventID string
-	events  eventHub
+	store    Infrastructure
+	options  Options
+	leases   *lease.Runner
+	eventID  string
+	events   eventHub
+	buildKey func(Path) string
 }
 
 func NewEngine(store Infrastructure, options Options) (*Engine, error) {
@@ -53,7 +60,10 @@ func NewEngine(store Infrastructure, options Options) (*Engine, error) {
 	if options.CleanupTimeout == 0 {
 		options.CleanupTimeout = 5 * time.Second
 	}
-	if options.LeaseTTL < 3*time.Nanosecond || options.CleanupTimeout <= 0 {
+	if options.MaxFlowDepth == 0 {
+		options.MaxFlowDepth = 8
+	}
+	if options.LeaseTTL < 3*time.Nanosecond || options.CleanupTimeout <= 0 || options.MaxFlowDepth < 0 {
 		return nil, ErrInvalid
 	}
 	if options.Now == nil {
@@ -68,7 +78,11 @@ func NewEngine(store Infrastructure, options Options) (*Engine, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Engine{store: store, options: options, leases: leases, eventID: uuid.NewString()}, nil
+	buildKey := DefaultKey
+	if builder, ok := store.(KeyBuilder); ok {
+		buildKey = builder.BuildKey
+	}
+	return &Engine{store: store, options: options, leases: leases, eventID: uuid.NewString(), buildKey: buildKey}, nil
 }
 
 // ActionKey is stable within a scoped run. For external idempotency compose
@@ -88,11 +102,14 @@ type actionKey struct{}
 // execution 是一次 Drive 的状态。abort 保存框架故障（基础设施、可重试 Action
 // 失败、误用、漂移）；它们不会以 error 形式交给编排代码，而是停止编排。
 type execution struct {
-	engine  *Engine
-	ctx     context.Context
-	cancel  context.CancelFunc
-	mu      sync.Mutex
-	keys    map[string]bool
+	engine *Engine
+	ctx    context.Context
+	cancel context.CancelFunc
+	mu     sync.Mutex
+	// keys maps every claimed key to its path, so a non-injective BuildKey is
+	// told apart from a genuinely duplicated step.
+	// keys 记录每个已占用 key 对应的路径，以区分非单射的 BuildKey 与真正重复的步骤。
+	keys    map[string]Path
 	abort   []error
 	pending map[string]Pending
 	// records holds terminal records preloaded by Drive; read-only afterwards.
@@ -112,26 +129,17 @@ type flowScope struct {
 	closed bool
 }
 
-// WorkflowContext is created only by Engine.Drive. Its private state is not
-// embedded: Action and signal methods are not promoted into orchestration.
-// WorkflowContext 仅由 Engine.Drive 创建。内部状态不采用嵌入，
-// 因此顶层编排不会获得 Action 和信号方法。
-type WorkflowContext struct {
-	state *FlowContext
-}
-
-func (w *WorkflowContext) Context() context.Context { return w.state.Context() }
-
-// FlowContext provides Action and signal primitives, but cannot call Flows.
-// Actions receive a standard context instead of either workflow context.
+// FlowContext provides Action, wait and Flow-mounting primitives. Flows may
+// mount Flows; Options.MaxFlowDepth bounds the nesting. Actions receive a
+// standard context instead of either workflow context.
 //
 // Primitives never return framework errors. A pending wait or an aborted drive
 // unwinds the calling goroutine with a private panic; deferred functions run,
 // so defers in orchestration code must not perform side effects. Do not
 // recover() blindly in orchestration code: even if you do, every subsequent
 // primitive on the same goroutine halts again and nothing new is persisted.
-// FlowContext 提供 Action 和信号原语，但不提供 Flow 调用能力；
-// Action 接收标准 context，不接收任一工作流上下文。
+// FlowContext 提供 Action、等待与挂载 Flow 的原语。Flow 可以挂载 Flow，嵌套深度由
+// Options.MaxFlowDepth 限制。Action 接收标准 context，不接收任一工作流上下文。
 //
 // 原语从不返回框架错误。挂起的等待或被中止的 drive 会用私有 panic 展开当前
 // goroutine；defer 仍会执行，因此编排代码中的 defer 不得产生副作用。不要在编排
@@ -139,58 +147,71 @@ func (w *WorkflowContext) Context() context.Context { return w.state.Context() }
 // 不会持久化任何新进度。
 type FlowContext struct {
 	execution *execution
-	prefix    string
-	// types is the type path of prefix: one segment per key namespace.
-	// types 是 prefix 对应的类型路径：每个 key 命名空间一段。
-	types  string
-	scope  *flowScope
-	strand *strand
+	path      Path
+	depth     int // mounted Flow depth; the root Flow is 0
+	scope     *flowScope
+	strand    *strand
 }
 
 func (f *FlowContext) Context() context.Context { return f.execution.ctx }
-func (f *FlowContext) Key() string              { return f.prefix }
 
-// typePath appends a segment to the type path, mirroring how claim appends a
-// key to the prefix.
-// typePath 向类型路径追加一段，与 claim 向 prefix 追加 key 的方式对应。
-func (f *FlowContext) typePath(segment string) string {
-	if f.types == "" {
-		return segment
+// Path is the structured address of this Flow's namespace.
+// Path 是当前 Flow 命名空间的结构化地址。
+func (f *FlowContext) Path() Path { return slices.Clone(f.path) }
+
+// Key is the built key of this Flow's namespace ("" at the root).
+// Key 是当前 Flow 命名空间构建出的 key（根为 ""）。
+func (f *FlowContext) Key() string {
+	if len(f.path) == 0 {
+		return ""
 	}
-	return f.types + "|" + segment
+	return f.execution.engine.buildKey(f.path)
 }
 
-// signature renders a typed segment such as "action[int,string]". It uses the
-// I/O signature, not the implementation type, so swapping an AsAction for a
-// named Action with the same I/O stays replay-compatible.
-// signature 生成形如 "action[int,string]" 的类型段。它使用 I/O 签名而非实现类型，
-// 因此把 AsAction 换成同 I/O 的具名 Action 仍可回放兼容。
+// Scope returns a child namespace name[id] without recording anything. Use it
+// for loops or branches whose steps keep fixed names, e.g.
+//
+//	s := f.Scope("step", strconv.Itoa(i))
+//	s.Run("llm", llm, req) // step[0]|llm
+//
+// id must be deterministic (an index, a business ID), never time or random.
+// The scope shares the caller's strand and async joining.
+// Scope 返回子命名空间 name[id]，本身不产生记录，用于让步骤保持固定名字的循环或分支。
+// id 必须确定（下标、业务 ID），不能是时间或随机数。Scope 与调用方共享 strand 和异步汇合。
+func (f *FlowContext) Scope(name string, id string) *FlowContext {
+	path, _ := f.claim(name, id)
+	return &FlowContext{execution: f.execution, path: path, depth: f.depth, scope: f.scope, strand: f.strand}
+}
+
+// signature renders the leaf type of a step for observation, e.g.
+// "action[int,string]". It is recorded and emitted, never compared.
+// signature 生成步骤的叶子类型，例如 "action[int,string]"。它只被记录和发出，从不参与比较。
 func signature[I, O any](name string) string {
 	return name + "[" + reflect.TypeFor[I]().String() + "," + reflect.TypeFor[O]().String() + "]"
 }
 
-// sameStep is the replay identity check: key (already matched) + kind + type
-// path. Input is NOT part of it. A record written before Type existed has no
-// type path and falls back to the strict input comparison.
-// sameStep 是回放身份校验：key（已匹配）+ kind + 类型路径，Input 不参与。
-// 引入 Type 之前写入的记录没有类型路径，退回输入严格比较。
-func sameStep(r *Record, kind Kind, typ string, input json.RawMessage) bool {
-	if r.Kind != kind {
-		return false
-	}
-	if r.Type == "" {
-		return bytes.Equal(r.Input, input)
-	}
-	return r.Type == typ
+// sameStep is the replay identity check: key (already matched) + kind, plus
+// the stored path when present (catches a non-injective KeyBuilder across
+// drives). Types and inputs are observed, never compared.
+// sameStep 是回放身份校验：key（已匹配）+ kind，以及存在时的存储路径（跨 drive 兜底非单射
+// KeyBuilder）。类型与输入只观测、不比较。
+func sameStep(r *Record, kind Kind, path Path) bool {
+	return r.Kind == kind && (r.Path == nil || r.Path.Equal(path))
 }
 
-// inputChanged reports, without failing, a replayed step whose current input
-// differs from the persisted one; the persisted outcome is still used.
-// inputChanged 报告（但不失败）当前输入与持久化输入不同的回放步骤；仍使用持久化结果。
-func (f *FlowContext) inputChanged(r *Record, input json.RawMessage) {
-	if r.Type != "" && !bytes.Equal(r.Input, input) {
-		f.execution.engine.emit(f.Context(), Event{Type: InputChanged, Key: r.Key, Kind: r.Kind,
-			Status: r.Status, RecordVersion: r.Version,
+// replayed reports, without failing, a replayed step whose current input or
+// leaf type differs from the persisted one; the persisted outcome is used.
+// replayed 报告（但不失败）当前输入或叶子类型与持久化值不同的回放步骤；仍使用持久化结果。
+func (f *FlowContext) replayed(r *Record, typ string, input json.RawMessage) {
+	e := f.execution.engine
+	if !sameJSON(r.Input, input) {
+		e.emit(f.Context(), Event{Type: InputChanged, Key: r.Key, Path: r.Path, Kind: r.Kind,
+			Status: r.Status, RecordVersion: r.Version, StepType: typ,
+		}, nil)
+	}
+	if r.Type != "" && r.Type != typ {
+		e.emit(f.Context(), Event{Type: TypeChanged, Key: r.Key, Path: r.Path, Kind: r.Kind,
+			Status: r.Status, RecordVersion: r.Version, StepType: typ, StoredType: r.Type,
 		}, nil)
 	}
 }
@@ -228,21 +249,23 @@ func (f *FlowContext) suspend(pending ...Pending) {
 	f.halt()
 }
 
-// claim reserves a key for a primitive or halts. Halted strands, cancelled or
-// closed executions and invalid/duplicate keys never reach storage.
-// claim 为原语预留 key，否则停止。已停止的 strand、已取消或关闭的执行、
-// 无效或重复 key 都不会触达存储。
-func (f *FlowContext) claim(key string) string {
+// claim reserves the address name[id] for a primitive or halts. Halted
+// strands, cancelled or closed executions, invalid names or IDs, duplicate
+// addresses and non-injective key builders never reach storage.
+// claim 为原语预留地址 name[id]，否则停止。已停止的 strand、已取消或关闭的执行、
+// 无效名称或 ID、重复地址以及非单射的 key 构建器都不会触达存储。
+func (f *FlowContext) claim(name, id string) (Path, string) {
 	if f.strand.halted.Load() {
 		f.halt()
 	}
-	if !localKey.MatchString(key) {
-		f.abort(fatal(fmt.Errorf("%w: key %q", ErrInvalid, key)))
+	if !localKey.MatchString(name) {
+		f.abort(fatal(fmt.Errorf("%w: key %q", ErrInvalid, name)))
 	}
-	resolved := key
-	if f.prefix != "" {
-		resolved = f.prefix + "|" + key
+	if err := validID(id); err != nil {
+		f.abort(fatal(err))
 	}
+	path := f.path.child(name, id)
+	key := f.execution.engine.buildKey(path)
 	e := f.execution
 	e.mu.Lock()
 	if e.closed || (f.scope != nil && f.scope.closed) {
@@ -253,13 +276,40 @@ func (f *FlowContext) claim(key string) string {
 		e.mu.Unlock()
 		f.halt() // the cause is already recorded or comes from the caller's ctx
 	}
-	if e.keys[resolved] {
+	if previous, ok := e.keys[key]; ok {
 		e.mu.Unlock()
-		f.abort(fatal(fmt.Errorf("%w: duplicate key %s", ErrInvalid, resolved)))
+		if !previous.Equal(path) {
+			f.abort(fatal(fmt.Errorf("%w: BuildKey not injective: %s and %s both map to %q", ErrInvalid, previous, path, key)))
+		}
+		f.abort(fatal(fmt.Errorf("%w: duplicate key %s", ErrInvalid, key)))
 	}
-	e.keys[resolved] = true
+	if key == "" || key == definitionKey {
+		e.mu.Unlock()
+		f.abort(fatal(fmt.Errorf("%w: BuildKey returned reserved key %q for %s", ErrInvalid, key, path)))
+	}
+	e.keys[key] = path
 	e.mu.Unlock()
-	return resolved
+	return path, key
+}
+
+// claimInput claims name[input.StepKey()].
+// claimInput 占用 name[input.StepKey()]。
+func (f *FlowContext) claimInput(name string, input any) (Path, string) {
+	id, err := stepID(input)
+	if err != nil {
+		f.fail(err)
+	}
+	return f.claim(name, id)
+}
+
+// fail aborts with a deterministic error after the strand check, so a halted
+// strand halts instead of reporting a secondary failure.
+// fail 在 strand 检查之后以确定性错误中止，使已停止的 strand 只停止而不报告次生故障。
+func (f *FlowContext) fail(err error) {
+	if f.strand.halted.Load() {
+		f.halt()
+	}
+	f.abort(fatal(err))
 }
 
 // must converts a framework error into an abort. Drift and decoding errors are
@@ -335,7 +385,7 @@ func (e *Engine) Drive[I, O any](ctx context.Context, workflow Workflow[I, O], i
 			StartedAt: eventStarted, Pending: result.Pending,
 		}, err)
 	}()
-	if ctx == nil || workflow.run == nil || !localKey.MatchString(workflow.Name) || workflow.Version == "" {
+	if ctx == nil || invalidFlow(workflow.root) || !localKey.MatchString(workflow.Name) || workflow.Version == "" {
 		return result, ErrInvalid
 	}
 	if err = ctx.Err(); err != nil {
@@ -349,12 +399,12 @@ func (e *Engine) Drive[I, O any](ctx context.Context, workflow Workflow[I, O], i
 		return result, err
 	}
 	definition, err := e.store.Put(ctx, &Record{
-		Key: "$definition", Kind: DefinitionKind, Status: Completed, Input: identity,
+		Key: definitionKey, Path: Path{{Name: definitionKey}}, Kind: DefinitionKind, Status: Completed, Input: identity,
 	})
 	if err != nil {
-		return result, &OperationError{Key: "$definition", Op: "Put", Cause: err}
+		return result, &OperationError{Key: definitionKey, Op: "Put", Cause: err}
 	}
-	if !bytes.Equal(definition.Input, identity) {
+	if !sameJSON(definition.Input, identity) {
 		result.Status = Failed
 		return result, fatal(ErrChanged)
 	}
@@ -368,11 +418,11 @@ func (e *Engine) Drive[I, O any](ctx context.Context, workflow Workflow[I, O], i
 	}
 	runCtx, cancel := context.WithCancel(eventCtx)
 	defer cancel()
-	ex := &execution{engine: e, ctx: runCtx, cancel: cancel, keys: make(map[string]bool),
+	ex := &execution{engine: e, ctx: runCtx, cancel: cancel, keys: make(map[string]Path),
 		pending: make(map[string]Pending), records: records}
 	root := &strand{}
-	workflowCtx := &WorkflowContext{state: &FlowContext{execution: ex, strand: root}}
-	output, handlerErr, _ := runStrand(root, func() (O, error) { return workflow.run(workflowCtx, input) })
+	rootCtx := &FlowContext{execution: ex, strand: root}
+	output, handlerErr, _ := runStrand(root, func() (O, error) { return rootCtx.runChildFlow(nil, workflow.root, input) })
 	ex.wg.Wait()
 	ex.mu.Lock()
 	ex.closed = true
@@ -447,16 +497,24 @@ func terminalRecords(all []*Record) map[string]*Record {
 	return records
 }
 
+// definitionKey addresses the run's definition record. It cannot collide with
+// a step: step names match ^[A-Za-z0-9_]+$ and claim rejects it from BuildKey.
+// definitionKey 是 run 定义记录的地址。它不会与步骤冲突：步骤名匹配 ^[A-Za-z0-9_]+$，
+// 且 claim 会拒绝 BuildKey 返回它。
+const definitionKey = "$definition"
+
 // Run executes an Action once per run. The returned error is always nil or a
 // committed *ActionError (business failure, possibly after exhausting Retry);
 // handle it or return it. Retryable failures and infrastructure faults abort
-// the drive instead of returning.
+// the drive instead of returning. The step address is name[input.StepKey()]
+// when the input implements StepKeyer, otherwise name.
 // Run 在每个 run 中执行一次 Action。返回的 error 只会是 nil 或已提交的
 // *ActionError（业务失败，可能是用尽 Retry 之后）；处理它或返回它。
-// 可重试失败和基础设施故障会中止 drive，而不是返回。
-func (f *FlowContext) Run[I, O any](key string, action Action[I, O], input I, options ...ActionOptions) (O, error) {
-	resolved := f.claim(key)
-	output, actionErr, err := f.runAction(resolved, action, input, options...)
+// 可重试失败和基础设施故障会中止 drive，而不是返回。输入实现 StepKeyer 时步骤地址为
+// name[input.StepKey()]，否则为 name。
+func (f *FlowContext) Run[I, O any](name string, action Action[I, O], input I, options ...ActionOptions) (O, error) {
+	path, key := f.claimInput(name, input)
+	output, actionErr, err := f.runAction(path, key, action, input, options...)
 	f.must(err)
 	if actionErr != nil {
 		return output, actionErr
@@ -466,8 +524,9 @@ func (f *FlowContext) Run[I, O any](key string, action Action[I, O], input I, op
 
 // runAction returns (output, committed business failure, framework failure).
 // runAction 返回（输出、已提交的业务失败、框架故障）。
-func (f *FlowContext) runAction[I, O any](key string, action Action[I, O], input I, options ...ActionOptions) (output O, business *ActionError, err error) {
+func (f *FlowContext) runAction[I, O any](path Path, key string, action Action[I, O], input I, options ...ActionOptions) (output O, business *ActionError, err error) {
 	e := f.execution.engine
+	typ := signature[I, O]("action")
 	eventStarted := e.options.Now()
 	actionStatus := Running
 	var recordVersion int64
@@ -478,7 +537,7 @@ func (f *FlowContext) runAction[I, O any](key string, action Action[I, O], input
 			eventErr = business
 		}
 		e.emit(f.Context(), Event{
-			Type: ActionFinished, Key: key, Kind: ActionKind, Status: actionStatus,
+			Type: ActionFinished, Key: key, Path: path, Kind: ActionKind, Status: actionStatus, StepType: typ,
 			StartedAt: eventStarted, Replayed: replayed, RecordVersion: recordVersion,
 		}, eventErr)
 	}()
@@ -496,7 +555,6 @@ func (f *FlowContext) runAction[I, O any](key string, action Action[I, O], input
 	if err != nil {
 		return output, nil, fatal(err)
 	}
-	typ := f.typePath(signature[I, O]("action"))
 	started := e.options.Now()
 	record := f.execution.records[key]
 	if record == nil {
@@ -510,23 +568,23 @@ func (f *FlowContext) runAction[I, O any](key string, action Action[I, O], input
 		if r == nil {
 			return false, nil
 		}
-		if !sameStep(r, ActionKind, typ, data) {
+		if !sameStep(r, ActionKind, path) {
 			return true, ErrChanged
 		}
 		switch r.Status {
 		case Completed:
-			f.inputChanged(r, data)
+			f.replayed(r, typ, data)
 			decodeErr := decode(r.Result, &output)
 			replayed, actionStatus, recordVersion = true, r.Status, r.Version
-			e.emit(f.Context(), Event{Type: ActionReplayed, Key: key, Kind: ActionKind,
+			e.emit(f.Context(), Event{Type: ActionReplayed, Key: key, Path: path, Kind: ActionKind, StepType: typ,
 				Status: r.Status, StartedAt: eventStarted, Replayed: true, RecordVersion: r.Version,
 			}, decodeErr)
 			return true, decodeErr
 		case Failed:
-			f.inputChanged(r, data)
+			f.replayed(r, typ, data)
 			business = &ActionError{Key: key, Message: r.Error}
 			replayed, actionStatus, recordVersion = true, r.Status, r.Version
-			e.emit(f.Context(), Event{Type: ActionReplayed, Key: key, Kind: ActionKind,
+			e.emit(f.Context(), Event{Type: ActionReplayed, Key: key, Path: path, Kind: ActionKind, StepType: typ,
 				Status: r.Status, StartedAt: eventStarted, Replayed: true, RecordVersion: r.Version,
 			}, business)
 			return true, nil
@@ -549,23 +607,23 @@ func (f *FlowContext) runAction[I, O any](key string, action Action[I, O], input
 		}
 		if record == nil {
 			record, err = e.store.Commit(executionCtx, token, &Record{
-				Key: key, Kind: ActionKind, Status: Running, Type: typ, Input: data, StartedAt: started,
+				Key: key, Path: path, Kind: ActionKind, Status: Running, Type: typ, Input: data, StartedAt: started,
 			}, 0)
 			if err != nil {
 				return &OperationError{key, "Commit", err}
 			}
 		} else {
 			// Re-executing an interrupted attempt: the outcome must describe the
-			// input actually used now (and upgrades a pre-Type record).
-			// 重新执行被中断的尝试：结果必须对应本次实际使用的输入（同时升级无 Type 的旧记录）。
-			f.inputChanged(record, data)
-			record.Type, record.Input = typ, data
+			// input and type actually used now.
+			// 重新执行被中断的尝试：结果必须对应本次实际使用的输入与类型。
+			f.replayed(record, typ, data)
+			record.Path, record.Type, record.Input = path, typ, data
 		}
 		recordVersion = record.Version
 		baseCtx := context.WithValue(executionCtx, actionKey{}, key)
 		var actionErr error
 		for attempt := 1; ; attempt++ {
-			e.emit(baseCtx, Event{Type: ActionStarted, Key: key, Kind: ActionKind,
+			e.emit(baseCtx, Event{Type: ActionStarted, Key: key, Path: path, Kind: ActionKind, StepType: typ,
 				Status: Running, StartedAt: eventStarted, RecordVersion: record.Version,
 			}, nil)
 			output, actionErr = attemptAction(baseCtx, action, input, option.Timeout)

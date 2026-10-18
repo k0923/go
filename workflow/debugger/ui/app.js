@@ -337,8 +337,19 @@ function renderSteps(records) {
     </div>`)
 }
 
+// segLabel renders one Path segment: name, or name[id] with a dimmed id.
+function segLabel(seg) {
+  return seg.id ? `${esc(seg.name)}<span class="text-sky-300/70">[${esc(seg.id)}]</span>` : esc(seg.name)
+}
+
+// recordPath prefers the structured Path; it never splits a key, because an
+// id may itself contain '|'.
+function recordPath(r) {
+  return r.path && r.path.length ? r.path : [{ name: r.key }]
+}
+
 function stepRow(r, t0, span, now) {
-  const parts = r.key.split('|')
+  const parts = recordPath(r)
   const depth = parts.length - 1
   const start = new Date(r.started_at).getTime()
   const end = isZero(r.ended_at) ? now : new Date(r.ended_at).getTime()
@@ -347,12 +358,12 @@ function stepRow(r, t0, span, now) {
   const s = st(r.status)
   let extra = ''
   if (r.kind === 'SLEEP' && r.status === 'SUSPENDED') extra = `<span class="text-cyan-300/80">${countdown(r.until)}</span>`
-  if (r.group) extra = `<span class="text-slate-500">group ${esc(r.group.split('|').pop())}</span>`
+  if (r.group) extra = `<span class="text-slate-500">group ${segLabel(parts[parts.length - 2] || { name: r.group })}</span>`
   if (r.error) extra = `<span class="text-rose-300/90 truncate">${esc(r.error)}</span>`
   return `<button data-record="${esc(r.key)}" class="w-full text-left grid grid-cols-[minmax(0,2.2fr)_110px_120px_minmax(0,1.6fr)_80px] gap-4 px-4 py-2.5 items-center border-b border-white/[.03] last:border-0 hover:bg-white/[.03] transition">
     <div class="min-w-0" style="padding-left:${depth * 16}px">
       <div class="font-mono text-[13px] truncate">
-        ${depth ? `<span class="text-slate-600">${esc(parts.slice(0, -1).join(' › '))} › </span>` : ''}<span class="text-slate-100">${esc(parts[parts.length - 1])}</span>
+        ${depth ? `<span class="text-slate-600">${parts.slice(0, -1).map(segLabel).join(' › ')} › </span>` : ''}<span class="text-slate-100">${segLabel(parts[parts.length - 1])}</span>
       </div>
       ${extra ? `<div class="text-[11px] mt-0.5 truncate">${extra}</div>` : ''}
     </div>
@@ -376,6 +387,8 @@ const EVENT_STYLE = {
   action_replayed: ['bg-slate-500', 'Action 回放'],
   wait_suspended: ['bg-amber-400', '挂起等待'],
   wait_resolved: ['bg-emerald-400', '等待已解决'],
+  input_changed: ['bg-orange-400', '输入变化'],
+  type_changed: ['bg-orange-400', '类型变化'],
   'store.put': ['bg-teal-400', '写入记录'],
   'store.commit': ['bg-indigo-400', '提交 Action'],
   'store.resolve': ['bg-emerald-400', '信号解决'],

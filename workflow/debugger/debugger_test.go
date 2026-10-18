@@ -62,9 +62,9 @@ func (f *fixture) engine(t *testing.T, run string) (*workflow.Engine, *Client) {
 }
 
 func definition[I, O any](flow workflow.FlowFunc[I, O]) workflow.Workflow[I, O] {
-	return workflow.NewWorkflow("test", "v2", func(w *workflow.WorkflowContext, input I) (O, error) {
+	return workflow.NewWorkflow("test", "v2", workflow.FlowFunc[I, O](func(w *workflow.FlowContext, input I) (O, error) {
 		return w.RunFlow("main", flow, input)
-	})
+	}))
 }
 
 func TestWaitForSubmitOverHTTP(t *testing.T) {
@@ -95,7 +95,8 @@ func TestWaitForSubmitOverHTTP(t *testing.T) {
 		}
 	}
 	if request == nil || string(request.Input) != `{"n":42}` || request.Status != workflow.Suspended ||
-		request.Type != "flow[int,string]|signal[map[string]int,map[string]string]" {
+		request.Type != "signal[map[string]int,map[string]string]" ||
+		!request.Path.Equal(workflow.Path{{Name: "main"}, {Name: "approval"}}) {
 		t.Fatalf("request not visible: %+v", request)
 	}
 	if ok, err := client.Submit(ctx, "main|approval", map[string]string{"by": "alice"}); !ok || err != nil {
@@ -113,7 +114,7 @@ func TestWaitForSubmitOverHTTP(t *testing.T) {
 		t.Fatalf("%+v %v calls=%d", result, err, calls)
 	}
 	if _, err = engine.Drive(ctx, flow, 22); !errors.Is(err, workflow.ErrChanged) {
-		t.Fatalf("changed input must be rejected: %v", err)
+		t.Fatalf("changed definition input must be rejected: %v", err)
 	}
 }
 
@@ -396,7 +397,7 @@ func TestEndToEndTwoIsolatedRuns(t *testing.T) {
 		}
 		return id, nil
 	})
-	flow := workflow.NewWorkflow("test", "v2", func(w *workflow.WorkflowContext, id string) (string, error) {
+	flow := workflow.NewWorkflow("test", "v2", workflow.FlowFunc[string, string](func(w *workflow.FlowContext, id string) (string, error) {
 		if _, err := w.RunFlow("prepare", prepare, id); err != nil {
 			return "", err
 		}
@@ -425,7 +426,7 @@ func TestEndToEndTwoIsolatedRuns(t *testing.T) {
 			return output, nil
 		})
 		return w.RunFlow("finish", cooldown, fmt.Sprintf("%s shipped@%d %s", id, ship.Attempt, text))
-	})
+	}))
 	type outcome struct {
 		result workflow.Result[string]
 		err    error

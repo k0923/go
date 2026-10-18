@@ -120,14 +120,14 @@ var prepareFlow = workflow.FlowFunc[Order, Summary](func(f *workflow.FlowContext
 	return summary, err
 })
 
-func orchestrateOrder(w *workflow.WorkflowContext, order Order) (Summary, error) {
-	summary, err := w.RunFlow("prepare", prepareFlow, order)
+func orchestrateOrder(root *workflow.FlowContext, order Order) (Summary, error) {
+	summary, err := root.RunFlow("prepare", prepareFlow, order)
 	if err != nil {
 		return summary, err
 	}
 	// Shipment polling and customer notification progress concurrently.
 	// 物流轮询和客户通知会并发推进。
-	notice := w.GoFlow("notify", workflow.FlowFunc[string, string](func(f *workflow.FlowContext, id string) (string, error) {
+	notice := root.GoFlow("notify", workflow.FlowFunc[string, string](func(f *workflow.FlowContext, id string) (string, error) {
 		// Acks are typed in by hand in the debugger, so accept any JSON shape.
 		// ack 是在 debugger 中手动输入的，因此接受任意 JSON 形状。
 		email := workflow.OnSignal[json.RawMessage]("email_ack", map[string]string{"order": id, "channel": "email"})
@@ -147,7 +147,7 @@ func orchestrateOrder(w *workflow.WorkflowContext, order Order) (Summary, error)
 			Interval: 15 * time.Second, MaxAttempts: 5,
 		})
 	})
-	if summary.Shipment, err = w.RunFlow("shipping", shipping, order.ID); err != nil {
+	if summary.Shipment, err = root.RunFlow("shipping", shipping, order.ID); err != nil {
 		return summary, err
 	}
 	if summary.Notice, err = notice.Wait(); err != nil {
@@ -157,7 +157,7 @@ func orchestrateOrder(w *workflow.WorkflowContext, order Order) (Summary, error)
 		f.Sleep("cooldown", 5*time.Second)
 		return summary, nil
 	})
-	return w.RunFlow("finish", cooldown, summary)
+	return root.RunFlow("finish", cooldown, summary)
 }
 
 func main() {
@@ -168,7 +168,7 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer stop()
 
-	definition := workflow.NewWorkflow("order", "v2", orchestrateOrder)
+	definition := workflow.NewWorkflow("order", "v2", workflow.FlowFunc[Order, Summary](orchestrateOrder))
 	id := *run
 	if id == "" {
 		id = "order-" + uuid.NewString()
