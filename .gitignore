@@ -12,3 +12,4 @@ reviews/
 *.db
 *.log
 *.out
+.trae/
