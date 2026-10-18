@@ -1,7 +1,6 @@
 package dflow
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -22,15 +21,29 @@ type Options struct {
 }
 
 type Engine struct {
-	graph   *Graph
-	infra   Infrastructure
-	leases  *lease.Runner
-	options Options
+	definitions DefinitionProvider
+	registry    *Registry
+	infra       Infrastructure
+	leases      *lease.Runner
+	options     Options
 }
 
+// NewEngine is the in-process publication convenience API.
 func NewEngine(graph *Graph, infra Infrastructure, options Options) (*Engine, error) {
-	if graph == nil || isNil(infra) {
-		return nil, fmt.Errorf("dflow: graph and infrastructure are required")
+	if graph == nil {
+		return nil, ErrInvalidDefinition
+	}
+	return NewEngineWithProvider(graph, graph.registry, infra, options)
+}
+
+// NewEngineWithProvider reconstructs only ready nodes through registry. Provider
+// binds an immutable validated publication; no full-graph decode during recovery.
+func NewEngineWithProvider(provider DefinitionProvider, registry *Registry, infra Infrastructure, options Options) (*Engine, error) {
+	if isNil(provider) || isNil(infra) {
+		return nil, fmt.Errorf("dflow: provider and infrastructure required")
+	}
+	if registry == nil {
+		registry = DefaultRegistry()
 	}
 	if options.MaxConcurrency == 0 {
 		options.MaxConcurrency = 4
@@ -39,327 +52,310 @@ func NewEngine(graph *Graph, infra Infrastructure, options Options) (*Engine, er
 		options.NodeTimeout = 5 * time.Minute
 	}
 	if options.MaxConcurrency < 1 || options.NodeTimeout < 0 {
-		return nil, fmt.Errorf("dflow: invalid concurrency or timeout")
+		return nil, fmt.Errorf("dflow: invalid options")
 	}
 	runner, err := lease.NewRunner(infra, options.Lease)
 	if err != nil {
 		return nil, err
 	}
-	return &Engine{graph, infra, runner, options}, nil
+	return &Engine{provider, registry, infra, runner, options}, nil
 }
 
-// Run starts or resumes a run with the same definition and input. Successful and
-// skipped nodes are reused. Failed/interrupted nodes are retried on the next call.
-// When no nodes can execute, Run returns their snapshot and releases the lease.
-// A nil error means this drive stopped normally, not that the workflow finished.
-// A run-level renewable lease prevents concurrent drivers; nodes within a run
-// execute concurrently. Cancellation waits for started nodes to return, so custom
-// nodes MUST honor ctx. The returned snapshot is the last confirmed durable state.
+// Run drains persistent ready tasks in memory. Returned Nodes contains only
+// nodes touched by this drive. Business observation uses GetNode/SnapshotReader.
+// Nil error means quiescence, not workflow completion.
 func (e *Engine) Run(ctx context.Context, input map[string]any) (state *State, err error) {
-	normalized, err := cloneJSON(input)
+	input, err = cloneJSON(input)
 	if err != nil {
-		return nil, fmt.Errorf("dflow input: %w", err)
+		return nil, err
 	}
-	if normalized == nil {
-		normalized = map[string]any{}
+	if input == nil {
+		input = map[string]any{}
 	}
 	err = e.leases.Run(ctx, runLeaseKey, func(ctx context.Context, token lease.Token) error {
-		loaded, err := e.infra.Load(ctx)
+		manifest, err := e.definitions.Manifest(ctx)
 		if err != nil {
-			return &InfrastructureError{"Load", err}
+			return err
 		}
-		if loaded == nil {
-			loaded = &State{
-				DefinitionHash: e.graph.hash, Input: normalized,
-				Nodes: make(map[string]NodeState, len(e.graph.nodes)),
-			}
-			for id := range e.graph.nodes {
-				loaded.Nodes[id] = NodeState{Status: Pending}
-			}
-			if err := e.save(ctx, token, loaded); err != nil {
-				return err
-			}
-		} else {
-			left, _ := json.Marshal(loaded.Input)
-			right, _ := json.Marshal(normalized)
-			if loaded.DefinitionHash != e.graph.hash || !bytes.Equal(left, right) {
-				return ErrRunMismatch
-			}
-			if err := e.validateState(loaded); err != nil {
-				return &InfrastructureError{"Load", err}
-			}
+		if err := e.infra.Initialize(ctx, token, manifest, input); err != nil {
+			return &InfrastructureError{"Initialize", err}
 		}
-		state, err = cloneJSON(loaded)
-		if err != nil {
-			return &InfrastructureError{"Load", err}
-		}
-		return e.drive(ctx, token, &state)
+		state = &State{DefinitionHash: manifest.Hash, Input: input, Nodes: map[string]NodeState{}}
+		return e.drive(ctx, token, state, nil, false)
 	})
 	return state, err
 }
 
-func (e *Engine) validateState(state *State) error {
-	if state.Version < 1 || len(state.Nodes) != len(e.graph.nodes) {
-		return fmt.Errorf("invalid stored state")
-	}
-	for id := range e.graph.nodes {
-		node, ok := state.Nodes[id]
-		if !ok {
-			return fmt.Errorf("stored node %q is missing", id)
-		}
-		switch node.Status {
-		case Pending, Running, Failed, Suspended:
-			if node.Status == Suspended && node.Suspension == nil {
-				return fmt.Errorf("suspended node %q has no suspension", id)
-			}
-		case Succeeded, Skipped:
-			if node.Suspension != nil {
-				return fmt.Errorf("terminal node %q retains a suspension", id)
-			}
-		default:
-			return fmt.Errorf("invalid stored node status %q", node.Status)
-		}
-		if node.Suspension != nil {
-			if _, ok := e.graph.nodes[id].(ResumableNode); !ok || node.Suspension.Token == "" {
-				return fmt.Errorf("node %q cannot resume persisted suspension", id)
-			}
-		}
-	}
-	return nil
-}
-
-func (e *Engine) save(ctx context.Context, token lease.Token, state *State) error {
-	if err := e.infra.Save(ctx, token, state, state.Version); err != nil {
-		return &InfrastructureError{"Save", err}
-	}
-	state.Version++
-	return nil
-}
-
 type completion struct {
-	id     string
+	task   *NodeTask
+	node   *PublishedNode
 	result Result
 	err    error
 }
 
-func (e *Engine) drive(parent context.Context, token lease.Token, durable **State) error {
+func (e *Engine) drive(parent context.Context, token lease.Token, observed *State, first *NodeTask, scoped bool) error {
 	ctx, cancel := context.WithCancel(parent)
 	defer cancel()
-	state, err := cloneJSON(*durable)
-	if err != nil {
-		return err
-	}
-	commit := func() error {
-		if err := e.save(ctx, token, state); err != nil {
-			return err
-		}
-		copy, err := cloneJSON(state)
-		if err != nil {
-			return err
-		}
-		*durable = copy
-		return nil
-	}
-	for id, node := range state.Nodes {
-		if node.Status == Running || node.Status == Failed {
-			node.Status, node.Error = Pending, ""
-			state.Nodes[id] = node
-		}
-	}
-	completed := make(chan completion, e.options.MaxConcurrency)
+	done := make(chan completion, e.options.MaxConcurrency)
 	active := 0
-	// Never return while a started custom node can still access its resources.
+	queue := []string{}
+	queued := map[string]bool{}
 	defer func() {
 		cancel()
 		for active > 0 {
-			<-completed
+			<-done
 			active--
 		}
 	}()
-	fail := func(id, stage string, cause error) error {
-		nodeErr := &NodeError{id, stage, cause}
-		node := state.Nodes[id]
-		node.Status, node.Error = Failed, nodeErr.Error()
-		state.Nodes[id] = node
-		return errors.Join(nodeErr, commit())
-	}
 	for {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		// Responses live outside the snapshot, so concurrent Wakeup cannot be
-		// overwritten by a snapshot commit. No polling while the run is idle.
-		responses, err := e.refreshWaits(ctx, state)
-		if err != nil {
-			return err
-		}
-		changed := false
-		for _, id := range e.graph.order {
-			if active >= e.options.MaxConcurrency {
+		for active < e.options.MaxConcurrency {
+			var task *NodeTask
+			var err error
+			if first != nil {
+				task = first
+				first = nil
+			} else if scoped {
+				for len(queue) > 0 && task == nil {
+					id := queue[0]
+					queue = queue[1:]
+					delete(queued, id)
+					task, err = e.infra.ClaimNode(ctx, token, id)
+					if err != nil {
+						break
+					}
+				}
+			} else {
+				task, err = e.infra.ClaimReady(ctx, token)
+			}
+			if err != nil {
+				return &InfrastructureError{"ClaimReady", err}
+			}
+			if task == nil {
 				break
 			}
-			if state.Nodes[id].Status != Pending {
-				continue
-			}
-			ready, enabled := e.ready(id, state)
-			if !ready {
-				continue
-			}
-			if !enabled {
-				state.Nodes[id] = NodeState{Status: Skipped}
-				changed = true
-				continue
-			}
-			input, err := e.graph.specs[id].Inputs.resolve(state.Input, state.Nodes)
-			if err != nil {
-				return fail(id, "resolve input", err)
-			}
-			// An unconfigured start node passes the entire workflow input through.
-			if e.graph.specs[id].Type == "start" && len(e.graph.specs[id].Inputs) == 0 {
-				input, err = cloneJSON(state.Input)
-				if err != nil {
-					return fail(id, "resolve input", err)
-				}
-			}
-			previous := state.Nodes[id]
-			if previous.Suspension != nil {
-				input = previous.Input
-			}
-			state.Nodes[id] = NodeState{Status: Running, Input: input, Suspension: previous.Suspension}
-			if err := commit(); err != nil {
-				return err
-			}
-			// A custom node is allowed to mutate its private input, not stored input.
-			nodeInput, err := cloneJSON(input)
-			if err != nil {
-				return fail(id, "copy input", err)
-			}
+			observed.Nodes[task.NodeID] = task.State
 			active++
 			go func() {
-				result, err := e.runNode(ctx, id, nodeInput, responses[id])
-				completed <- completion{id: id, result: result, err: err}
+				node, result, err := e.execute(ctx, task, observed.Input)
+				done <- completion{task, node, result, err}
 			}()
 		}
-		if changed {
-			if err := commit(); err != nil {
-				return err
-			}
-		}
 		if active == 0 {
-			// Scheduling quiescence is not a workflow lifecycle decision.
 			return nil
 		}
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case done := <-completed:
+		case result := <-done:
 			active--
-			if done.err != nil {
-				var storageErr *InfrastructureError
-				if errors.As(done.err, &storageErr) {
-					return done.err
-				}
-				return fail(done.id, "execute", done.err)
-			}
-			node := state.Nodes[done.id]
-			if done.result.Suspend != nil {
-				node.Status = Suspended
-				node.Output, node.Ports = nil, nil
-				node.Suspension = &SuspensionState{Token: uuid.NewString(), Suspension: *done.result.Suspend}
-			} else {
-				node.Status, node.Output, node.Ports = Succeeded, done.result.Output, done.result.Ports
-				node.Suspension = nil
-			}
-			state.Nodes[done.id] = node
-			if err := commit(); err != nil {
+			if err := ctx.Err(); err != nil {
 				return err
 			}
-		}
-	}
-}
-
-func (e *Engine) refreshWaits(ctx context.Context, state *State) (map[string]*ResumeInput, error) {
-	responses := make(map[string]*ResumeInput)
-	for id, node := range state.Nodes {
-		if node.Suspension == nil || (node.Status != Suspended && node.Status != Pending) {
-			continue
-		}
-		response, err := e.infra.GetResponse(ctx, id, node.Suspension.Token)
-		if err != nil {
-			return nil, &InfrastructureError{"GetResponse", err}
-		}
-		if response == nil {
-			if node.Status == Pending {
-				return nil, &InfrastructureError{"GetResponse", fmt.Errorf("missing response for interrupted Resume of %q", id)}
+			task := result.task
+			next := task.State
+			var arrivals []Arrival
+			if result.err != nil {
+				var infraErr *InfrastructureError
+				if errors.As(result.err, &infraErr) {
+					return result.err
+				}
+				next.Status, next.Error = Failed, result.err.Error()
+			} else if result.result.Suspend != nil {
+				payload, err := EncodeSuspension(result.result.Suspend)
+				if err != nil {
+					return err
+				}
+				next.Status = Suspended
+				next.Suspension = &SuspensionState{Token: uuid.NewString(), Payload: payload}
+			} else {
+				next.Status = Succeeded
+				if !task.State.Enabled {
+					next.Status = Skipped
+				}
+				next.Output, next.Ports, next.Suspension = result.result.Output, result.result.Ports, nil
+				var err error
+				arrivals, err = e.arrivals(ctx, task.NodeID, result.node, next)
+				if err != nil {
+					return err
+				}
 			}
-			continue
-		}
-		var value any
-		if err := json.Unmarshal(response.Value, &value); err != nil {
-			return nil, &InfrastructureError{"GetResponse", err}
-		}
-		resume, err := cloneJSON(ResumeInput{Token: node.Suspension.Token, State: node.Suspension.State, Response: value})
-		if err != nil {
-			return nil, &InfrastructureError{"GetResponse", err}
-		}
-		responses[id] = &resume
-		node.Status = Pending
-		state.Nodes[id] = node
-	}
-	return responses, nil
-}
-
-func (e *Engine) ready(id string, state *State) (ready, enabled bool) {
-	edges := e.graph.incoming[id]
-	enabled = len(edges) == 0
-	for _, edge := range edges {
-		node := state.Nodes[edge.SourceNodeID]
-		if node.Status != Succeeded && node.Status != Skipped {
-			return false, false
-		}
-		if node.Status == Succeeded && (node.Ports == nil || slices.Contains(node.Ports, edge.SourcePortID)) {
-			enabled = true
+			next.Ready = false
+			if err := e.infra.Commit(ctx, token, NodeCommit{task.NodeID, task.State.Version, next, arrivals}); err != nil {
+				return &InfrastructureError{"Commit", err}
+			}
+			next.Version++
+			observed.Nodes[task.NodeID] = next
+			if scoped {
+				for _, arrival := range arrivals {
+					if !queued[arrival.TargetNodeID] {
+						queue = append(queue, arrival.TargetNodeID)
+						queued[arrival.TargetNodeID] = true
+					}
+				}
+			}
+			if result.err != nil {
+				return &NodeError{task.NodeID, "execute", result.err}
+			}
 		}
 	}
-	return true, enabled
 }
 
-func (e *Engine) runNode(parent context.Context, id string, input map[string]any, resume *ResumeInput) (result Result, err error) {
-	ctx, cancel := context.WithTimeout(context.WithValue(parent, nodeIDKey{}, id), e.options.NodeTimeout)
+func (e *Engine) execute(parent context.Context, task *NodeTask, input map[string]any) (published *PublishedNode, result Result, err error) {
+	ctx, cancel := context.WithTimeout(context.WithValue(parent, nodeIDKey{}, task.NodeID), e.options.NodeTimeout)
 	defer cancel()
-	// User panics become node failures rather than crashing scheduler goroutines.
 	defer func() {
 		if value := recover(); value != nil {
 			err = fmt.Errorf("panic: %v", value)
 		}
 	}()
-	if resume != nil {
-		result, err = e.graph.nodes[id].(ResumableNode).Resume(ctx, input, *resume)
+	published, err = e.definitions.LoadNode(ctx, task.NodeID)
+	if err != nil {
+		return nil, result, &InfrastructureError{"LoadNode", err}
+	}
+	if published == nil || published.Spec.ID != task.NodeID {
+		return nil, result, &InfrastructureError{"LoadNode", ErrInvalidDefinition}
+	}
+	if !task.State.Enabled {
+		return published, result, nil
+	} // no executable instance for skipped nodes
+	node, err := e.registry.DecodeNode(published.Spec)
+	if err != nil {
+		return published, result, err
+	}
+	nodeInput := task.State.Input
+	if task.State.Suspension == nil {
+		upstream := map[string]NodeState{}
+		for _, parameter := range published.Spec.Inputs {
+			refs, refErr := parameter.references()
+			if refErr != nil {
+				return published, result, refErr
+			}
+			for _, path := range refs {
+				if path[0] == InputSource {
+					continue
+				}
+				if _, loaded := upstream[path[0]]; loaded {
+					continue
+				}
+				state, readErr := e.infra.GetNode(ctx, path[0])
+				if readErr != nil {
+					return published, result, &InfrastructureError{"GetNode", readErr}
+				}
+				if state != nil {
+					upstream[path[0]] = *state
+				}
+			}
+		}
+		nodeInput, err = published.Spec.Inputs.resolveWithInput(e.infra, ctx, upstream)
+		if err != nil {
+			return published, result, err
+		}
+		if published.Spec.Type == "start" && len(published.Spec.Inputs) == 0 {
+			value, readErr := e.infra.GetInput(ctx)
+			if readErr != nil {
+				return published, result, &InfrastructureError{"GetInput", readErr}
+			}
+			var ok bool
+			nodeInput, ok = value.(map[string]any)
+			if !ok {
+				return published, result, ErrInvalidDefinition
+			}
+		}
+		if err != nil {
+			return published, result, err
+		}
+		task.State.Input, err = cloneJSON(nodeInput)
+		if err != nil {
+			return published, result, err
+		}
+	}
+	nodeInput, err = cloneJSON(nodeInput)
+	if err != nil {
+		return published, result, err
+	}
+	if suspension := task.State.Suspension; suspension != nil {
+		response, readErr := e.infra.GetResponse(ctx, task.NodeID, suspension.Token)
+		if readErr != nil {
+			return published, result, &InfrastructureError{"GetResponse", readErr}
+		}
+		if response == nil {
+			return published, result, &InfrastructureError{"GetResponse", ErrWaitNotFound}
+		}
+		resumable, ok := node.(ResumableNode)
+		if !ok {
+			return published, result, ErrInvalidSuspension
+		}
+		var value any
+		if err := json.Unmarshal(response.Value, &value); err != nil {
+			return published, result, err
+		}
+		payload, decodeErr := e.registry.DecodeSuspension(suspension.Payload)
+		if decodeErr != nil {
+			return published, result, &InfrastructureError{"DecodeSuspension", decodeErr}
+		}
+		result, err = resumable.Resume(ctx, nodeInput, ResumeInput{Token: suspension.Token, Suspension: payload, Response: value})
 	} else {
-		result, err = e.graph.nodes[id].Run(ctx, input)
+		result, err = node.Run(ctx, nodeInput)
 	}
 	if ctx.Err() != nil {
-		return Result{}, ctx.Err()
+		return published, Result{}, ctx.Err()
 	}
 	if err != nil {
-		return Result{}, err
+		return published, result, err
 	}
 	if result.Suspend != nil {
-		if _, ok := e.graph.nodes[id].(ResumableNode); !ok || result.Output != nil || result.Ports != nil {
-			return Result{}, ErrInvalidSuspension
+		if _, ok := node.(ResumableNode); !ok || isNil(result.Suspend) || result.Output != nil || result.Ports != nil {
+			return published, result, ErrInvalidSuspension
+		}
+		envelope, encodeErr := EncodeSuspension(result.Suspend)
+		if encodeErr != nil {
+			return published, result, encodeErr
+		}
+		result.Suspend, err = e.registry.DecodeSuspension(envelope)
+		if err != nil {
+			return published, result, err
 		}
 	}
 	for _, port := range result.Ports {
 		found := false
-		for _, edge := range e.graph.outgoing[id] {
+		for _, edge := range published.Outgoing {
 			if edge.SourcePortID == port {
 				found = true
-				break
 			}
 		}
 		if !found {
-			return Result{}, fmt.Errorf("selected unknown outgoing port %q", port)
+			return published, result, fmt.Errorf("unknown outgoing port %q", port)
 		}
 	}
-	return cloneJSON(result)
+	suspend := result.Suspend
+	result, err = cloneJSON(result)
+	result.Suspend = suspend
+	return published, result, err
+}
+
+func (e *Engine) arrivals(ctx context.Context, source string, node *PublishedNode, state NodeState) ([]Arrival, error) {
+	targets := map[string]bool{}
+	var order []string
+	for _, edge := range node.Outgoing {
+		if _, exists := targets[edge.TargetNodeID]; !exists {
+			order = append(order, edge.TargetNodeID)
+		}
+		active := state.Status == Succeeded && (state.Ports == nil || slices.Contains(state.Ports, edge.SourcePortID))
+		targets[edge.TargetNodeID] = targets[edge.TargetNodeID] || active
+	}
+	var result []Arrival
+	for _, id := range order {
+		incoming, err := e.definitions.Incoming(ctx, id)
+		if err != nil {
+			return nil, err
+		}
+		if !slices.Contains(incoming, source) {
+			return nil, ErrInvalidDefinition
+		}
+		result = append(result, Arrival{TargetNodeID: id, Incoming: incoming, Active: targets[id]})
+	}
+	return result, nil
 }

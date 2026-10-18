@@ -40,11 +40,7 @@ func (i *Infrastructure) Resolve(ctx context.Context, nodeID, token string, valu
 	if response != nil {
 		return false, nil
 	}
-	var state dflow.State
-	if err := json.Unmarshal(i.state, &state); err != nil {
-		return false, err
-	}
-	node := state.Nodes[nodeID]
+	node := i.state.Nodes[nodeID]
 	if node.Suspension == nil || node.Suspension.Token != token {
 		return false, nil
 	}
@@ -52,6 +48,9 @@ func (i *Infrastructure) Resolve(ctx context.Context, nodeID, token string, valu
 		return false, dflow.ErrInvalidSuspension
 	}
 	i.responses[key] = &dflow.Response{Value: slices.Clone(value)}
+	node.Ready = true
+	node.Version++
+	i.state.Nodes[nodeID] = node
 	i.notify(dflow.Notification{Kind: dflow.WakeNotification, NodeID: nodeID, Token: token})
 	return true, nil
 }

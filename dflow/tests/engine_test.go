@@ -2,7 +2,6 @@ package tests
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"sync/atomic"
@@ -14,7 +13,22 @@ import (
 	"github.com/k0923/go/lease"
 )
 
-func engine(t *testing.T, def dflow.Definition, registry *dflow.Registry, infra dflow.Infrastructure, options dflow.Options) *dflow.Engine {
+type observedEngine struct {
+	*dflow.Engine
+	store dflow.SnapshotReader
+}
+
+func (e *observedEngine) Run(ctx context.Context, input map[string]any) (*dflow.State, error) {
+	_, err := e.Engine.Run(ctx, input)
+	state, readErr := e.store.Load(context.WithoutCancel(ctx))
+	return state, errors.Join(err, readErr)
+}
+func (e *observedEngine) Drain(ctx context.Context) (*dflow.State, error) {
+	_, err := e.Engine.Drain(ctx)
+	state, readErr := e.store.Load(context.WithoutCancel(ctx))
+	return state, errors.Join(err, readErr)
+}
+func engine(t *testing.T, def dflow.Definition, registry *dflow.Registry, infra dflow.Infrastructure, options dflow.Options) *observedEngine {
 	t.Helper()
 	graph, err := dflow.Compile(def, registry)
 	if err != nil {
@@ -24,12 +38,12 @@ func engine(t *testing.T, def dflow.Definition, registry *dflow.Registry, infra 
 	if err != nil {
 		t.Fatal(err)
 	}
-	return e
+	return &observedEngine{e, infra.(dflow.SnapshotReader)}
 }
 
 func register(t *testing.T, registry *dflow.Registry, name string, node dflow.NodeFunc) {
 	t.Helper()
-	if err := registry.Register(name, func(json.RawMessage) (dflow.Node, error) { return node, nil }); err != nil {
+	if err := registry.Register(func() dflow.Node { return &dflow.FuncNode{Kind: name, Handler: node} }); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -271,11 +285,11 @@ type failingSave struct {
 	fail atomic.Bool
 }
 
-func (s *failingSave) Save(ctx context.Context, token lease.Token, state *dflow.State, version int64) error {
-	if node := state.Nodes["a"]; node.Status == dflow.Succeeded && s.fail.CompareAndSwap(true, false) {
+func (s *failingSave) Commit(ctx context.Context, token lease.Token, commit dflow.NodeCommit) error {
+	if commit.NodeID == "a" && commit.State.Status == dflow.Succeeded && s.fail.CompareAndSwap(true, false) {
 		return errors.New("storage unavailable")
 	}
-	return s.Infrastructure.Save(ctx, token, state, version)
+	return s.Infrastructure.Commit(ctx, token, commit)
 }
 
 func TestPersistenceFailureDoesNotStartDownstream(t *testing.T) {

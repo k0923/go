@@ -19,7 +19,7 @@ import (
 func suspendedSnapshot() *dflow.State {
 	return &dflow.State{Nodes: map[string]dflow.NodeState{
 		"node": {Status: dflow.Suspended, Suspension: &dflow.SuspensionState{
-			Token: "token-1", Suspension: dflow.Suspension{State: "saved", Request: "request"},
+			Token: "token-1", Payload: dflow.SuspensionEnvelope{Type: "dflow.json", Data: json.RawMessage(`{"data":"saved"}`)},
 		}},
 	}}
 }
@@ -52,13 +52,21 @@ func TestSQLiteConcurrentResolveAndFencing(t *testing.T) {
 		t.Fatal(err)
 	}
 	state := suspendedSnapshot()
-	if err := left.Save(ctx, *old, state, 0); !errors.Is(err, lease.ErrConflict) {
-		t.Fatal("stale writer accepted", err)
-	}
-	if err := right.Save(ctx, *current, state, 0); err != nil {
+	if err := right.Initialize(ctx, *current, dflow.Manifest{Hash: "v1", Roots: []string{"node"}}, nil); err != nil {
 		t.Fatal(err)
 	}
-	if err := right.Save(ctx, *current, state, 0); !errors.Is(err, dflow.ErrConflict) {
+	task, err := right.ClaimReady(ctx, *current)
+	if err != nil {
+		t.Fatal(err)
+	}
+	commit := dflow.NodeCommit{NodeID: "node", ExpectedVersion: task.State.Version, State: state.Nodes["node"]}
+	if err := left.Commit(ctx, *old, commit); !errors.Is(err, lease.ErrConflict) {
+		t.Fatal("stale writer accepted", err)
+	}
+	if err := right.Commit(ctx, *current, commit); err != nil {
+		t.Fatal(err)
+	}
+	if err := right.Commit(ctx, *current, commit); !errors.Is(err, dflow.ErrConflict) {
 		t.Fatal("stale snapshot accepted", err)
 	}
 	type response struct {
@@ -83,8 +91,7 @@ func TestSQLiteConcurrentResolveAndFencing(t *testing.T) {
 		}
 	}
 	// An old snapshot saved after callback arrival must not overwrite it.
-	state.Version = 1
-	if err := right.Save(ctx, *current, state, 1); err != nil {
+	if err := right.Commit(ctx, *current, commit); !errors.Is(err, dflow.ErrConflict) {
 		t.Fatal(err)
 	}
 	messages, err := left.Pending(ctx)
@@ -133,10 +140,18 @@ BEGIN SELECT RAISE(ABORT, 'injected outbox failure'); END`); err != nil {
 		t.Fatal(err)
 	}
 	state := suspendedSnapshot()
-	if err := store.Save(ctx, *token, state, 0); err == nil {
+	if err := store.Initialize(ctx, *token, dflow.Manifest{Hash: "v1", Roots: []string{"node"}}, nil); err != nil {
+		t.Fatal(err)
+	}
+	task, err := store.ClaimReady(ctx, *token)
+	if err != nil {
+		t.Fatal(err)
+	}
+	commit := dflow.NodeCommit{NodeID: "node", ExpectedVersion: task.State.Version, State: state.Nodes["node"]}
+	if err := store.Commit(ctx, *token, commit); err == nil {
 		t.Fatal("expected request notification failure")
 	}
-	if loaded, err := store.Load(ctx); err != nil || loaded != nil {
+	if loaded, err := store.GetNode(ctx, "node"); err != nil || loaded.Status != dflow.Running {
 		t.Fatal("suspension committed without request", loaded, err)
 	}
 	if _, err := store.GetResponse(ctx, "node", "token-1"); !errors.Is(err, dflow.ErrWaitNotFound) {
@@ -145,7 +160,7 @@ BEGIN SELECT RAISE(ABORT, 'injected outbox failure'); END`); err != nil {
 	if _, err := db.Exec(`DROP TRIGGER reject_notification`); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.Save(ctx, *token, state, 0); err != nil {
+	if err := store.Commit(ctx, *token, commit); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := db.Exec(`CREATE TRIGGER reject_notification BEFORE INSERT ON dflow_outbox
@@ -165,11 +180,11 @@ BEGIN SELECT RAISE(ABORT, 'injected wake failure'); END`); err != nil {
 // can return and before lease cleanup. Simulates uncertain commit on process loss.
 type crashAfterSuspend struct{ *sqlite.Infrastructure }
 
-func (s *crashAfterSuspend) Save(ctx context.Context, token lease.Token, state *dflow.State, version int64) error {
-	if err := s.Infrastructure.Save(ctx, token, state, version); err != nil {
+func (s *crashAfterSuspend) Commit(ctx context.Context, token lease.Token, commit dflow.NodeCommit) error {
+	if err := s.Infrastructure.Commit(ctx, token, commit); err != nil {
 		return err
 	}
-	if state.Nodes["wait"].Status == dflow.Suspended {
+	if commit.NodeID == "wait" && commit.State.Status == dflow.Suspended {
 		os.Exit(23)
 	}
 	return nil
@@ -191,7 +206,7 @@ func TestSQLiteCrashRecovery(t *testing.T) {
 		}
 		registry := asyncRegistry(t, asyncNode{
 			run: func(context.Context, map[string]any) (dflow.Result, error) {
-				return dflow.Result{Suspend: &dflow.Suspension{State: "saved", Request: "request"}}, nil
+				return dflow.Result{Suspend: &dflow.JSONSuspension{Data: "saved"}}, nil
 			},
 			resume: func(context.Context, map[string]any, dflow.ResumeInput) (dflow.Result, error) {
 				// Simulate loss during Resume after its running state was committed.
@@ -257,7 +272,7 @@ func TestSQLiteCrashRecovery(t *testing.T) {
 			return dflow.Result{}, errors.New("Run must not execute again")
 		},
 		resume: func(_ context.Context, input map[string]any, resume dflow.ResumeInput) (dflow.Result, error) {
-			if input["original"] != "input" || resume.State != "saved" || resume.Token != token {
+			if input["original"] != "input" || resume.Suspension.(*dflow.JSONSuspension).Data != "saved" || resume.Token != token {
 				return dflow.Result{}, errors.New("missing continuation/input")
 			}
 			return dflow.Result{Output: resume.Response}, nil
@@ -273,7 +288,7 @@ func TestSQLiteCrashRecovery(t *testing.T) {
 	}
 }
 
-func driveAfterLeaseExpires(t *testing.T, e *dflow.Engine) *dflow.State {
+func driveAfterLeaseExpires(t *testing.T, e *observedEngine) *dflow.State {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()

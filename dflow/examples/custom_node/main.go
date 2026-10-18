@@ -21,24 +21,26 @@ func (greetingService) Greet(ctx context.Context, name string) (string, error) {
 	return "你好，" + name, nil
 }
 
+type greetingNode struct {
+	Suffix  string `json:"suffix"`
+	service greetingService
+}
+
+func (*greetingNode) Type() string { return "greet" }
+func (n *greetingNode) Run(ctx context.Context, input map[string]any) (dflow.Result, error) {
+	name, ok := input["name"].(string)
+	if !ok {
+		return dflow.Result{}, errors.New("name must be a string")
+	}
+	text, err := n.service.Greet(ctx, name)
+	return dflow.Result{Output: map[string]any{"message": text + n.Suffix}}, err
+}
+
 func main() {
 	service := greetingService{}
 	registry := dflow.DefaultRegistry()
-	err := registry.Register("greet", func(raw json.RawMessage) (dflow.Node, error) {
-		var config struct {
-			Suffix string `json:"suffix"`
-		}
-		if err := json.Unmarshal(raw, &config); err != nil {
-			return nil, err
-		}
-		return dflow.NodeFunc(func(ctx context.Context, input map[string]any) (dflow.Result, error) {
-			name, ok := input["name"].(string)
-			if !ok {
-				return dflow.Result{}, errors.New("name must be a string")
-			}
-			text, err := service.Greet(ctx, name)
-			return dflow.Result{Output: map[string]any{"message": text + config.Suffix}}, err
-		}), nil
+	err := registry.Register(func() dflow.Node {
+		return &greetingNode{service: service}
 	})
 	if err != nil {
 		log.Fatal(err)

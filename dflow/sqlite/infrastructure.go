@@ -61,6 +61,19 @@ CREATE TABLE IF NOT EXISTS dflow_waits (
  scope TEXT NOT NULL, node TEXT NOT NULL, token TEXT NOT NULL, response BLOB,
  PRIMARY KEY(scope,node,token)
 );
+CREATE TABLE IF NOT EXISTS dflow_nodes (
+ scope TEXT NOT NULL, node TEXT NOT NULL, state BLOB NOT NULL,
+ ready INTEGER NOT NULL, status TEXT NOT NULL, generation INTEGER NOT NULL,
+ PRIMARY KEY(scope,node)
+);
+CREATE INDEX IF NOT EXISTS dflow_nodes_ready ON dflow_nodes(scope,ready,status,generation);
+CREATE TABLE IF NOT EXISTS dflow_publications (
+ id TEXT PRIMARY KEY, manifest BLOB NOT NULL
+);
+CREATE TABLE IF NOT EXISTS dflow_definitions (
+ publication TEXT NOT NULL,node TEXT NOT NULL,definition BLOB NOT NULL,incoming BLOB NOT NULL,
+ PRIMARY KEY(publication,node)
+);
 CREATE TABLE IF NOT EXISTS dflow_outbox (
  id INTEGER PRIMARY KEY AUTOINCREMENT, scope TEXT NOT NULL,
  kind TEXT NOT NULL, node TEXT NOT NULL, token TEXT NOT NULL, request BLOB
@@ -158,73 +171,29 @@ func (i *Infrastructure) checkLease(ctx context.Context, tx *sql.Tx, token lease
 }
 
 func (i *Infrastructure) Load(ctx context.Context) (*dflow.State, error) {
-	var data []byte
-	if err := i.db.QueryRowContext(ctx, `SELECT state FROM dflow_runs WHERE scope=?`, i.scope).Scan(&data); err != nil {
-		return nil, err
+	state, err := i.LoadMetadata(ctx)
+	if err != nil || state == nil {
+		return state, err
 	}
-	if data == nil {
-		return nil, nil
-	}
-	var state dflow.State
-	if err := json.Unmarshal(data, &state); err != nil {
-		return nil, err
-	}
-	return &state, nil
-}
-
-func (i *Infrastructure) Save(ctx context.Context, token lease.Token, state *dflow.State, expected int64) error {
-	if state == nil || state.Version != expected {
-		return dflow.ErrConflict
-	}
-	copy := *state
-	copy.Version = expected + 1
-	data, err := json.Marshal(copy)
+	state.Nodes = map[string]dflow.NodeState{}
+	rows, err := i.db.QueryContext(ctx, `SELECT node,state FROM dflow_nodes WHERE scope=?`, i.scope)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	return i.transaction(ctx, func(tx *sql.Tx) error {
-		if err := i.checkLease(ctx, tx, token); err != nil {
-			return err
+	defer rows.Close()
+	for rows.Next() {
+		var id string
+		var raw []byte
+		if err := rows.Scan(&id, &raw); err != nil {
+			return nil, err
 		}
-		result, err := tx.ExecContext(ctx, `UPDATE dflow_runs SET state=?,version=? WHERE scope=? AND version=?`,
-			data, copy.Version, i.scope, expected)
-		if err := affected(result, err, dflow.ErrConflict); err != nil {
-			return err
+		var node dflow.NodeState
+		if err := json.Unmarshal(raw, &node); err != nil {
+			return nil, err
 		}
-		for id, node := range state.Nodes {
-			if node.Suspension == nil {
-				continue
-			}
-			if node.Suspension.Token == "" {
-				return dflow.ErrInvalidSuspension
-			}
-			result, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO dflow_waits(scope,node,token) VALUES(?,?,?)`,
-				i.scope, id, node.Suspension.Token)
-			if err != nil {
-				return err
-			}
-			inserted, err := result.RowsAffected()
-			if err != nil {
-				return err
-			}
-			if inserted == 0 {
-				continue
-			}
-			if node.Status != dflow.Suspended {
-				return dflow.ErrInvalidSuspension
-			}
-			request, err := json.Marshal(node.Suspension.Request)
-			if err != nil {
-				return err
-			}
-			if err := i.notify(ctx, tx, dflow.Notification{
-				Kind: dflow.RequestNotification, NodeID: id, Token: node.Suspension.Token, Request: request,
-			}); err != nil {
-				return err
-			}
-		}
-		return nil
-	})
+		state.Nodes[id] = node
+	}
+	return state, rows.Err()
 }
 
 type reader interface {
@@ -266,16 +235,11 @@ func (i *Infrastructure) Resolve(ctx context.Context, nodeID, token string, valu
 		if response != nil {
 			return nil
 		}
-		var data []byte
-		if err := tx.QueryRowContext(ctx, `SELECT state FROM dflow_runs WHERE scope=?`, i.scope).Scan(&data); err != nil {
+		node, err := i.getNode(ctx, tx, nodeID)
+		if err != nil {
 			return err
 		}
-		var state dflow.State
-		if err := json.Unmarshal(data, &state); err != nil {
-			return err
-		}
-		node := state.Nodes[nodeID]
-		if node.Suspension == nil || node.Suspension.Token != token {
+		if node == nil || node.Suspension == nil || node.Suspension.Token != token {
 			return nil
 		}
 		if !json.Valid(value) {
@@ -286,6 +250,11 @@ func (i *Infrastructure) Resolve(ctx context.Context, nodeID, token string, valu
 			return err
 		}
 		if err := i.notify(ctx, tx, dflow.Notification{Kind: dflow.WakeNotification, NodeID: nodeID, Token: token}); err != nil {
+			return err
+		}
+		node.Ready = true
+		node.Version++
+		if err := i.putNode(ctx, tx, nodeID, *node); err != nil {
 			return err
 		}
 		accepted = true

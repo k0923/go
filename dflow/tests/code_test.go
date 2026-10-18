@@ -92,12 +92,12 @@ func TestMemoryFencingAndVersionCAS(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	state := &dflow.State{Nodes: map[string]dflow.NodeState{"node": {Status: dflow.Running}}}
-	if err := infra.Save(ctx, *first, state, 0); err != nil {
+	if err := infra.Initialize(ctx, *first, dflow.Manifest{Hash: "v1", Roots: []string{"node"}}, nil); err != nil {
 		t.Fatal(err)
 	}
-	if err := infra.Save(ctx, *first, state, 0); !errors.Is(err, dflow.ErrConflict) {
-		t.Fatalf("stale version accepted: %v", err)
+	task, err := infra.ClaimReady(ctx, *first)
+	if err != nil {
+		t.Fatal(err)
 	}
 	if err := infra.Release(ctx, *first); err != nil {
 		t.Fatal(err)
@@ -106,23 +106,34 @@ func TestMemoryFencingAndVersionCAS(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	state.Version = 1
-	if err := infra.Save(ctx, *first, state, 1); !errors.Is(err, lease.ErrConflict) {
+	commit := dflow.NodeCommit{NodeID: "node", ExpectedVersion: task.State.Version, State: dflow.NodeState{Status: dflow.Succeeded}}
+	if err := infra.Commit(ctx, *first, commit); !errors.Is(err, lease.ErrConflict) {
 		t.Fatalf("stale owner accepted: %v", err)
 	}
 	if second.Generation <= first.Generation {
 		t.Fatal("lease generation did not advance")
 	}
-	if err := infra.Save(ctx, *second, state, 1); err != nil {
+	if err := infra.Commit(ctx, *second, commit); !errors.Is(err, dflow.ErrConflict) {
+		t.Fatal("old node generation accepted", err)
+	}
+	task, err = infra.ClaimReady(ctx, *second)
+	if err != nil {
 		t.Fatal(err)
 	}
+	commit.ExpectedVersion = task.State.Version
+	if err := infra.Commit(ctx, *second, commit); err != nil {
+		t.Fatal(err)
+	}
+	if err := infra.Commit(ctx, *second, commit); !errors.Is(err, dflow.ErrConflict) {
+		t.Fatal("duplicate terminal commit accepted", err)
+	}
 	loaded, err := infra.Load(ctx)
-	if err != nil || loaded.Version != 2 || state.Version != 1 {
+	if err != nil || loaded.Nodes["node"].Version != task.State.Version+1 {
 		t.Fatalf("incorrect snapshot version: %+v %v", loaded, err)
 	}
 	loaded.Nodes["node"] = dflow.NodeState{Status: dflow.Failed}
 	again, err := infra.Load(ctx)
-	if err != nil || again.Nodes["node"].Status != dflow.Running {
+	if err != nil || again.Nodes["node"].Status != dflow.Succeeded {
 		t.Fatalf("load aliases internal state: %+v %v", again, err)
 	}
 }

@@ -1,6 +1,7 @@
 package dflow
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"regexp"
@@ -9,7 +10,77 @@ import (
 	"strings"
 )
 
+func (p Parameters) resolveWithInput(infra Infrastructure, ctx context.Context, states map[string]NodeState) (map[string]any, error) {
+	resolved := make(Parameters, len(p))
+	for key, parameter := range p {
+		if parameter.Type == "ref" {
+			path, err := referencePath(parameter.Content)
+			if err != nil {
+				return nil, err
+			}
+			if path[0] == InputSource {
+				value, err := infra.GetInput(ctx, path[1:]...)
+				if err != nil {
+					return nil, &InfrastructureError{"GetInput", err}
+				}
+				parameter = Constant(value)
+			}
+		} else if parameter.Type == "template" || parameter.Type == "plain-template" {
+			text, ok := parameter.Content.(string)
+			if !ok {
+				return nil, ErrInvalidReference
+			}
+			var failure error
+			parameter.Content = referencePattern.ReplaceAllStringFunc(text, func(match string) string {
+				path := strings.Split(strings.TrimSpace(referencePattern.FindStringSubmatch(match)[1]), ".")
+				var value any
+				var err error
+				if path[0] == InputSource {
+					value, err = infra.GetInput(ctx, path[1:]...)
+				} else {
+					value, err = resolvePath(path, nil, states)
+				}
+				if err != nil {
+					failure = err
+					if path[0] == InputSource {
+						failure = &InfrastructureError{"GetInput", err}
+					}
+					return ""
+				}
+				if parameter.Type == "plain-template" {
+					if value == nil {
+						return ""
+					}
+					return fmt.Sprint(value)
+				}
+				raw, err := json.Marshal(value)
+				if err != nil {
+					failure = err
+				}
+				return string(raw)
+			})
+			if failure != nil {
+				return nil, failure
+			}
+			// Freeze rendered input fragments as constants so user data containing
+			// {{...}} cannot be interpreted a second time as a node reference.
+			parameter = Constant(parameter.Content)
+		}
+		resolved[key] = parameter
+	}
+	return resolved.resolve(nil, states)
+}
+
 const InputSource = "$input"
+
+// InputValue resolves an original input path for Infrastructure adapters.
+func InputValue(input any, path ...string) (any, error) {
+	value, err := resolvePath(append([]string{InputSource}, path...), input, nil)
+	if err != nil {
+		return nil, err
+	}
+	return cloneJSON(value)
+}
 
 // Parameter retains flowgram's constant/ref/template tagged value model.
 // A ref content is [nodeID, objectKey, arrayIndex, ...]. "$input" selects run input.

@@ -1,6 +1,7 @@
 package dflow
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -35,9 +36,9 @@ type Graph struct {
 	hash       string
 	order      []string
 	specs      map[string]NodeSpec
-	nodes      map[string]Node
 	incoming   map[string][]Edge
 	outgoing   map[string][]Edge
+	registry   *Registry
 }
 
 // Compile validates topology, references and node configurations without running nodes.
@@ -50,8 +51,9 @@ func Compile(definition Definition, registry *Registry) (*Graph, error) {
 		return nil, fmt.Errorf("%w: %v", ErrInvalidDefinition, err)
 	}
 	g := &Graph{
-		definition: def, specs: map[string]NodeSpec{}, nodes: map[string]Node{},
+		definition: def, specs: map[string]NodeSpec{},
 		incoming: map[string][]Edge{}, outgoing: map[string][]Edge{},
+		registry: registry,
 	}
 	fail := func(id, detail string, cause error) (*Graph, error) {
 		return nil, &ValidationError{NodeID: id, Detail: detail, Cause: cause}
@@ -123,23 +125,107 @@ func Compile(definition Definition, registry *Registry) (*Graph, error) {
 		}
 	}
 	for _, spec := range def.Nodes {
-		factory := registry.factory(spec.Type)
-		if factory == nil {
-			return fail(spec.ID, "unknown node type "+spec.Type, ErrInvalidDefinition)
-		}
-		node, err := factory(append(json.RawMessage(nil), spec.Config...))
+		_, err := registry.DecodeNode(spec)
 		if err != nil {
 			return fail(spec.ID, "node configuration", err)
 		}
-		if isNil(node) {
-			return fail(spec.ID, "factory returned nil node", ErrInvalidDefinition)
-		}
-		g.nodes[spec.ID] = node
 	}
 	raw, _ := json.Marshal(def)
 	hash := sha256.Sum256(raw)
 	g.hash = hex.EncodeToString(hash[:])
 	return g, nil
+}
+
+// Manifest is the small immutable header needed to start or recover execution.
+type Manifest struct {
+	Hash  string   `json:"hash"`
+	Roots []string `json:"roots"`
+}
+
+// PublishedNode is a serializable node definition plus validated topology.
+// Incoming contains UNIQUE predecessor IDs, not the number of incoming ports.
+type PublishedNode struct {
+	Spec     NodeSpec `json:"spec"`
+	Incoming []string `json:"incoming"`
+	Outgoing []Edge   `json:"outgoing"`
+}
+
+// DefinitionProvider binds to ONE immutable, already validated publication.
+// Implementations load individual database records, not the whole definition.
+// Return independent copies. Manifest.Hash must change when definitions change.
+type DefinitionProvider interface {
+	Manifest(context.Context) (Manifest, error)
+	LoadNode(context.Context, string) (*PublishedNode, error)
+	// Incoming loads only a target's predecessor index, not its config.
+	Incoming(context.Context, string) ([]string, error)
+}
+
+func (g *Graph) Incoming(ctx context.Context, id string) ([]string, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if _, exists := g.specs[id]; !exists {
+		return nil, ErrInvalidDefinition
+	}
+	var result []string
+	seen := map[string]bool{}
+	for _, edge := range g.incoming[id] {
+		if !seen[edge.SourceNodeID] {
+			seen[edge.SourceNodeID] = true
+			result = append(result, edge.SourceNodeID)
+		}
+	}
+	return result, nil
+}
+func (g *Graph) Manifest(ctx context.Context) (Manifest, error) {
+	if err := ctx.Err(); err != nil {
+		return Manifest{}, err
+	}
+	m := Manifest{Hash: g.hash}
+	for _, id := range g.order {
+		if len(g.incoming[id]) == 0 {
+			m.Roots = append(m.Roots, id)
+		}
+	}
+	return m, nil
+}
+
+func (g *Graph) LoadNode(ctx context.Context, id string) (*PublishedNode, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	spec, exists := g.specs[id]
+	if !exists {
+		return nil, fmt.Errorf("%w: node %q", ErrInvalidDefinition, id)
+	}
+	node := PublishedNode{Spec: spec, Outgoing: g.outgoing[id]}
+	seen := map[string]bool{}
+	for _, edge := range g.incoming[id] {
+		if !seen[edge.SourceNodeID] {
+			seen[edge.SourceNodeID] = true
+			node.Incoming = append(node.Incoming, edge.SourceNodeID)
+		}
+	}
+	copy, err := cloneJSON(node)
+	return &copy, err
+}
+
+// Publication exports individual records for database persistence. Compiled Go
+// instances and service clients are deliberately excluded.
+func (g *Graph) Publication() (Manifest, []PublishedNode, error) {
+	m, err := g.Manifest(context.Background())
+	if err != nil {
+		return m, nil, err
+	}
+	nodes := make([]PublishedNode, 0, len(g.order))
+	for _, id := range g.order {
+		node, err := g.LoadNode(context.Background(), id)
+		if err != nil {
+			return m, nil, err
+		}
+		nodes = append(nodes, *node)
+	}
+	return m, nodes, nil
 }
 
 func isNil(value any) bool {

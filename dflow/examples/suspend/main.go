@@ -13,16 +13,22 @@ import (
 
 type taskNode struct{}
 
+func (taskNode) Type() string { return "async-task" }
+
 func (taskNode) Run(context.Context, map[string]any) (dflow.Result, error) {
 	fmt.Println("首次执行 task 节点")
-	return dflow.Result{Suspend: &dflow.Suspension{
-		State: map[string]any{"format": "mp4"}, Request: map[string]any{"action": "transcode"},
+	return dflow.Result{Suspend: &dflow.JSONSuspension{
+		Data: map[string]any{"format": "mp4", "action": "transcode"},
 	}}, nil
 }
 
 func (taskNode) Resume(_ context.Context, _ map[string]any, input dflow.ResumeInput) (dflow.Result, error) {
 	fmt.Println("恢复 task 节点，token:", input.Token)
-	return dflow.Result{Output: map[string]any{"savedState": input.State, "response": input.Response}}, nil
+	payload, ok := input.Suspension.(*dflow.JSONSuspension)
+	if !ok {
+		return dflow.Result{}, dflow.ErrInvalidSuspension
+	}
+	return dflow.Result{Output: map[string]any{"operation": payload.Data, "response": input.Response}}, nil
 }
 
 func main() {
@@ -30,6 +36,7 @@ func main() {
 	scope := flag.String("run", "demo", "unique run ID")
 	answer := flag.String("answer", "", "response to the existing wait")
 	token := flag.String("token", "", "suspension token from the request notification")
+	publish := flag.Bool("publish", false, "publish the definition before first execution")
 	flag.Parse()
 	if *path == "" {
 		log.Fatal("-db is required")
@@ -41,23 +48,29 @@ func main() {
 	}
 	defer store.Close()
 	registry := dflow.DefaultRegistry()
-	if err := registry.Register("async-task", func(json.RawMessage) (dflow.Node, error) {
-		return taskNode{}, nil
+	if err := registry.Register(func() dflow.Node {
+		return &taskNode{}
 	}); err != nil {
 		log.Fatal(err)
 	}
-	graph, err := dflow.Compile(dflow.Definition{
-		Version: "1",
-		Nodes: []dflow.NodeSpec{
-			{ID: "task", Type: "async-task"},
-			{ID: "end", Type: "end", Inputs: dflow.Parameters{"result": dflow.Ref("task")}},
-		},
-		Edges: []dflow.Edge{{SourceNodeID: "task", TargetNodeID: "end"}},
-	}, registry)
-	if err != nil {
-		log.Fatal(err)
+	if *publish {
+		graph, err := dflow.Compile(dflow.Definition{
+			Version: "1",
+			Nodes: []dflow.NodeSpec{
+				{ID: "task", Type: "async-task"},
+				{ID: "end", Type: "end", Inputs: dflow.Parameters{"result": dflow.Ref("task")}},
+			},
+			Edges: []dflow.Edge{{SourceNodeID: "task", TargetNodeID: "end"}},
+		}, registry)
+		if err != nil {
+			log.Fatal(err)
+		}
+		if _, err := store.Publish(ctx, "transcode-v1", graph); err != nil {
+			log.Fatal(err)
+		}
 	}
-	engine, err := dflow.NewEngine(graph, store, dflow.Options{})
+	// On restart only the publication ID is needed; nodes are decoded on demand.
+	engine, err := dflow.NewEngineWithProvider(store.Provider("transcode-v1"), registry, store, dflow.Options{})
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -65,13 +78,14 @@ func main() {
 		if *token == "" {
 			log.Fatal("-token from the original request is required with -answer")
 		}
-		accepted, err := engine.Wakeup(ctx, "task", *token, *answer)
-		if err != nil {
-			log.Fatal(err)
-		}
-		fmt.Println("写入唤醒结果:", accepted)
+		_, err = engine.ResumeNode(ctx, "task", *token, *answer)
+	} else {
+		_, err = engine.Run(ctx, nil)
 	}
-	state, err := engine.Run(ctx, nil)
+	if err != nil {
+		log.Fatal(err)
+	}
+	state, err := store.Load(ctx) // optional business observation, not engine scheduling
 	if err != nil {
 		log.Fatal(err)
 	}

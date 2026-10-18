@@ -27,12 +27,19 @@ type codeNode struct {
 	timeout time.Duration
 }
 
-func codeFactory(raw json.RawMessage) (Node, error) {
+func (*codeNode) Type() string { return "code" }
+
+func (n *codeNode) DecodeNodeJSON(raw json.RawMessage) error {
 	var config CodeConfig
 	if err := decodeConfig(raw, &config); err != nil {
-		return nil, err
+		return err
 	}
-	return NewCodeNode(config)
+	node, err := NewCodeNode(config)
+	if err != nil {
+		return err
+	}
+	*n = *node.(*codeNode)
+	return nil
 }
 
 // NewCodeNode compiles JavaScript without executing it. Each Run gets a fresh VM.
