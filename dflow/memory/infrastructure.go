@@ -3,7 +3,7 @@ package memory
 
 import (
 	"context"
-	"encoding/json"
+	"reflect"
 	"slices"
 	"sync"
 	"time"
@@ -26,14 +26,6 @@ type Infrastructure struct {
 
 func New() *Infrastructure { return &Infrastructure{} }
 
-func clone[T any](value T) (T, error) {
-	var out T
-	data, err := json.Marshal(value)
-	if err == nil {
-		err = json.Unmarshal(data, &out)
-	}
-	return out, err
-}
 func (i *Infrastructure) valid(token lease.Token) bool {
 	return i.token != nil && token.Key == i.token.Key && token.Generation == i.token.Generation && time.Now().Before(i.token.ExpiresAt)
 }
@@ -93,9 +85,7 @@ func (i *Infrastructure) Initialize(ctx context.Context, token lease.Token, m df
 		return lease.ErrConflict
 	}
 	if i.state != nil {
-		a, _ := json.Marshal(i.state.Input)
-		b, _ := json.Marshal(input)
-		if i.state.DefinitionHash != m.Hash || string(a) != string(b) {
+		if i.state.DefinitionHash != m.Hash || !reflect.DeepEqual(i.state.Input, input) {
 			return dflow.ErrRunMismatch
 		}
 		return nil
@@ -120,7 +110,11 @@ func (i *Infrastructure) GetInput(ctx context.Context, path ...string) (any, err
 	if i.state == nil {
 		return nil, dflow.ErrMissingValue
 	}
-	return dflow.InputValue(i.state.Input, path...)
+	value, err := dflow.InputValue(i.state.Input, path...)
+	if err != nil {
+		return nil, err
+	}
+	return clone(value)
 }
 func (i *Infrastructure) Load(ctx context.Context) (*dflow.State, error) {
 	i.mu.Lock()
@@ -218,7 +212,7 @@ func (i *Infrastructure) Commit(ctx context.Context, token lease.Token, c dflow.
 		}
 		targets[arrival.TargetNodeID] = target
 	}
-	var request json.RawMessage
+	var request dflow.Suspension
 	newWait := false
 	if next.Status == dflow.Suspended {
 		if i.responses == nil {
@@ -226,7 +220,7 @@ func (i *Infrastructure) Commit(ctx context.Context, token lease.Token, c dflow.
 		}
 		_, exists := i.responses[[2]string{c.NodeID, next.Suspension.Token}]
 		newWait = !exists
-		request, err = json.Marshal(next.Suspension.Payload)
+		request, err = clone(next.Suspension.Payload)
 		if err != nil {
 			return err
 		}

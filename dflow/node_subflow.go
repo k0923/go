@@ -2,7 +2,6 @@ package dflow
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 )
 
@@ -12,11 +11,7 @@ type SubflowNode struct {
 	OutputNode  string `json:"outputNode"`
 }
 
-func (*SubflowNode) Type() string { return "subflow" }
-func (n *SubflowNode) DecodeNodeJSON(raw json.RawMessage) error {
-	if err := decodeConfig(raw, n); err != nil {
-		return err
-	}
+func (n *SubflowNode) Validate() error {
 	if n.Publication == "" || n.OutputNode == "" {
 		return fmt.Errorf("subflow: publication and outputNode required")
 	}

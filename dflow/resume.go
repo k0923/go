@@ -2,7 +2,6 @@ package dflow
 
 import (
 	"context"
-	"encoding/json"
 
 	"github.com/k0923/go/lease"
 )
@@ -14,11 +13,7 @@ func (e *Engine) Wakeup(ctx context.Context, nodeID, token string, response any)
 	if nodeID == "" || token == "" {
 		return false, ErrWaitNotFound
 	}
-	data, err := json.Marshal(response)
-	if err != nil {
-		return false, err
-	}
-	accepted, err := e.infra.Resolve(ctx, nodeID, token, data)
+	accepted, err := e.infra.Resolve(ctx, nodeID, token, response)
 	if err != nil {
 		return false, &InfrastructureError{Op: "Resolve", Cause: err}
 	}
@@ -27,7 +22,7 @@ func (e *Engine) Wakeup(ctx context.Context, nodeID, token string, response any)
 
 // ResumeNode resolves an optional callback, then claims only the named node and
 // advances its reachable successors. Without response, consume a persisted Wake.
-// JSON null can be delivered with one explicit nil argument. Old tokens are no-ops.
+// Nil can be delivered with one explicit nil argument. Old tokens are no-ops.
 func (e *Engine) ResumeNode(ctx context.Context, nodeID, token string, response ...any) (state *State, err error) {
 	if nodeID == "" || token == "" || len(response) > 1 {
 		return nil, ErrWaitNotFound

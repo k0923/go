@@ -2,7 +2,6 @@ package tests
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"testing"
 
@@ -26,7 +25,7 @@ func TestResumeNodeTargetsOneBranchAndReadsInputOnDemand(t *testing.T) {
 		counter := &inputCounter{Infrastructure: infra}
 		registry := asyncRegistry(t, asyncNode{
 			run: func(context.Context, map[string]any) (dflow.Result, error) {
-				return dflow.Result{Suspend: &dflow.JSONSuspension{Data: "wait"}}, nil
+				return dflow.Result{Suspend: &dflow.ValueSuspension{Kind: "external", Data: "wait"}}, nil
 			},
 			resume: func(_ context.Context, input map[string]any, resume dflow.ResumeInput) (dflow.Result, error) {
 				if input["saved"] != "original" {
@@ -37,9 +36,9 @@ func TestResumeNodeTargetsOneBranchAndReadsInputOnDemand(t *testing.T) {
 		})
 		graph := compile(t, dflow.Definition{
 			Nodes: []dflow.NodeSpec{
-				{ID: "a", Type: "custom", Inputs: dflow.Parameters{"saved": dflow.Input("value")}},
-				{ID: "b", Type: "custom", Inputs: dflow.Parameters{"saved": dflow.Input("value")}},
-				{ID: "after", Type: "end", Inputs: dflow.Parameters{
+				{ID: "a", Node: namedNode("custom"), Inputs: dflow.Parameters{"saved": dflow.Input("value")}},
+				{ID: "b", Node: namedNode("custom"), Inputs: dflow.Parameters{"saved": dflow.Input("value")}},
+				{ID: "after", Node: &dflow.EndNode{}, Inputs: dflow.Parameters{
 					"text": dflow.PlainTemplate(`{{$input.value}} {{a}}`),
 				}},
 			},
@@ -126,10 +125,10 @@ func TestResumeNodeDoesNotAcceptOldLoopToken(t *testing.T) {
 		ctx := context.Background()
 		registry := asyncRegistry(t, asyncNode{
 			run: func(context.Context, map[string]any) (dflow.Result, error) {
-				return dflow.Result{Suspend: &dflow.JSONSuspension{Data: "first"}}, nil
+				return dflow.Result{Suspend: &dflow.ValueSuspension{Kind: "external", Data: "first"}}, nil
 			},
 			resume: func(context.Context, map[string]any, dflow.ResumeInput) (dflow.Result, error) {
-				return dflow.Result{Suspend: &dflow.JSONSuspension{Data: "second"}}, nil
+				return dflow.Result{Suspend: &dflow.ValueSuspension{Kind: "external", Data: "second"}}, nil
 			},
 		})
 		e, err := dflow.NewEngine(compile(t, waitDefinition(), registry), infra, dflow.Options{})
@@ -141,7 +140,7 @@ func TestResumeNodeDoesNotAcceptOldLoopToken(t *testing.T) {
 			t.Fatal(err)
 		}
 		old := initial.Nodes["wait"].Suspension.Token
-		if _, err := e.ResumeNode(ctx, "wait", old, json.RawMessage(`null`)); err != nil {
+		if _, err := e.ResumeNode(ctx, "wait", old, nil); err != nil {
 			t.Fatal(err)
 		}
 		current, _ := infra.GetNode(ctx, "wait")

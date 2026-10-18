@@ -1,8 +1,8 @@
 package dflow
 
 import (
-	"encoding/json"
 	"fmt"
+	"maps"
 	"slices"
 )
 
@@ -20,10 +20,8 @@ func ApplyArrival(target NodeState, source string, arrival Arrival) (NodeState, 
 	if !expected[source] {
 		return target, ErrInvalidDefinition
 	}
-	copy, err := cloneJSON(target)
-	if err != nil {
-		return target, err
-	}
+	copy := target
+	copy.Incoming = maps.Clone(target.Incoming)
 	if copy.Incoming == nil {
 		copy.Incoming = map[string]bool{}
 	}
@@ -67,7 +65,7 @@ func ValidateCommit(current NodeState, commit NodeCommit, generation int64) erro
 		return ErrInvalidSuspension
 	}
 	if payload := commit.State.Suspension; payload != nil {
-		if payload.Payload.Type == "" || !json.Valid(payload.Payload.Data) {
+		if isNil(payload.Payload) || payload.Payload.Type() == "" {
 			return ErrInvalidSuspension
 		}
 	}

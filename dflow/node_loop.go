@@ -2,8 +2,8 @@ package dflow
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
+	"slices"
 )
 
 // LoopNode runs one child per iteration. foreach consumes input.items; until
@@ -23,15 +23,10 @@ type LoopSuspension struct {
 	Child   ChildRequest `json:"child"`
 }
 
-func (*LoopSuspension) Type() string { return "dflow.loop" }
-func (n *LoopSuspension) MarshalJSON() ([]byte, error) {
-	type plain LoopSuspension
-	return json.Marshal((*plain)(n))
-}
+func (*LoopSuspension) Type() string              { return "dflow.loop" }
 func (n *LoopSuspension) ChildCall() ChildRequest { return n.Child }
 
-func (*LoopNode) Type() string { return "loop" }
-func (n *LoopNode) validate() error {
+func (n *LoopNode) Validate() error {
 	if n.Publication == "" || n.OutputNode == "" {
 		return fmt.Errorf("loop: publication and outputNode required")
 	}
@@ -43,12 +38,6 @@ func (n *LoopNode) validate() error {
 	}
 	return nil
 }
-func (n *LoopNode) DecodeNodeJSON(raw json.RawMessage) error {
-	if err := decodeConfig(raw, n); err != nil {
-		return err
-	}
-	return n.validate()
-}
 func (n *LoopNode) limit() int {
 	if n.MaxIterations == 0 {
 		return 1000
@@ -59,7 +48,7 @@ func (n *LoopNode) Run(ctx context.Context, input map[string]any) (Result, error
 	if err := ctx.Err(); err != nil {
 		return Result{}, err
 	}
-	if err := n.validate(); err != nil {
+	if err := n.Validate(); err != nil {
 		return Result{}, err
 	}
 	return n.next(input, LoopSuspension{Value: input["value"], Results: []any{}})
@@ -93,7 +82,7 @@ func (n *LoopNode) Resume(ctx context.Context, input map[string]any, resumed Res
 	if err := ctx.Err(); err != nil {
 		return Result{}, err
 	}
-	if err := n.validate(); err != nil {
+	if err := n.Validate(); err != nil {
 		return Result{}, err
 	}
 	payload, ok := resumed.Suspension.(*LoopSuspension)
@@ -101,10 +90,8 @@ func (n *LoopNode) Resume(ctx context.Context, input map[string]any, resumed Res
 		return Result{}, ErrInvalidSuspension
 	}
 	// Copy before mutation so repeated Resume calls do not mutate persisted state.
-	state, err := cloneJSON(*payload)
-	if err != nil {
-		return Result{}, err
-	}
+	state := *payload
+	state.Results = slices.Clone(payload.Results)
 	if state.Index < 0 || state.Index >= n.limit() {
 		return Result{}, fmt.Errorf("loop: invalid saved index")
 	}

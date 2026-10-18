@@ -25,16 +25,7 @@ type HTTPNode struct {
 	Client *http.Client `json:"-"`
 }
 
-func (*HTTPNode) Type() string { return "http" }
-
-func (n *HTTPNode) DecodeNodeJSON(raw json.RawMessage) error {
-	if err := decodeConfig(raw, n); err != nil {
-		return err
-	}
-	return n.validate()
-}
-
-func (n *HTTPNode) validate() error {
+func (n *HTTPNode) Validate() error {
 	if n.TimeoutMS < 0 || n.TimeoutMS > 600_000 || n.RetryTimes < 0 || n.RetryTimes > 5 {
 		return fmt.Errorf("http: timeoutMs must be 0..600000 and retryTimes 0..5")
 	}
@@ -55,7 +46,7 @@ func (n *HTTPNode) validate() error {
 }
 
 func (n *HTTPNode) Run(parent context.Context, input map[string]any) (Result, error) {
-	if err := n.validate(); err != nil {
+	if err := n.Validate(); err != nil {
 		return Result{}, err
 	}
 	timeout := n.TimeoutMS
@@ -205,8 +196,12 @@ func httpValues(value any, field string) (url.Values, error) {
 	if value == nil {
 		return result, nil
 	}
-	object, err := cloneJSON[any](value)
+	raw, err := json.Marshal(value)
 	if err != nil {
+		return nil, err
+	}
+	var object any
+	if err := json.Unmarshal(raw, &object); err != nil {
 		return nil, err
 	}
 	values, ok := object.(map[string]any)

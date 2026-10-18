@@ -8,7 +8,6 @@ import (
 
 type JSONParseNode struct{}
 
-func (*JSONParseNode) Type() string { return "json-parse" }
 func (*JSONParseNode) Run(_ context.Context, input map[string]any) (Result, error) {
 	text, ok := input["json"].(string)
 	if !ok {

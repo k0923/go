@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"log"
 
@@ -11,28 +10,24 @@ import (
 )
 
 func main() {
-	const definitionJSON = `{
-  "version": "1",
-  "nodes": [
-    {"id":"start","type":"start"},
-    {"id":"calculate","type":"code",
-      "inputsValues":{"price":{"type":"ref","content":["start","price"]}},
-      "config":{"script":{"language":"javascript","content":"function main({params}) { return { total: params.price * 2 }; }"}}
-    },
-    {"id":"end","type":"end",
-      "inputsValues":{"total":{"type":"ref","content":["calculate","total"]}}
-    }
-  ],
-  "edges": [
-    {"sourceNodeID":"start","targetNodeID":"calculate"},
-    {"sourceNodeID":"calculate","targetNodeID":"end"}
-  ]
-}`
-	var definition dflow.Definition
-	if err := json.Unmarshal([]byte(definitionJSON), &definition); err != nil {
+	code, err := dflow.NewCodeNode(dflow.CodeConfig{
+		Script: dflow.Script{Content: `function main({params}) { return {total: params.price * 2}; }`},
+	})
+	if err != nil {
 		log.Fatal(err)
 	}
-	graph, err := dflow.Compile(definition, dflow.DefaultRegistry())
+	graph, err := dflow.Compile(dflow.Definition{
+		Version: "basic-v1",
+		Nodes: []dflow.NodeSpec{
+			{ID: "start", Node: &dflow.StartNode{}},
+			{ID: "calculate", Node: code, Inputs: dflow.Parameters{"price": dflow.Ref("start", "price")}},
+			{ID: "end", Node: &dflow.EndNode{}, Inputs: dflow.Parameters{"total": dflow.Ref("calculate", "total")}},
+		},
+		Edges: []dflow.Edge{
+			{SourceNodeID: "start", TargetNodeID: "calculate"},
+			{SourceNodeID: "calculate", TargetNodeID: "end"},
+		},
+	})
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -44,9 +39,5 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	output, err := json.Marshal(state.Nodes["end"].Output)
-	if err != nil {
-		log.Fatal(err)
-	}
-	fmt.Println(string(output))
+	fmt.Println(state.Nodes["end"].Output)
 }

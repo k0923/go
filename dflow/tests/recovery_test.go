@@ -3,7 +3,6 @@ package tests
 import (
 	"context"
 	"database/sql"
-	"encoding/json"
 	"errors"
 	"os"
 	"os/exec"
@@ -19,7 +18,7 @@ import (
 func suspendedSnapshot() *dflow.State {
 	return &dflow.State{Nodes: map[string]dflow.NodeState{
 		"node": {Status: dflow.Suspended, Suspension: &dflow.SuspensionState{
-			Token: "token-1", Payload: dflow.SuspensionEnvelope{Type: "dflow.json", Data: json.RawMessage(`{"data":"saved"}`)},
+			Token: "token-1", Payload: &dflow.ValueSuspension{Kind: "external", Data: "saved"},
 		}},
 	}}
 }
@@ -27,12 +26,12 @@ func suspendedSnapshot() *dflow.State {
 func TestSQLiteConcurrentResolveAndFencing(t *testing.T) {
 	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "concurrent.db")
-	left, err := sqlite.Open(ctx, path, "run")
+	left, err := sqlite.Open(ctx, path, "run", fixtureCodec{})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer left.Close()
-	right, err := sqlite.Open(ctx, path, "run")
+	right, err := sqlite.Open(ctx, path, "run", fixtureCodec{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -76,7 +75,7 @@ func TestSQLiteConcurrentResolveAndFencing(t *testing.T) {
 	results := make(chan response, 2)
 	for _, store := range []*sqlite.Infrastructure{left, right} {
 		go func() {
-			ok, err := store.Resolve(ctx, "node", "token-1", json.RawMessage(`"response"`))
+			ok, err := store.Resolve(ctx, "node", "token-1", "response")
 			results <- response{ok, err}
 		}()
 	}
@@ -99,10 +98,10 @@ func TestSQLiteConcurrentResolveAndFencing(t *testing.T) {
 		t.Fatalf("resolve not atomic: winners=%d messages=%v err=%v", winners, messages, err)
 	}
 	saved, err := left.GetResponse(ctx, "node", "token-1")
-	if err != nil || saved == nil || string(saved.Value) != `"response"` {
+	if err != nil || saved == nil || saved.Value != "response" {
 		t.Fatal("snapshot erased response", saved, err)
 	}
-	other, err := sqlite.Open(ctx, path, "other-run")
+	other, err := sqlite.Open(ctx, path, "other-run", fixtureCodec{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -121,7 +120,7 @@ func TestSQLiteConcurrentResolveAndFencing(t *testing.T) {
 func TestSQLiteOutboxFailuresRollbackNodeState(t *testing.T) {
 	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "rollback.db")
-	store, err := sqlite.Open(ctx, path, "run")
+	store, err := sqlite.Open(ctx, path, "run", fixtureCodec{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -167,7 +166,7 @@ BEGIN SELECT RAISE(ABORT, 'injected outbox failure'); END`); err != nil {
 BEGIN SELECT RAISE(ABORT, 'injected wake failure'); END`); err != nil {
 		t.Fatal(err)
 	}
-	if ok, err := store.Resolve(ctx, "node", "token-1", json.RawMessage(`"answer"`)); err == nil || ok {
+	if ok, err := store.Resolve(ctx, "node", "token-1", "answer"); err == nil || ok {
 		t.Fatal("expected wake notification failure", ok, err)
 	}
 	response, err := store.GetResponse(ctx, "node", "token-1")
@@ -192,7 +191,7 @@ func (s *crashAfterSuspend) Commit(ctx context.Context, token lease.Token, commi
 
 func crashDefinition() dflow.Definition {
 	def := waitDefinition()
-	def.Nodes = append([]dflow.NodeSpec{{ID: "before", Type: "before"}}, def.Nodes...)
+	def.Nodes = append([]dflow.NodeSpec{{ID: "before", Node: namedNode("before")}}, def.Nodes...)
 	def.Edges = append(def.Edges, edge("before", "wait"))
 	return def
 }
@@ -200,13 +199,13 @@ func crashDefinition() dflow.Definition {
 func TestSQLiteCrashRecovery(t *testing.T) {
 	if path := os.Getenv("DFLOW_CRASH_TEST_PATH"); path != "" {
 		ctx := context.Background()
-		store, err := sqlite.Open(ctx, path, "crash-run")
+		store, err := sqlite.Open(ctx, path, "crash-run", fixtureCodec{})
 		if err != nil {
 			t.Fatal(err)
 		}
 		registry := asyncRegistry(t, asyncNode{
 			run: func(context.Context, map[string]any) (dflow.Result, error) {
-				return dflow.Result{Suspend: &dflow.JSONSuspension{Data: "saved"}}, nil
+				return dflow.Result{Suspend: &dflow.ValueSuspension{Kind: "external", Data: "saved"}}, nil
 			},
 			resume: func(context.Context, map[string]any, dflow.ResumeInput) (dflow.Result, error) {
 				// Simulate loss during Resume after its running state was committed.
@@ -238,7 +237,7 @@ func TestSQLiteCrashRecovery(t *testing.T) {
 	}
 	runChild("suspend", 23)
 	ctx := context.Background()
-	store, err := sqlite.Open(ctx, path, "crash-run")
+	store, err := sqlite.Open(ctx, path, "crash-run", fixtureCodec{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -247,14 +246,14 @@ func TestSQLiteCrashRecovery(t *testing.T) {
 		t.Fatal(state, err)
 	}
 	token := state.Nodes["wait"].Suspension.Token
-	if accepted, err := store.Resolve(ctx, "wait", token, json.RawMessage(`"response"`)); err != nil || !accepted {
+	if accepted, err := store.Resolve(ctx, "wait", token, "response"); err != nil || !accepted {
 		t.Fatal(accepted, err)
 	}
 	if err := store.Close(); err != nil {
 		t.Fatal(err)
 	}
 	runChild("resume", 24)
-	store, err = sqlite.Open(ctx, path, "crash-run")
+	store, err = sqlite.Open(ctx, path, "crash-run", fixtureCodec{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -272,7 +271,7 @@ func TestSQLiteCrashRecovery(t *testing.T) {
 			return dflow.Result{}, errors.New("Run must not execute again")
 		},
 		resume: func(_ context.Context, input map[string]any, resume dflow.ResumeInput) (dflow.Result, error) {
-			if input["original"] != "input" || resume.Suspension.(*dflow.JSONSuspension).Data != "saved" || resume.Token != token {
+			if input["original"] != "input" || resume.Suspension.(*dflow.ValueSuspension).Data != "saved" || resume.Token != token {
 				return dflow.Result{}, errors.New("missing continuation/input")
 			}
 			return dflow.Result{Output: resume.Response}, nil

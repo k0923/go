@@ -13,9 +13,9 @@ import (
 	"github.com/k0923/go/dflow/sqlite"
 )
 
-func compile(t *testing.T, def dflow.Definition, registry *dflow.Registry) *dflow.Graph {
+func compile(t *testing.T, def dflow.Definition, registry testRegistry) *dflow.Graph {
 	t.Helper()
-	graph, err := dflow.Compile(def, registry)
+	graph, err := dflow.Compile(fixtureDefinition(def, registry))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -40,21 +40,21 @@ func childRequests(t *testing.T, store dflow.Outbox) []dflow.Notification {
 func TestSubflowSQLiteRestartAndDuplicateDelivery(t *testing.T) {
 	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "children.db")
-	store, err := sqlite.Open(ctx, path, "parent")
+	store, err := sqlite.Open(ctx, path, "parent", fixtureCodec{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	registry := dflow.DefaultRegistry()
+	registry := testRegistry{}
 	var calls atomic.Int32
 	register(t, registry, "echo", func(_ context.Context, input map[string]any) (dflow.Result, error) {
 		calls.Add(1)
 		return dflow.Result{Output: input}, nil
 	})
 	child := compile(t, dflow.Definition{Nodes: []dflow.NodeSpec{
-		{ID: "out", Type: "echo", Inputs: dflow.Parameters{"text": dflow.Input("text")}},
+		{ID: "out", Node: namedNode("echo"), Inputs: dflow.Parameters{"text": dflow.Input("text")}},
 	}}, registry)
 	parentGraph := compile(t, dflow.Definition{Nodes: []dflow.NodeSpec{
-		{ID: "call", Type: "subflow", Config: json.RawMessage(`{"publication":"child-v1","outputNode":"out"}`),
+		{ID: "call", Node: &dflow.SubflowNode{Publication: "child-v1", OutputNode: "out"},
 			Inputs: dflow.Parameters{"text": dflow.Input("text")}},
 	}}, registry)
 	if _, err := store.Publish(ctx, "child-v1", child); err != nil {
@@ -63,19 +63,19 @@ func TestSubflowSQLiteRestartAndDuplicateDelivery(t *testing.T) {
 	if _, err := store.Publish(ctx, "parent-v1", parentGraph); err != nil {
 		t.Fatal(err)
 	}
-	parent, _ := dflow.NewEngineWithProvider(store.Provider("parent-v1"), registry, store, dflow.Options{})
+	parent, _ := dflow.NewEngineWithProvider(store.Provider("parent-v1"), store, dflow.Options{})
 	if _, err := parent.Run(ctx, map[string]any{"text": "hello"}); err != nil {
 		t.Fatal(err)
 	}
 	request := childRequests(t, store)[0]
 	var opened []*sqlite.Infrastructure
 	dispatcher := dflow.ChildDispatcher{Bind: func(ctx context.Context, call dflow.ChildExecution) (*dflow.Engine, dflow.Infrastructure, error) {
-		childStore, err := sqlite.Open(ctx, path, call.ScopeKey())
+		childStore, err := sqlite.Open(ctx, path, call.ScopeKey(), fixtureCodec{})
 		if err != nil {
 			return nil, nil, err
 		}
 		opened = append(opened, childStore)
-		engine, err := dflow.NewEngineWithProvider(childStore.Provider(call.Request.Publication), registry, childStore, dflow.Options{})
+		engine, err := dflow.NewEngineWithProvider(childStore.Provider(call.Request.Publication), childStore, dflow.Options{})
 		return engine, childStore, err
 	}}
 	if complete, err := dispatcher.Handle(ctx, parent, "parent", request); err != nil || !complete {
@@ -89,12 +89,12 @@ func TestSubflowSQLiteRestartAndDuplicateDelivery(t *testing.T) {
 	if err := store.Close(); err != nil {
 		t.Fatal(err)
 	}
-	store, err = sqlite.Open(ctx, path, "parent")
+	store, err = sqlite.Open(ctx, path, "parent", fixtureCodec{})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer store.Close()
-	parent, _ = dflow.NewEngineWithProvider(store.Provider("parent-v1"), registry, store, dflow.Options{})
+	parent, _ = dflow.NewEngineWithProvider(store.Provider("parent-v1"), store, dflow.Options{})
 	// Callback committed but parent not resumed; request re-delivery must not restart child.
 	if complete, err := dispatcher.Handle(ctx, parent, "parent", request); err != nil || !complete || calls.Load() != 1 {
 		t.Fatal(complete, err, calls.Load())
@@ -113,7 +113,7 @@ func TestSubflowSQLiteRestartAndDuplicateDelivery(t *testing.T) {
 
 func TestChildSuspensionAndError(t *testing.T) {
 	for _, businessError := range []bool{false, true} {
-		registry := dflow.DefaultRegistry()
+		registry := testRegistry{}
 		childStore := memory.New()
 		parentStore := memory.New()
 		var childGraph *dflow.Graph
@@ -121,20 +121,20 @@ func TestChildSuspensionAndError(t *testing.T) {
 			register(t, registry, "fail", func(context.Context, map[string]any) (dflow.Result, error) {
 				return dflow.Result{}, errors.New("child business failure")
 			})
-			childGraph = compile(t, dflow.Definition{Nodes: []dflow.NodeSpec{{ID: "out", Type: "fail"}}}, registry)
+			childGraph = compile(t, dflow.Definition{Nodes: []dflow.NodeSpec{{ID: "out", Node: namedNode("fail")}}}, registry)
 		} else {
 			registry = asyncRegistry(t, asyncNode{
 				run: func(context.Context, map[string]any) (dflow.Result, error) {
-					return dflow.Result{Suspend: &dflow.JSONSuspension{Data: "external"}}, nil
+					return dflow.Result{Suspend: &dflow.ValueSuspension{Kind: "external", Data: "external"}}, nil
 				},
 				resume: func(_ context.Context, _ map[string]any, input dflow.ResumeInput) (dflow.Result, error) {
 					return dflow.Result{Output: input.Response}, nil
 				},
 			})
-			childGraph = compile(t, dflow.Definition{Nodes: []dflow.NodeSpec{{ID: "out", Type: "custom"}}}, registry)
+			childGraph = compile(t, dflow.Definition{Nodes: []dflow.NodeSpec{{ID: "out", Node: namedNode("custom")}}}, registry)
 		}
 		parentGraph := compile(t, dflow.Definition{Nodes: []dflow.NodeSpec{
-			{ID: "call", Type: "subflow", Config: json.RawMessage(`{"publication":"child","outputNode":"out"}`)},
+			{ID: "call", Node: &dflow.SubflowNode{Publication: "child", OutputNode: "out"}},
 		}}, registry)
 		parent, _ := dflow.NewEngine(parentGraph, parentStore, dflow.Options{})
 		child, _ := dflow.NewEngine(childGraph, childStore, dflow.Options{})
@@ -178,20 +178,20 @@ func TestLoopReusesChildProtocol(t *testing.T) {
 	for _, mode := range []string{"foreach", "until"} {
 		t.Run(mode, func(t *testing.T) {
 			ctx := context.Background()
-			registry := dflow.DefaultRegistry()
+			registry := testRegistry{}
 			register(t, registry, "body", func(_ context.Context, input map[string]any) (dflow.Result, error) {
 				if mode == "foreach" {
 					return dflow.Result{Output: input["item"]}, nil
 				}
-				next := input["value"].(float64) + 1
+				next := input["value"].(int) + 1
 				return dflow.Result{Output: map[string]any{"done": next == 3, "value": next}}, nil
 			})
 			body := compile(t, dflow.Definition{Nodes: []dflow.NodeSpec{
-				{ID: "out", Type: "body", Inputs: dflow.Parameters{"item": dflow.Input("item"), "value": dflow.Input("value")}},
+				{ID: "out", Node: namedNode("body"), Inputs: dflow.Parameters{"item": dflow.Input("item"), "value": dflow.Input("value")}},
 			}}, registry)
 			config, _ := json.Marshal(dflow.LoopNode{Publication: "body", OutputNode: "out", Mode: mode, MaxIterations: 3})
 			parentGraph := compile(t, dflow.Definition{Nodes: []dflow.NodeSpec{
-				{ID: "loop", Type: "loop", Config: config, Inputs: dflow.Parameters{
+				{ID: "loop", Node: configuredFixture("loop", config), Inputs: dflow.Parameters{
 					"items": dflow.Constant([]any{"a", "b", "c"}), "value": dflow.Constant(0),
 				}},
 			}}, registry)
@@ -232,7 +232,7 @@ func TestLoopReusesChildProtocol(t *testing.T) {
 				if len(result) != 3 || result[0] != "a" || result[2] != "c" {
 					t.Fatal(result)
 				}
-			} else if node.Output != float64(3) {
+			} else if node.Output != 3 {
 				t.Fatal(node.Output)
 			}
 		})

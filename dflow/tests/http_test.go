@@ -37,8 +37,8 @@ func TestHTTPNodeDAG(t *testing.T) {
 	defer server.Close()
 	def := dflow.Definition{
 		Nodes: []dflow.NodeSpec{
-			{ID: "start", Type: "start"},
-			{ID: "request", Type: "http", Config: json.RawMessage(`{"method":"POST","bodyType":"JSON"}`),
+			{ID: "start", Node: &dflow.StartNode{}},
+			{ID: "request", Node: &dflow.HTTPNode{Method: "POST", BodyType: "JSON"},
 				Inputs: dflow.Parameters{
 					"url":     dflow.Ref("start", "url"),
 					"body":    dflow.Ref("start", "payload"),
@@ -46,7 +46,7 @@ func TestHTTPNodeDAG(t *testing.T) {
 					"params":  dflow.Constant(map[string]any{"tag": []string{"one", "two"}}),
 					"auth":    dflow.Ref("start", "auth"),
 				}},
-			{ID: "parse", Type: "json-parse", Inputs: dflow.Parameters{"json": dflow.Ref("request", "body")}},
+			{ID: "parse", Node: &dflow.JSONParseNode{}, Inputs: dflow.Parameters{"json": dflow.Ref("request", "body")}},
 		},
 		Edges: []dflow.Edge{edge("start", "request"), edge("request", "parse")},
 	}
@@ -60,7 +60,7 @@ func TestHTTPNodeDAG(t *testing.T) {
 	}
 	output := state.Nodes["request"].Output.(map[string]any)
 	headers := output["headers"].(map[string]any)
-	if output["statusCode"] != float64(201) || len(headers["X-Multi"].([]any)) != 2 ||
+	if output["statusCode"] != 201 || len(headers["X-Multi"].([]string)) != 2 ||
 		state.Nodes["parse"].Output.(map[string]any)["ok"] != true {
 		t.Fatal("unexpected HTTP output", output)
 	}
@@ -106,9 +106,10 @@ func TestHTTPNodeBodiesAndBearer(t *testing.T) {
 func TestHTTPNodeValidationAndLimits(t *testing.T) {
 	for _, config := range []string{
 		`{"timeoutMs":-1}`, `{"timeoutMs":600001}`, `{"retryTimes":6}`, `{"retryTimes":-1}`,
-		`{"bodyType":"bad"}`, `{"method":"bad method"}`, `{"maxResponseBytes":-1}`, `{"unknown":1}`,
+		`{"bodyType":"bad"}`, `{"method":"bad method"}`, `{"maxResponseBytes":-1}`,
 	} {
-		if _, err := dflow.DefaultRegistry().DecodeNode(dflow.NodeSpec{Type: "http", Config: json.RawMessage(config)}); err == nil {
+		node := configuredFixture("http", json.RawMessage(config)).(*dflow.HTTPNode)
+		if err := node.Validate(); err == nil {
 			t.Fatal("invalid HTTP config accepted", config)
 		}
 	}
@@ -186,15 +187,7 @@ func TestHTTPNodeClientInjection(t *testing.T) {
 	node := &dflow.HTTPNode{Client: &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error {
 		return http.ErrUseLastResponse
 	}}}
-	registry := dflow.NewRegistry()
-	if err := registry.Register(func() dflow.Node { copy := *node; return &copy }); err != nil {
-		t.Fatal(err)
-	}
-	decoded, err := registry.DecodeNode(dflow.NodeSpec{Type: "http"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	result, err := decoded.Run(context.Background(), map[string]any{"url": server.URL})
+	result, err := node.Run(context.Background(), map[string]any{"url": server.URL})
 	if err != nil || result.Output.(map[string]any)["statusCode"] != 302 {
 		t.Fatal("injected client was not preserved", result, err)
 	}

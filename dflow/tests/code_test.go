@@ -23,8 +23,8 @@ func TestCodeNode(t *testing.T) {
 			config, _ := json.Marshal(dflow.CodeConfig{Script: dflow.Script{Content: script}})
 			def := dflow.Definition{
 				Nodes: []dflow.NodeSpec{
-					{ID: "js", Type: "code", Config: config, Inputs: dflow.Parameters{"x": dflow.Input("number")}},
-					{ID: "end", Type: "end", Inputs: dflow.Parameters{"result": dflow.Ref("js", "value")}},
+					{ID: "js", Node: configuredFixture("code", config), Inputs: dflow.Parameters{"x": dflow.Input("number")}},
+					{ID: "end", Node: &dflow.EndNode{}, Inputs: dflow.Parameters{"result": dflow.Ref("js", "value")}},
 				},
 				Edges: []dflow.Edge{edge("js", "end")},
 			}

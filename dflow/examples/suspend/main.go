@@ -2,29 +2,31 @@ package main
 
 import (
 	"context"
+	"encoding/gob"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"log"
 
 	"github.com/k0923/go/dflow"
+	"github.com/k0923/go/dflow/examples/internal/appcodec"
 	"github.com/k0923/go/dflow/sqlite"
 )
 
 type taskNode struct{}
 
-func (taskNode) Type() string { return "async-task" }
+func init() { gob.Register(taskNode{}) }
 
 func (taskNode) Run(context.Context, map[string]any) (dflow.Result, error) {
 	fmt.Println("首次执行 task 节点")
-	return dflow.Result{Suspend: &dflow.JSONSuspension{
+	return dflow.Result{Suspend: &dflow.ValueSuspension{Kind: "transcode",
 		Data: map[string]any{"format": "mp4", "action": "transcode"},
 	}}, nil
 }
 
 func (taskNode) Resume(_ context.Context, _ map[string]any, input dflow.ResumeInput) (dflow.Result, error) {
 	fmt.Println("恢复 task 节点，token:", input.Token)
-	payload, ok := input.Suspension.(*dflow.JSONSuspension)
+	payload, ok := input.Suspension.(*dflow.ValueSuspension)
 	if !ok {
 		return dflow.Result{}, dflow.ErrInvalidSuspension
 	}
@@ -42,26 +44,20 @@ func main() {
 		log.Fatal("-db is required")
 	}
 	ctx := context.Background()
-	store, err := sqlite.Open(ctx, *path, *scope)
+	store, err := sqlite.Open(ctx, *path, *scope, appcodec.Codec{})
 	if err != nil {
 		log.Fatal(err)
 	}
 	defer store.Close()
-	registry := dflow.DefaultRegistry()
-	if err := registry.Register(func() dflow.Node {
-		return &taskNode{}
-	}); err != nil {
-		log.Fatal(err)
-	}
 	if *publish {
 		graph, err := dflow.Compile(dflow.Definition{
 			Version: "1",
 			Nodes: []dflow.NodeSpec{
-				{ID: "task", Type: "async-task"},
-				{ID: "end", Type: "end", Inputs: dflow.Parameters{"result": dflow.Ref("task")}},
+				{ID: "task", Node: taskNode{}},
+				{ID: "end", Node: &dflow.EndNode{}, Inputs: dflow.Parameters{"result": dflow.Ref("task")}},
 			},
 			Edges: []dflow.Edge{{SourceNodeID: "task", TargetNodeID: "end"}},
-		}, registry)
+		})
 		if err != nil {
 			log.Fatal(err)
 		}
@@ -70,7 +66,7 @@ func main() {
 		}
 	}
 	// On restart only the publication ID is needed; nodes are decoded on demand.
-	engine, err := dflow.NewEngineWithProvider(store.Provider("transcode-v1"), registry, store, dflow.Options{})
+	engine, err := dflow.NewEngineWithProvider(store.Provider("transcode-v1"), store, dflow.Options{})
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -102,7 +98,7 @@ func main() {
 	for _, message := range messages {
 		// Production: REQUEST goes to a business provider using run+node+token as an
 		// idempotency key; WAKE retries Resume until it returns without error.
-		fmt.Printf("通知 %d: %s node=%s token=%s request=%s\n", message.ID, message.Kind, message.NodeID, message.Token, message.Request)
+		fmt.Printf("通知 %d: %s node=%s token=%s request=%+v\n", message.ID, message.Kind, message.NodeID, message.Token, message.Request)
 		if state.Nodes["end"].Status == dflow.Succeeded {
 			if err := store.Ack(ctx, message.ID); err != nil {
 				log.Fatal(err)

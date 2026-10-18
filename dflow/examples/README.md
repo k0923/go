@@ -4,13 +4,13 @@
 
 | 场景 | 命令 | 说明 |
 | --- | --- | --- |
-| [basic](basic/main.go) | `go run ./dflow/examples/basic` | JSON 定义、上游输出引用、JS 计算，输出 `{"total":42}` |
-| [custom_node](custom_node/main.go) | `go run ./dflow/examples/custom_node` | 注册自定义节点、闭包注入服务、工作流输入引用，输出 `你好，DAG！` |
+| [basic](basic/main.go) | `go run ./dflow/examples/basic` | 接口实例定义、上游输出引用、JS 计算，输出 `map[total:42]` |
+| [custom_node](custom_node/main.go) | `go run ./dflow/examples/custom_node` | 直接注入自定义节点和服务、工作流输入引用，输出 `你好，DAG！` |
 | [http](http/main.go) | `go run ./dflow/examples/http` | 本地 HTTP 服务、查询参数、响应 JSON 解析，输出 `你好，HTTP` |
 | [suspend](suspend/main.go) | 见下方命令 | 节点返回挂起结果、SQLite 自动保存、跨进程调用 Resume |
 | [subflow](subflow/main.go) | 见下方命令 | SQLite 子流程调用协议、foreach Loop、逐轮持久化 |
 
-basic、custom_node 和 http 示例使用 `memory.New()`。挂起示例使用 SQLite，依次执行：
+basic、custom_node 和 http 示例使用 `memory.New()`。SQLite 示例的编码器位于 [internal/appcodec](internal/appcodec/codec.go)，演示业务侧使用 gob 保存接口类型。业务也可使用 xjson.G DTO 并在解码时重建服务依赖。挂起示例依次执行：
 
 ```sh
 go run ./dflow/examples/suspend -db /tmp/dflow-lazy-suspend.db -run demo -publish

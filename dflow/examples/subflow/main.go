@@ -8,6 +8,7 @@ import (
 	"log"
 
 	"github.com/k0923/go/dflow"
+	"github.com/k0923/go/dflow/examples/internal/appcodec"
 	"github.com/k0923/go/dflow/sqlite"
 )
 
@@ -20,19 +21,18 @@ func main() {
 		log.Fatal("-db is required")
 	}
 	ctx := context.Background()
-	store, err := sqlite.Open(ctx, *path, *scope)
+	store, err := sqlite.Open(ctx, *path, *scope, appcodec.Codec{})
 	if err != nil {
 		log.Fatal(err)
 	}
 	defer store.Close()
-	registry := dflow.DefaultRegistry()
 	if *publish {
 		body, err := dflow.Compile(dflow.Definition{
 			Version: "1",
-			Nodes: []dflow.NodeSpec{{ID: "out", Type: "end", Inputs: dflow.Parameters{
+			Nodes: []dflow.NodeSpec{{ID: "out", Node: &dflow.EndNode{}, Inputs: dflow.Parameters{
 				"item": dflow.Input("item"), "index": dflow.Input("index"),
 			}}},
-		}, registry)
+		})
 		if err != nil {
 			log.Fatal(err)
 		}
@@ -41,11 +41,11 @@ func main() {
 		}
 		parent, err := dflow.Compile(dflow.Definition{
 			Version: "1",
-			Nodes: []dflow.NodeSpec{{ID: "loop", Type: "loop",
-				Config: json.RawMessage(`{"publication":"loop-body-v1","outputNode":"out","mode":"foreach","maxIterations":10}`),
+			Nodes: []dflow.NodeSpec{{ID: "loop",
+				Node:   &dflow.LoopNode{Publication: "loop-body-v1", OutputNode: "out", Mode: "foreach", MaxIterations: 10},
 				Inputs: dflow.Parameters{"items": dflow.Input("items")},
 			}},
-		}, registry)
+		})
 		if err != nil {
 			log.Fatal(err)
 		}
@@ -53,7 +53,7 @@ func main() {
 			log.Fatal(err)
 		}
 	}
-	parent, err := dflow.NewEngineWithProvider(store.Provider("loop-parent-v1"), registry, store, dflow.Options{})
+	parent, err := dflow.NewEngineWithProvider(store.Provider("loop-parent-v1"), store, dflow.Options{})
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -67,12 +67,12 @@ func main() {
 		}
 	}()
 	dispatcher := dflow.ChildDispatcher{Bind: func(ctx context.Context, call dflow.ChildExecution) (*dflow.Engine, dflow.Infrastructure, error) {
-		childStore, err := sqlite.Open(ctx, *path, call.ScopeKey())
+		childStore, err := sqlite.Open(ctx, *path, call.ScopeKey(), appcodec.Codec{})
 		if err != nil {
 			return nil, nil, err
 		}
 		handles = append(handles, childStore)
-		child, err := dflow.NewEngineWithProvider(childStore.Provider(call.Request.Publication), registry, childStore, dflow.Options{})
+		child, err := dflow.NewEngineWithProvider(childStore.Provider(call.Request.Publication), childStore, dflow.Options{})
 		return child, childStore, err
 	}}
 	// This example's children are synchronous. Production dispatchers retain

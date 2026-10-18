@@ -25,9 +25,8 @@ type ChildSuspension struct {
 	ChildRequest
 }
 
-func (*ChildSuspension) Type() string                   { return ChildSuspensionType }
-func (n *ChildSuspension) MarshalJSON() ([]byte, error) { return json.Marshal(n.ChildRequest) }
-func (n *ChildSuspension) ChildCall() ChildRequest      { return n.ChildRequest }
+func (*ChildSuspension) Type() string              { return ChildSuspensionType }
+func (n *ChildSuspension) ChildCall() ChildRequest { return n.ChildRequest }
 
 // ChildInvocation is shared by subflow and loop suspension payloads.
 type ChildInvocation interface {
@@ -75,13 +74,9 @@ func (d ChildDispatcher) Handle(ctx context.Context, parent *Engine, parentScope
 	if parent == nil || parentScope == "" || d.Bind == nil || notification.Kind != RequestNotification {
 		return false, fmt.Errorf("dflow: invalid child dispatch")
 	}
-	var envelope SuspensionEnvelope
-	if err := decodeConfig(notification.Request, &envelope); err != nil {
-		return false, err
-	}
-	payload, err := parent.registry.DecodeSuspension(envelope)
-	if err != nil {
-		return false, err
+	payload := notification.Request
+	if isNil(payload) {
+		return false, ErrInvalidSuspension
 	}
 	call, ok := payload.(ChildInvocation)
 	if !ok {
@@ -161,13 +156,13 @@ func (d ChildDispatcher) Handle(ctx context.Context, parent *Engine, parentScope
 }
 
 func decodeChildResponse(value any) (ChildResponse, error) {
-	var response ChildResponse
-	raw, err := json.Marshal(value)
-	if err != nil {
-		return response, err
-	}
-	if err := decodeConfig(raw, &response); err != nil {
-		return response, err
+	response, ok := value.(ChildResponse)
+	if !ok {
+		if pointer, valid := value.(*ChildResponse); valid && pointer != nil {
+			response = *pointer
+		} else {
+			return response, fmt.Errorf("child response must be ChildResponse")
+		}
 	}
 	if response.Error != "" {
 		return response, fmt.Errorf("child execution: %s", response.Error)

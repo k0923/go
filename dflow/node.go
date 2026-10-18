@@ -5,11 +5,15 @@ import (
 	"context"
 )
 
-// Node receives resolved, JSON-normalized input. Implementations must honor ctx.
-// Dependencies such as service clients belong in the factory's closure.
+// Node receives resolved input. Implementations must honor ctx and treat input
+// values as read-only. Configuration is immutable; nodes may run concurrently.
 type Node interface {
-	Type() string
 	Run(context.Context, map[string]any) (Result, error)
+}
+
+// NodeValidator optionally validates configuration without executing the node.
+type NodeValidator interface {
+	Validate() error
 }
 
 // ResumableNode handles a persisted suspension's response. A recovered suspended
@@ -32,7 +36,8 @@ func (f NodeFunc) Run(ctx context.Context, input map[string]any) (Result, error)
 	return f(ctx, input)
 }
 
-// Result.Output must be JSON-serializable. Ports selects outgoing source ports:
+// Result values must be supported by the application's Infrastructure.
+// Ports selects outgoing source ports:
 // nil activates every edge; an empty non-nil slice activates none.
 type Result struct {
 	Output any      `json:"output"`

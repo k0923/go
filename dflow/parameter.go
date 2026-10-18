@@ -4,217 +4,140 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"reflect"
 	"regexp"
 	"sort"
 	"strconv"
 	"strings"
 )
 
-func (p Parameters) resolveWithInput(infra Infrastructure, ctx context.Context, states map[string]NodeState) (map[string]any, error) {
-	resolved := make(Parameters, len(p))
-	for key, parameter := range p {
-		if parameter.Type == "ref" {
-			path, err := referencePath(parameter.Content)
-			if err != nil {
-				return nil, err
-			}
-			if path[0] == InputSource {
-				value, err := infra.GetInput(ctx, path[1:]...)
-				if err != nil {
-					return nil, &InfrastructureError{"GetInput", err}
-				}
-				parameter = Constant(value)
-			}
-		} else if parameter.Type == "template" || parameter.Type == "plain-template" {
-			text, ok := parameter.Content.(string)
-			if !ok {
-				return nil, ErrInvalidReference
-			}
-			var failure error
-			parameter.Content = referencePattern.ReplaceAllStringFunc(text, func(match string) string {
-				path := strings.Split(strings.TrimSpace(referencePattern.FindStringSubmatch(match)[1]), ".")
-				var value any
-				var err error
-				if path[0] == InputSource {
-					value, err = infra.GetInput(ctx, path[1:]...)
-				} else {
-					value, err = resolvePath(path, nil, states)
-				}
-				if err != nil {
-					failure = err
-					if path[0] == InputSource {
-						failure = &InfrastructureError{"GetInput", err}
-					}
-					return ""
-				}
-				if parameter.Type == "plain-template" {
-					if value == nil {
-						return ""
-					}
-					return fmt.Sprint(value)
-				}
-				raw, err := json.Marshal(value)
-				if err != nil {
-					failure = err
-				}
-				return string(raw)
-			})
-			if failure != nil {
-				return nil, failure
-			}
-			// Freeze rendered input fragments as constants so user data containing
-			// {{...}} cannot be interpreted a second time as a node reference.
-			parameter = Constant(parameter.Content)
-		}
-		resolved[key] = parameter
-	}
-	return resolved.resolve(nil, states)
-}
-
 const InputSource = "$input"
 
-// InputValue resolves an original input path for Infrastructure adapters.
-func InputValue(input any, path ...string) (any, error) {
-	value, err := resolvePath(append([]string{InputSource}, path...), input, nil)
-	if err != nil {
-		return nil, err
-	}
-	return cloneJSON(value)
+// ValueResolver reads a run input or an ancestor's output by path.
+type ValueResolver interface {
+	Resolve(context.Context, ...string) (any, error)
 }
 
-// Parameter retains flowgram's constant/ref/template tagged value model.
-// A ref content is [nodeID, objectKey, arrayIndex, ...]. "$input" selects run input.
-type Parameter struct {
-	Type    string `json:"type"`
-	Content any    `json:"content"`
+// Parameter declares every dependency before compilation and resolves a value
+// during execution. Implementations and returned values must be immutable.
+type Parameter interface {
+	References() ([][]string, error)
+	Resolve(context.Context, ValueResolver) (any, error)
 }
 
 type Parameters map[string]Parameter
 
-func Constant(value any) Parameter { return Parameter{Type: "constant", Content: value} }
-func Ref(nodeID string, path ...string) Parameter {
-	return Parameter{Type: "ref", Content: append([]string{nodeID}, path...)}
+type ConstantParameter struct{ Value any }
+type ReferenceParameter struct{ Path []string }
+type TemplateParameter struct {
+	Text string
+	// JSON inserts JSON literals; false inserts plain text.
+	JSON bool
 }
-func Input(path ...string) Parameter { return Ref(InputSource, path...) }
 
-// Template inserts JSON literals, including quotes around strings.
-func Template(text string) Parameter { return Parameter{Type: "template", Content: text} }
+func Constant(value any) Parameter { return ConstantParameter{Value: value} }
+func Ref(nodeID string, path ...string) Parameter {
+	return ReferenceParameter{Path: append([]string{nodeID}, path...)}
+}
+func Input(path ...string) Parameter      { return Ref(InputSource, path...) }
+func Template(text string) Parameter      { return TemplateParameter{Text: text, JSON: true} }
+func PlainTemplate(text string) Parameter { return TemplateParameter{Text: text} }
 
-// PlainTemplate inserts strings verbatim; use for URLs or human-readable text.
-func PlainTemplate(text string) Parameter { return Parameter{Type: "plain-template", Content: text} }
+func (p ConstantParameter) References() ([][]string, error) { return nil, nil }
+func (p ConstantParameter) Resolve(ctx context.Context, _ ValueResolver) (any, error) {
+	return p.Value, ctx.Err()
+}
+func (p ReferenceParameter) References() ([][]string, error) {
+	if err := validatePath(p.Path); err != nil {
+		return nil, err
+	}
+	return [][]string{append([]string(nil), p.Path...)}, nil
+}
+func (p ReferenceParameter) Resolve(ctx context.Context, resolver ValueResolver) (any, error) {
+	if err := validatePath(p.Path); err != nil {
+		return nil, err
+	}
+	return resolver.Resolve(ctx, p.Path...)
+}
 
 var referencePattern = regexp.MustCompile(`\{\{\s*([^{}]+?)\s*\}\}`)
 
-func referencePath(content any) ([]string, error) {
-	raw, err := json.Marshal(content)
-	if err != nil {
+func validatePath(path []string) error {
+	if len(path) == 0 || path[0] == "" {
+		return fmt.Errorf("%w: reference requires a source", ErrInvalidReference)
+	}
+	return nil
+}
+
+func (p TemplateParameter) References() ([][]string, error) {
+	var refs [][]string
+	for _, match := range referencePattern.FindAllStringSubmatch(p.Text, -1) {
+		path := strings.Split(strings.TrimSpace(match[1]), ".")
+		for _, segment := range path {
+			if segment == "" {
+				return nil, fmt.Errorf("%w: empty template path segment", ErrInvalidReference)
+			}
+		}
+		refs = append(refs, path)
+	}
+	return refs, nil
+}
+
+func (p TemplateParameter) Resolve(ctx context.Context, resolver ValueResolver) (any, error) {
+	if _, err := p.References(); err != nil {
 		return nil, err
 	}
-	var path []string
-	if err := json.Unmarshal(raw, &path); err != nil || len(path) == 0 || path[0] == "" {
-		return nil, fmt.Errorf("%w: ref requires a nonempty string path", ErrInvalidReference)
-	}
-	return path, nil
-}
-
-func (p Parameter) references() ([][]string, error) {
-	switch p.Type {
-	case "constant":
-		return nil, nil
-	case "ref":
-		path, err := referencePath(p.Content)
-		return [][]string{path}, err
-	case "template", "plain-template":
-		text, ok := p.Content.(string)
-		if !ok {
-			return nil, fmt.Errorf("%w: template content must be a string", ErrInvalidReference)
+	var failure error
+	text := referencePattern.ReplaceAllStringFunc(p.Text, func(match string) string {
+		if failure != nil {
+			return ""
 		}
-		var refs [][]string
-		for _, match := range referencePattern.FindAllStringSubmatch(text, -1) {
-			path := strings.Split(strings.TrimSpace(match[1]), ".")
-			for _, segment := range path {
-				if segment == "" {
-					return nil, fmt.Errorf("%w: empty template path segment", ErrInvalidReference)
-				}
-			}
-			refs = append(refs, path)
-		}
-		return refs, nil
-	default:
-		return nil, fmt.Errorf("%w: unknown parameter type %q", ErrInvalidDefinition, p.Type)
-	}
-}
-
-func resolvePath(path []string, input any, states map[string]NodeState) (any, error) {
-	value := input
-	if path[0] != InputSource {
-		state, ok := states[path[0]]
-		if !ok || state.Status != Succeeded {
-			return nil, fmt.Errorf("%w: node %q has no successful output", ErrMissingValue, path[0])
-		}
-		value = state.Output
-	}
-	for _, part := range path[1:] {
-		switch current := value.(type) {
-		case map[string]any:
-			var exists bool
-			value, exists = current[part]
-			if !exists {
-				return nil, fmt.Errorf("%w: %v", ErrMissingValue, path)
-			}
-		case []any:
-			index, err := strconv.Atoi(part)
-			if err != nil || index < 0 || index >= len(current) {
-				return nil, fmt.Errorf("%w: %v", ErrMissingValue, path)
-			}
-			value = current[index]
-		default:
-			return nil, fmt.Errorf("%w: %v", ErrMissingValue, path)
-		}
-	}
-	return value, nil
-}
-
-func (p Parameter) resolve(input any, states map[string]NodeState) (any, error) {
-	switch p.Type {
-	case "constant":
-		return p.Content, nil
-	case "ref":
-		path, err := referencePath(p.Content)
+		path := strings.Split(strings.TrimSpace(referencePattern.FindStringSubmatch(match)[1]), ".")
+		value, err := resolver.Resolve(ctx, path...)
 		if err != nil {
-			return nil, err
+			failure = err
+			return ""
 		}
-		return resolvePath(path, input, states)
-	case "template", "plain-template":
-		text := p.Content.(string) // Compile has validated every parameter.
-		var resolveErr error
-		rendered := referencePattern.ReplaceAllStringFunc(text, func(match string) string {
-			if resolveErr != nil {
+		if !p.JSON {
+			if value == nil {
 				return ""
 			}
-			expression := referencePattern.FindStringSubmatch(match)[1]
-			value, err := resolvePath(strings.Split(strings.TrimSpace(expression), "."), input, states)
-			if err != nil {
-				resolveErr = err
-				return ""
-			}
-			if p.Type == "plain-template" {
-				if value == nil {
-					return ""
-				}
-				return fmt.Sprint(value)
-			}
-			raw, err := json.Marshal(value)
-			resolveErr = err
-			return string(raw)
-		})
-		return rendered, resolveErr
-	default:
-		return nil, ErrInvalidDefinition
-	}
+			return fmt.Sprint(value)
+		}
+		raw, err := json.Marshal(value)
+		failure = err
+		return string(raw)
+	})
+	return text, failure
 }
 
-func (p Parameters) resolve(input any, states map[string]NodeState) (map[string]any, error) {
+type inputResolver struct {
+	infra  Infrastructure
+	states map[string]NodeState
+}
+
+func (r inputResolver) Resolve(ctx context.Context, path ...string) (any, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if err := validatePath(path); err != nil {
+		return nil, err
+	}
+	if path[0] == InputSource {
+		value, err := r.infra.GetInput(ctx, path[1:]...)
+		if err != nil {
+			return nil, &InfrastructureError{"GetInput", err}
+		}
+		return value, nil
+	}
+	state, ok := r.states[path[0]]
+	if !ok || state.Status != Succeeded {
+		return nil, fmt.Errorf("%w: node %q has no successful output", ErrMissingValue, path[0])
+	}
+	return InputValue(state.Output, path[1:]...)
+}
+
+func (p Parameters) resolveWithInput(infra Infrastructure, ctx context.Context, states map[string]NodeState) (map[string]any, error) {
 	result := make(map[string]any, len(p))
 	keys := make([]string, 0, len(p))
 	for key := range p {
@@ -222,22 +145,52 @@ func (p Parameters) resolve(input any, states map[string]NodeState) (map[string]
 	}
 	sort.Strings(keys)
 	for _, key := range keys {
-		value, err := p[key].resolve(input, states)
+		if isNil(p[key]) {
+			return nil, ErrInvalidReference
+		}
+		value, err := p[key].Resolve(ctx, inputResolver{infra, states})
 		if err != nil {
 			return nil, fmt.Errorf("input %q: %w", key, err)
 		}
 		result[key] = value
 	}
-	// Isolate each node from upstream outputs and sibling inputs.
-	return cloneJSON(result)
+	return result, nil
 }
 
-func cloneJSON[T any](value T) (T, error) {
-	var result T
-	raw, err := json.Marshal(value)
-	if err != nil {
-		return result, err
+// InputValue traverses string-keyed maps, slices/arrays and exported struct
+// fields by Go field name. It preserves Go types and returns a read-only value.
+func InputValue(input any, path ...string) (any, error) {
+	value := reflect.ValueOf(input)
+	for _, part := range path {
+		for value.IsValid() && (value.Kind() == reflect.Interface || value.Kind() == reflect.Pointer) {
+			value = value.Elem()
+		}
+		if !value.IsValid() {
+			return nil, ErrMissingValue
+		}
+		switch value.Kind() {
+		case reflect.Map:
+			if value.Type().Key().Kind() != reflect.String {
+				return nil, ErrMissingValue
+			}
+			value = value.MapIndex(reflect.ValueOf(part).Convert(value.Type().Key()))
+		case reflect.Slice, reflect.Array:
+			index, err := strconv.Atoi(part)
+			if err != nil || index < 0 || index >= value.Len() {
+				return nil, ErrMissingValue
+			}
+			value = value.Index(index)
+		case reflect.Struct:
+			value = value.FieldByName(part)
+		default:
+			return nil, ErrMissingValue
+		}
+		if !value.IsValid() || !value.CanInterface() {
+			return nil, ErrMissingValue
+		}
 	}
-	err = json.Unmarshal(raw, &result)
-	return result, err
+	if !value.IsValid() {
+		return nil, nil
+	}
+	return value.Interface(), nil
 }

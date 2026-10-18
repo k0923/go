@@ -28,22 +28,22 @@ func (p *countedProvider) LoadNode(ctx context.Context, id string) (*dflow.Publi
 func TestPersistedPublicationLazyResume(t *testing.T) {
 	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "lazy.db")
-	store, err := sqlite.Open(ctx, path, "run")
+	store, err := sqlite.Open(ctx, path, "run", fixtureCodec{})
 	if err != nil {
 		t.Fatal(err)
 	}
 	registry := asyncRegistry(t, asyncNode{
 		run: func(context.Context, map[string]any) (dflow.Result, error) {
-			return dflow.Result{Suspend: &dflow.JSONSuspension{Data: "saved"}}, nil
+			return dflow.Result{Suspend: &dflow.ValueSuspension{Kind: "external", Data: "saved"}}, nil
 		},
 		resume: func(_ context.Context, _ map[string]any, input dflow.ResumeInput) (dflow.Result, error) {
 			return dflow.Result{Output: input.Response}, nil
 		},
 	})
 	def := waitDefinition()
-	def.Nodes = append([]dflow.NodeSpec{{ID: "before", Type: "passthrough"}}, def.Nodes...)
+	def.Nodes = append([]dflow.NodeSpec{{ID: "before", Node: &dflow.PassthroughNode{}}}, def.Nodes...)
 	def.Edges = append(def.Edges, edge("before", "wait"))
-	graph, err := dflow.Compile(def, registry)
+	graph, err := dflow.Compile(fixtureDefinition(def, registry))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -52,7 +52,7 @@ func TestPersistedPublicationLazyResume(t *testing.T) {
 		t.Fatal(err)
 	}
 	counted := &countedProvider{DefinitionProvider: provider, loads: map[string]int{}}
-	e, err := dflow.NewEngineWithProvider(counted, registry, store, dflow.Options{})
+	e, err := dflow.NewEngineWithProvider(counted, store, dflow.Options{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -71,13 +71,13 @@ func TestPersistedPublicationLazyResume(t *testing.T) {
 		t.Fatal(err)
 	}
 	// New process needs ONLY the publication ID, no original graph or definition.
-	store, err = sqlite.Open(ctx, path, "run")
+	store, err = sqlite.Open(ctx, path, "run", fixtureCodec{})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer store.Close()
 	counted = &countedProvider{DefinitionProvider: store.Provider("publication-1"), loads: map[string]int{}}
-	e, err = dflow.NewEngineWithProvider(counted, registry, store, dflow.Options{})
+	e, err = dflow.NewEngineWithProvider(counted, store, dflow.Options{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -197,12 +197,12 @@ func TestArrivalDedupAndInactiveJoin(t *testing.T) {
 }
 
 func TestParallelPortsFromOnePredecessor(t *testing.T) {
-	registry := dflow.DefaultRegistry()
+	registry := testRegistry{}
 	register(t, registry, "select", func(context.Context, map[string]any) (dflow.Result, error) {
 		return dflow.Result{Output: "ok", Ports: []string{"true"}}, nil
 	})
 	def := dflow.Definition{
-		Nodes: []dflow.NodeSpec{{ID: "a", Type: "select"}, {ID: "b", Type: "end"}},
+		Nodes: []dflow.NodeSpec{{ID: "a", Node: namedNode("select")}, {ID: "b", Node: &dflow.EndNode{}}},
 		Edges: []dflow.Edge{
 			{SourceNodeID: "a", TargetNodeID: "b", SourcePortID: "true"},
 			{SourceNodeID: "a", TargetNodeID: "b", SourcePortID: "false"},

@@ -28,9 +28,9 @@ func (e *observedEngine) Drain(ctx context.Context) (*dflow.State, error) {
 	state, readErr := e.store.Load(context.WithoutCancel(ctx))
 	return state, errors.Join(err, readErr)
 }
-func engine(t *testing.T, def dflow.Definition, registry *dflow.Registry, infra dflow.Infrastructure, options dflow.Options) *observedEngine {
+func engine(t *testing.T, def dflow.Definition, registry testRegistry, infra dflow.Infrastructure, options dflow.Options) *observedEngine {
 	t.Helper()
-	graph, err := dflow.Compile(def, registry)
+	graph, err := dflow.Compile(fixtureDefinition(def, registry))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -41,11 +41,9 @@ func engine(t *testing.T, def dflow.Definition, registry *dflow.Registry, infra 
 	return &observedEngine{e, infra.(dflow.SnapshotReader)}
 }
 
-func register(t *testing.T, registry *dflow.Registry, name string, node dflow.NodeFunc) {
+func register(t *testing.T, registry testRegistry, name string, node dflow.NodeFunc) {
 	t.Helper()
-	if err := registry.Register(func() dflow.Node { return &dflow.FuncNode{Kind: name, Handler: node} }); err != nil {
-		t.Fatal(err)
-	}
+	registry[name] = node
 }
 
 func edge(from, to string) dflow.Edge {
@@ -55,8 +53,9 @@ func edge(from, to string) dflow.Edge {
 func TestCompileRejectsInvalidGraphsAndReferences(t *testing.T) {
 	base := func() dflow.Definition {
 		return dflow.Definition{
-			Nodes: []dflow.NodeSpec{{ID: "a", Type: "passthrough"}, {ID: "b", Type: "passthrough"}},
-			Edges: []dflow.Edge{edge("a", "b")},
+			Version: "v1",
+			Nodes:   []dflow.NodeSpec{{ID: "a", Node: &dflow.PassthroughNode{}}, {ID: "b", Node: &dflow.PassthroughNode{}}},
+			Edges:   []dflow.Edge{edge("a", "b")},
 		}
 	}
 	cases := []struct {
@@ -81,15 +80,17 @@ func TestCompileRejectsInvalidGraphsAndReferences(t *testing.T) {
 		{"hidden template reference", func(d *dflow.Definition) {
 			d.Nodes[0].Inputs = dflow.Parameters{"x": dflow.Template("{{ b.secret }}")}
 		}, dflow.ErrInvalidReference},
-		{"unknown type", func(d *dflow.Definition) { d.Nodes[1].Type = "missing" }, dflow.ErrInvalidDefinition},
+		{"nil node", func(d *dflow.Definition) { d.Nodes[1].Node = nil }, dflow.ErrInvalidDefinition},
+		{"typed nil node", func(d *dflow.Definition) { d.Nodes[1].Node = (*dflow.EndNode)(nil) }, dflow.ErrInvalidDefinition},
+		{"missing version", func(d *dflow.Definition) { d.Version = "" }, dflow.ErrInvalidDefinition},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			def := base()
 			tc.change(&def)
-			_, err := dflow.Compile(def, nil)
+			_, err := dflow.Compile(def)
 			var validation *dflow.ValidationError
-			if !errors.Is(err, tc.cause) || !errors.As(err, &validation) {
+			if !errors.Is(err, tc.cause) || (tc.name != "missing version" && !errors.As(err, &validation)) {
 				t.Fatalf("expected %v and ValidationError, got %v", tc.cause, err)
 			}
 		})
@@ -100,9 +101,9 @@ func TestDAGReferencesAndSnapshotIsolation(t *testing.T) {
 	infra := memory.New()
 	def := dflow.Definition{
 		Nodes: []dflow.NodeSpec{
-			{ID: "start", Type: "start"},
-			{ID: "middle", Type: "passthrough"},
-			{ID: "end", Type: "end", Inputs: dflow.Parameters{
+			{ID: "start", Node: &dflow.StartNode{}},
+			{ID: "middle", Node: &dflow.PassthroughNode{}},
+			{ID: "end", Node: &dflow.EndNode{}, Inputs: dflow.Parameters{
 				"value": dflow.Ref("start", "items", "0", "name"),
 				"null":  dflow.Ref("start", "null"),
 				"json":  dflow.Template(`{"name": {{start.items.0.name}}}`),
@@ -136,7 +137,7 @@ func TestDAGReferencesAndSnapshotIsolation(t *testing.T) {
 }
 
 func TestResumeRetriesOnlyUnfinishedNodes(t *testing.T) {
-	registry := dflow.DefaultRegistry()
+	registry := testRegistry{}
 	var first, second atomic.Int32
 	transient := errors.New("try again")
 	register(t, registry, "first", func(ctx context.Context, _ map[string]any) (dflow.Result, error) {
@@ -153,7 +154,7 @@ func TestResumeRetriesOnlyUnfinishedNodes(t *testing.T) {
 		return dflow.Result{Output: input["value"]}, nil
 	})
 	def := dflow.Definition{
-		Nodes: []dflow.NodeSpec{{ID: "a", Type: "first"}, {ID: "b", Type: "second", Inputs: dflow.Parameters{"value": dflow.Ref("a")}}},
+		Nodes: []dflow.NodeSpec{{ID: "a", Node: namedNode("first")}, {ID: "b", Node: namedNode("second"), Inputs: dflow.Parameters{"value": dflow.Ref("a")}}},
 		Edges: []dflow.Edge{edge("a", "b")},
 	}
 	infra := memory.New()
@@ -165,7 +166,7 @@ func TestResumeRetriesOnlyUnfinishedNodes(t *testing.T) {
 	// A fresh engine resumes from infrastructure, not from the prior engine's memory.
 	e = engine(t, def, registry, infra, dflow.Options{})
 	state, err = e.Run(context.Background(), nil)
-	if err != nil || state.Nodes["b"].Status != dflow.Succeeded || first.Load() != 1 || second.Load() != 2 || state.Nodes["b"].Output != float64(42) {
+	if err != nil || state.Nodes["b"].Status != dflow.Succeeded || first.Load() != 1 || second.Load() != 2 || state.Nodes["b"].Output != 42 {
 		t.Fatalf("resume failed: %+v %v calls=%d/%d", state, err, first.Load(), second.Load())
 	}
 	_, err = e.Run(context.Background(), nil)
@@ -177,11 +178,11 @@ func TestResumeRetriesOnlyUnfinishedNodes(t *testing.T) {
 func TestBranchSkipAndMerge(t *testing.T) {
 	def := dflow.Definition{
 		Nodes: []dflow.NodeSpec{
-			{ID: "branch", Type: "condition", Inputs: dflow.Parameters{"condition": dflow.Constant(true)}},
-			{ID: "yes", Type: "passthrough"},
-			{ID: "no", Type: "passthrough"},
-			{ID: "no-child", Type: "passthrough"},
-			{ID: "merge", Type: "end", Inputs: dflow.Parameters{"value": dflow.Ref("branch", "matchedKey")}},
+			{ID: "branch", Node: &dflow.ConditionNode{}, Inputs: dflow.Parameters{"condition": dflow.Constant(true)}},
+			{ID: "yes", Node: &dflow.PassthroughNode{}},
+			{ID: "no", Node: &dflow.PassthroughNode{}},
+			{ID: "no-child", Node: &dflow.PassthroughNode{}},
+			{ID: "merge", Node: &dflow.EndNode{}, Inputs: dflow.Parameters{"value": dflow.Ref("branch", "matchedKey")}},
 		},
 		Edges: []dflow.Edge{
 			{SourceNodeID: "branch", TargetNodeID: "yes", SourcePortID: "true"},
@@ -206,7 +207,7 @@ func TestBranchSkipAndMerge(t *testing.T) {
 }
 
 func TestConcurrentFanoutWaitsForAllPredecessors(t *testing.T) {
-	registry := dflow.DefaultRegistry()
+	registry := testRegistry{}
 	started := make(chan struct{}, 2)
 	release := make(chan struct{})
 	register(t, registry, "wait", func(ctx context.Context, input map[string]any) (dflow.Result, error) {
@@ -220,9 +221,9 @@ func TestConcurrentFanoutWaitsForAllPredecessors(t *testing.T) {
 	})
 	def := dflow.Definition{
 		Nodes: []dflow.NodeSpec{
-			{ID: "a", Type: "wait", Inputs: dflow.Parameters{"value": dflow.Constant(1)}},
-			{ID: "b", Type: "wait", Inputs: dflow.Parameters{"value": dflow.Constant(2)}},
-			{ID: "join", Type: "end", Inputs: dflow.Parameters{"a": dflow.Ref("a", "value"), "b": dflow.Ref("b", "value")}},
+			{ID: "a", Node: namedNode("wait"), Inputs: dflow.Parameters{"value": dflow.Constant(1)}},
+			{ID: "b", Node: namedNode("wait"), Inputs: dflow.Parameters{"value": dflow.Constant(2)}},
+			{ID: "join", Node: &dflow.EndNode{}, Inputs: dflow.Parameters{"a": dflow.Ref("a", "value"), "b": dflow.Ref("b", "value")}},
 		},
 		Edges: []dflow.Edge{edge("a", "join"), edge("b", "join")},
 	}
@@ -232,8 +233,8 @@ func TestConcurrentFanoutWaitsForAllPredecessors(t *testing.T) {
 	done := make(chan error, 1)
 	go func() {
 		state, err := e.Run(ctx, nil)
-		if err == nil && (state.Nodes["join"].Output.(map[string]any)["a"] != float64(1) ||
-			state.Nodes["join"].Output.(map[string]any)["b"] != float64(2)) {
+		if err == nil && (state.Nodes["join"].Output.(map[string]any)["a"] != 1 ||
+			state.Nodes["join"].Output.(map[string]any)["b"] != 2) {
 			err = errors.New("join has wrong inputs")
 		}
 		done <- err
@@ -252,7 +253,7 @@ func TestConcurrentFanoutWaitsForAllPredecessors(t *testing.T) {
 }
 
 func TestRunLeaseAndCancellation(t *testing.T) {
-	registry := dflow.NewRegistry()
+	registry := testRegistry{}
 	started := make(chan struct{})
 	var exited atomic.Bool
 	register(t, registry, "wait", func(ctx context.Context, _ map[string]any) (dflow.Result, error) {
@@ -261,7 +262,7 @@ func TestRunLeaseAndCancellation(t *testing.T) {
 		exited.Store(true)
 		return dflow.Result{}, ctx.Err()
 	})
-	e := engine(t, dflow.Definition{Nodes: []dflow.NodeSpec{{ID: "a", Type: "wait"}}}, registry, memory.New(), dflow.Options{})
+	e := engine(t, dflow.Definition{Nodes: []dflow.NodeSpec{{ID: "a", Node: namedNode("wait")}}}, registry, memory.New(), dflow.Options{})
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 	done := make(chan error, 1)
@@ -293,7 +294,7 @@ func (s *failingSave) Commit(ctx context.Context, token lease.Token, commit dflo
 }
 
 func TestPersistenceFailureDoesNotStartDownstream(t *testing.T) {
-	registry := dflow.DefaultRegistry()
+	registry := testRegistry{}
 	var downstream atomic.Int32
 	register(t, registry, "downstream", func(context.Context, map[string]any) (dflow.Result, error) {
 		downstream.Add(1)
@@ -302,7 +303,7 @@ func TestPersistenceFailureDoesNotStartDownstream(t *testing.T) {
 	infra := &failingSave{Infrastructure: memory.New()}
 	infra.fail.Store(true)
 	def := dflow.Definition{
-		Nodes: []dflow.NodeSpec{{ID: "a", Type: "passthrough"}, {ID: "b", Type: "downstream"}},
+		Nodes: []dflow.NodeSpec{{ID: "a", Node: &dflow.PassthroughNode{}}, {ID: "b", Node: namedNode("downstream")}},
 		Edges: []dflow.Edge{edge("a", "b")},
 	}
 	e := engine(t, def, registry, infra, dflow.Options{})

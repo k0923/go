@@ -3,7 +3,6 @@ package sqlite
 import (
 	"context"
 	"database/sql"
-	"encoding/json"
 	"fmt"
 
 	"github.com/k0923/go/dflow"
@@ -11,8 +10,9 @@ import (
 
 // Provider binds to one immutable publication ID stored separately from runs.
 type Provider struct {
-	db *sql.DB
-	id string
+	db    *sql.DB
+	id    string
+	codec Codec
 }
 
 // Publish stores validated records atomically. Publication IDs are insert-only.
@@ -25,7 +25,7 @@ func (i *Infrastructure) Publish(ctx context.Context, id string, graph *dflow.Gr
 	if err != nil {
 		return nil, err
 	}
-	raw, err := json.Marshal(m)
+	raw, err := i.codec.Encode(m)
 	if err != nil {
 		return nil, err
 	}
@@ -45,11 +45,11 @@ func (i *Infrastructure) Publish(ctx context.Context, id string, graph *dflow.Gr
 			return err
 		}
 		for _, node := range nodes {
-			data, err := json.Marshal(node)
+			data, err := i.codec.Encode(node)
 			if err != nil {
 				return err
 			}
-			incoming, err := json.Marshal(node.Incoming)
+			incoming, err := i.codec.Encode(node.Incoming)
 			if err != nil {
 				return err
 			}
@@ -67,7 +67,7 @@ func (i *Infrastructure) Publish(ctx context.Context, id string, graph *dflow.Gr
 }
 
 // Provider needs no full definition JSON. Open the DB and bind its publication ID.
-func (i *Infrastructure) Provider(id string) *Provider { return &Provider{i.db, id} }
+func (i *Infrastructure) Provider(id string) *Provider { return &Provider{i.db, id, i.codec} }
 func (p *Provider) Manifest(ctx context.Context) (dflow.Manifest, error) {
 	var raw []byte
 	var m dflow.Manifest
@@ -75,7 +75,7 @@ func (p *Provider) Manifest(ctx context.Context) (dflow.Manifest, error) {
 	if err != nil {
 		return m, err
 	}
-	err = json.Unmarshal(raw, &m)
+	err = p.codec.Decode(raw, &m)
 	return m, err
 }
 func (p *Provider) LoadNode(ctx context.Context, id string) (*dflow.PublishedNode, error) {
@@ -85,7 +85,7 @@ func (p *Provider) LoadNode(ctx context.Context, id string) (*dflow.PublishedNod
 		return nil, fmt.Errorf("load published node %q: %w", id, err)
 	}
 	var node dflow.PublishedNode
-	err = json.Unmarshal(raw, &node)
+	err = p.codec.Decode(raw, &node)
 	return &node, err
 }
 func (p *Provider) Incoming(ctx context.Context, id string) ([]string, error) {
@@ -95,6 +95,6 @@ func (p *Provider) Incoming(ctx context.Context, id string) ([]string, error) {
 		return nil, err
 	}
 	var incoming []string
-	err = json.Unmarshal(raw, &incoming)
+	err = p.codec.Decode(raw, &incoming)
 	return incoming, err
 }

@@ -2,7 +2,6 @@ package memory
 
 import (
 	"context"
-	"encoding/json"
 	"slices"
 
 	"github.com/k0923/go/dflow"
@@ -23,10 +22,10 @@ func (i *Infrastructure) GetResponse(ctx context.Context, nodeID, token string) 
 	if response == nil {
 		return nil, nil
 	}
-	return &dflow.Response{Value: slices.Clone(response.Value)}, nil
+	return clone(response)
 }
 
-func (i *Infrastructure) Resolve(ctx context.Context, nodeID, token string, value json.RawMessage) (bool, error) {
+func (i *Infrastructure) Resolve(ctx context.Context, nodeID, token string, value any) (bool, error) {
 	i.mu.Lock()
 	defer i.mu.Unlock()
 	if err := ctx.Err(); err != nil {
@@ -44,10 +43,11 @@ func (i *Infrastructure) Resolve(ctx context.Context, nodeID, token string, valu
 	if node.Suspension == nil || node.Suspension.Token != token {
 		return false, nil
 	}
-	if !json.Valid(value) {
-		return false, dflow.ErrInvalidSuspension
+	copy, err := clone(value)
+	if err != nil {
+		return false, err
 	}
-	i.responses[key] = &dflow.Response{Value: slices.Clone(value)}
+	i.responses[key] = &dflow.Response{Value: copy}
 	node.Ready = true
 	node.Version++
 	i.state.Nodes[nodeID] = node
@@ -72,7 +72,11 @@ func (i *Infrastructure) Pending(ctx context.Context) ([]dflow.Notification, err
 	}
 	result := make([]dflow.Notification, 0, len(i.outbox))
 	for _, item := range i.outbox {
-		item.Request = slices.Clone(item.Request)
+		var err error
+		item.Request, err = clone(item.Request)
+		if err != nil {
+			return nil, err
+		}
 		result = append(result, item)
 	}
 	slices.SortFunc(result, func(a, b dflow.Notification) int {

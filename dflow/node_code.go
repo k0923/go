@@ -22,30 +22,15 @@ type CodeConfig struct {
 	TimeoutMS int64  `json:"timeoutMs,omitempty"`
 }
 
-type codeNode struct {
+type CodeNode struct {
 	program *goja.Program
 	timeout time.Duration
-}
-
-func (*codeNode) Type() string { return "code" }
-
-func (n *codeNode) DecodeNodeJSON(raw json.RawMessage) error {
-	var config CodeConfig
-	if err := decodeConfig(raw, &config); err != nil {
-		return err
-	}
-	node, err := NewCodeNode(config)
-	if err != nil {
-		return err
-	}
-	*n = *node.(*codeNode)
-	return nil
 }
 
 // NewCodeNode compiles JavaScript without executing it. Each Run gets a fresh VM.
 // Scripts define main({params}); legacy run(params) is also accepted.
 // No filesystem, network, require, or event loop is installed.
-func NewCodeNode(config CodeConfig) (Node, error) {
+func NewCodeNode(config CodeConfig) (*CodeNode, error) {
 	if config.Script.Language != "" && config.Script.Language != "javascript" {
 		return nil, fmt.Errorf("unsupported script language %q", config.Script.Language)
 	}
@@ -68,10 +53,20 @@ throw new Error("script must define main({ params })");
 	if err != nil {
 		return nil, err
 	}
-	return &codeNode{program: program, timeout: time.Duration(config.TimeoutMS) * time.Millisecond}, nil
+	return &CodeNode{program: program, timeout: time.Duration(config.TimeoutMS) * time.Millisecond}, nil
 }
 
-func (n *codeNode) Run(parent context.Context, input map[string]any) (Result, error) {
+func (n *CodeNode) Validate() error {
+	if n == nil || n.program == nil || n.timeout <= 0 {
+		return fmt.Errorf("code: construct with NewCodeNode")
+	}
+	return nil
+}
+
+func (n *CodeNode) Run(parent context.Context, input map[string]any) (Result, error) {
+	if err := n.Validate(); err != nil {
+		return Result{}, err
+	}
 	ctx, cancel := context.WithTimeout(parent, n.timeout)
 	defer cancel()
 	if err := ctx.Err(); err != nil {

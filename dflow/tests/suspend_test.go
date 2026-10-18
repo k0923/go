@@ -2,7 +2,6 @@ package tests
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"path/filepath"
 	"reflect"
@@ -29,20 +28,16 @@ func (n asyncNode) Resume(ctx context.Context, input map[string]any, resume dflo
 	return n.resume(ctx, input, resume)
 }
 
-func asyncRegistry(t *testing.T, node asyncNode) *dflow.Registry {
+func asyncRegistry(t *testing.T, node asyncNode) testRegistry {
 	t.Helper()
-	registry := dflow.DefaultRegistry()
-	if err := registry.Register(func() dflow.Node { copy := node; return &copy }); err != nil {
-		t.Fatal(err)
-	}
-	return registry
+	return testRegistry{"custom": &node}
 }
 
 func waitDefinition() dflow.Definition {
 	return dflow.Definition{
 		Nodes: []dflow.NodeSpec{
-			{ID: "wait", Type: "custom", Inputs: dflow.Parameters{"original": dflow.Constant("input")}},
-			{ID: "end", Type: "end", Inputs: dflow.Parameters{"value": dflow.Ref("wait")}},
+			{ID: "wait", Node: namedNode("custom"), Inputs: dflow.Parameters{"original": dflow.Constant("input")}},
+			{ID: "end", Node: &dflow.EndNode{}, Inputs: dflow.Parameters{"value": dflow.Ref("wait")}},
 		},
 		Edges: []dflow.Edge{edge("wait", "end")},
 	}
@@ -54,7 +49,7 @@ func backends(t *testing.T, test func(*testing.T, dflow.Infrastructure)) {
 		t.Run(name, func(t *testing.T) {
 			var infra dflow.Infrastructure = memory.New()
 			if name == "sqlite" {
-				store, err := sqlite.Open(context.Background(), filepath.Join(t.TempDir(), "run.db"), "run")
+				store, err := sqlite.Open(context.Background(), filepath.Join(t.TempDir(), "run.db"), "run", fixtureCodec{})
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -73,13 +68,13 @@ func TestNodeSuspensionAndResume(t *testing.T) {
 			run: func(_ context.Context, input map[string]any) (dflow.Result, error) {
 				runs.Add(1)
 				input["original"] = "private mutation"
-				return dflow.Result{Suspend: &dflow.JSONSuspension{
+				return dflow.Result{Suspend: &dflow.ValueSuspension{Kind: "external",
 					Data: map[string]any{"job": "job-123", "action": "submit"},
 				}}, nil
 			},
 			resume: func(_ context.Context, input map[string]any, resume dflow.ResumeInput) (dflow.Result, error) {
 				resumes.Add(1)
-				if input["original"] != "input" || resume.Suspension.(*dflow.JSONSuspension).Data.(map[string]any)["job"] != "job-123" || resume.Token == "" {
+				if input["original"] != "input" || resume.Suspension.(*dflow.ValueSuspension).Data.(map[string]any)["job"] != "job-123" || resume.Token == "" {
 					return dflow.Result{}, errors.New("missing saved input or continuation state")
 				}
 				return dflow.Result{Output: resume.Response}, nil
@@ -95,7 +90,7 @@ func TestNodeSuspensionAndResume(t *testing.T) {
 		token := state.Nodes["wait"].Suspension.Token
 		outbox := infra.(dflow.Outbox)
 		requests, err := outbox.Pending(ctx)
-		if err != nil || len(requests) != 1 || requests[0].Token != token || !json.Valid(requests[0].Request) {
+		if err != nil || len(requests) != 1 || requests[0].Token != token || requests[0].Request.Type() != "external" {
 			t.Fatal(requests, err)
 		}
 		if _, err := e.Drain(ctx); err != nil || runs.Load() != 1 || resumes.Load() != 0 {
@@ -138,12 +133,12 @@ func TestRepeatedSuspensionAndResumeFailure(t *testing.T) {
 		node := asyncNode{
 			run: func(context.Context, map[string]any) (dflow.Result, error) {
 				runs.Add(1)
-				return dflow.Result{Suspend: &dflow.JSONSuspension{Data: "first"}}, nil
+				return dflow.Result{Suspend: &dflow.ValueSuspension{Kind: "external", Data: "first"}}, nil
 			},
 			resume: func(_ context.Context, _ map[string]any, resume dflow.ResumeInput) (dflow.Result, error) {
 				count := resumes.Add(1)
-				if resume.Suspension.(*dflow.JSONSuspension).Data == "first" {
-					return dflow.Result{Suspend: &dflow.JSONSuspension{Data: "second"}}, nil
+				if resume.Suspension.(*dflow.ValueSuspension).Data == "first" {
+					return dflow.Result{Suspend: &dflow.ValueSuspension{Kind: "external", Data: "second"}}, nil
 				}
 				if count == 2 {
 					return dflow.Result{}, errors.New("temporary resume error")
@@ -193,7 +188,7 @@ func (s *earlyWake) Commit(ctx context.Context, token lease.Token, commit dflow.
 		return err
 	}
 	if commit.NodeID == "wait" && commit.State.Status == dflow.Suspended {
-		_, err := s.Resolve(ctx, "wait", commit.State.Suspension.Token, json.RawMessage(`"early"`))
+		_, err := s.Resolve(ctx, "wait", commit.State.Suspension.Token, "early")
 		return err
 	}
 	return nil
@@ -202,14 +197,14 @@ func (s *earlyWake) Commit(ctx context.Context, token lease.Token, commit dflow.
 func TestEarlyResponseAndIndependentBranch(t *testing.T) {
 	node := asyncNode{
 		run: func(context.Context, map[string]any) (dflow.Result, error) {
-			return dflow.Result{Suspend: &dflow.JSONSuspension{Data: "submit"}}, nil
+			return dflow.Result{Suspend: &dflow.ValueSuspension{Kind: "external", Data: "submit"}}, nil
 		},
 		resume: func(_ context.Context, _ map[string]any, input dflow.ResumeInput) (dflow.Result, error) {
 			return dflow.Result{Output: input.Response}, nil
 		},
 	}
 	def := waitDefinition()
-	def.Nodes = append(def.Nodes, dflow.NodeSpec{ID: "independent", Type: "passthrough"})
+	def.Nodes = append(def.Nodes, dflow.NodeSpec{ID: "independent", Node: &dflow.PassthroughNode{}})
 	for _, early := range []bool{false, true} {
 		var infra dflow.Infrastructure = memory.New()
 		if early {
@@ -230,9 +225,9 @@ func TestEarlyResponseAndIndependentBranch(t *testing.T) {
 
 func TestInvalidSuspension(t *testing.T) {
 	for _, resumable := range []bool{false, true} {
-		registry := dflow.DefaultRegistry()
+		registry := testRegistry{}
 		run := dflow.NodeFunc(func(context.Context, map[string]any) (dflow.Result, error) {
-			return dflow.Result{Suspend: &dflow.JSONSuspension{}}, nil
+			return dflow.Result{Suspend: &dflow.ValueSuspension{Kind: "external"}}, nil
 		})
 		if resumable {
 			registry = asyncRegistry(t, asyncNode{

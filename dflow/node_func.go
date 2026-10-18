@@ -1,14 +1,25 @@
 package dflow
 
-import "context"
+import (
+	"context"
+	"fmt"
+)
 
-// FuncNode adapts a handler into a node with a stable type.
+// FuncNode adapts a handler into a node.
 type FuncNode struct {
-	Kind    string   `json:"-"`
-	Handler NodeFunc `json:"-"`
+	Handler NodeFunc
 }
 
-func (n *FuncNode) Type() string { return n.Kind }
+func (n *FuncNode) Validate() error {
+	if n == nil || n.Handler == nil {
+		return fmt.Errorf("node handler required")
+	}
+	return nil
+}
+
 func (n *FuncNode) Run(ctx context.Context, input map[string]any) (Result, error) {
+	if err := n.Validate(); err != nil {
+		return Result{}, err
+	}
 	return n.Handler(ctx, input)
 }

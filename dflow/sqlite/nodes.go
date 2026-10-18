@@ -3,8 +3,8 @@ package sqlite
 import (
 	"context"
 	"database/sql"
-	"encoding/json"
 	"errors"
+	"reflect"
 
 	"github.com/k0923/go/dflow"
 	"github.com/k0923/go/lease"
@@ -30,7 +30,7 @@ func (i *Infrastructure) LoadMetadata(ctx context.Context) (*dflow.State, error)
 		return nil, nil
 	}
 	var state dflow.State
-	if err := json.Unmarshal(raw, &state); err != nil {
+	if err := i.codec.Decode(raw, &state); err != nil {
 		return nil, err
 	}
 	if state.Nodes != nil {
@@ -49,17 +49,15 @@ func (i *Infrastructure) Initialize(ctx context.Context, token lease.Token, m df
 		}
 		if raw != nil {
 			var previous dflow.State
-			if err := json.Unmarshal(raw, &previous); err != nil {
+			if err := i.codec.Decode(raw, &previous); err != nil {
 				return err
 			}
-			a, _ := json.Marshal(previous.Input)
-			b, _ := json.Marshal(input)
-			if previous.Nodes != nil || previous.DefinitionHash != m.Hash || string(a) != string(b) {
+			if previous.Nodes != nil || previous.DefinitionHash != m.Hash || !reflect.DeepEqual(previous.Input, input) {
 				return dflow.ErrRunMismatch
 			}
 			return nil
 		}
-		raw, err := json.Marshal(dflow.State{Version: 1, DefinitionHash: m.Hash, Input: input})
+		raw, err := i.codec.Encode(dflow.State{Version: 1, DefinitionHash: m.Hash, Input: input})
 		if err != nil {
 			return err
 		}
@@ -84,7 +82,7 @@ func (i *Infrastructure) getNode(ctx context.Context, q reader, id string) (*dfl
 		return nil, err
 	}
 	var node dflow.NodeState
-	if err := json.Unmarshal(raw, &node); err != nil {
+	if err := i.codec.Decode(raw, &node); err != nil {
 		return nil, err
 	}
 	return &node, nil
@@ -93,7 +91,7 @@ func (i *Infrastructure) GetNode(ctx context.Context, id string) (*dflow.NodeSta
 	return i.getNode(ctx, i.db, id)
 }
 func (i *Infrastructure) putNode(ctx context.Context, tx *sql.Tx, id string, node dflow.NodeState) error {
-	raw, err := json.Marshal(node)
+	raw, err := i.codec.Encode(node)
 	if err != nil {
 		return err
 	}
@@ -191,11 +189,7 @@ func (i *Infrastructure) Commit(ctx context.Context, token lease.Token, c dflow.
 				return err
 			}
 			if inserted != 0 {
-				request, err := json.Marshal(next.Suspension.Payload)
-				if err != nil {
-					return err
-				}
-				if err := i.notify(ctx, tx, dflow.Notification{Kind: dflow.RequestNotification, NodeID: c.NodeID, Token: next.Suspension.Token, Request: request}); err != nil {
+				if err := i.notify(ctx, tx, dflow.Notification{Kind: dflow.RequestNotification, NodeID: c.NodeID, Token: next.Suspension.Token, Request: next.Suspension.Payload}); err != nil {
 					return err
 				}
 			}

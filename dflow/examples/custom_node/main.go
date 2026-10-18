@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
@@ -26,7 +25,6 @@ type greetingNode struct {
 	service greetingService
 }
 
-func (*greetingNode) Type() string { return "greet" }
 func (n *greetingNode) Run(ctx context.Context, input map[string]any) (dflow.Result, error) {
 	name, ok := input["name"].(string)
 	if !ok {
@@ -38,22 +36,15 @@ func (n *greetingNode) Run(ctx context.Context, input map[string]any) (dflow.Res
 
 func main() {
 	service := greetingService{}
-	registry := dflow.DefaultRegistry()
-	err := registry.Register(func() dflow.Node {
-		return &greetingNode{service: service}
-	})
-	if err != nil {
-		log.Fatal(err)
-	}
 	graph, err := dflow.Compile(dflow.Definition{
 		Version: "1",
 		Nodes: []dflow.NodeSpec{
-			{ID: "greeting", Type: "greet", Config: json.RawMessage(`{"suffix":"！"}`),
+			{ID: "greeting", Node: &greetingNode{Suffix: "！", service: service},
 				Inputs: dflow.Parameters{"name": dflow.Input("name")}},
-			{ID: "end", Type: "end", Inputs: dflow.Parameters{"text": dflow.Ref("greeting", "message")}},
+			{ID: "end", Node: &dflow.EndNode{}, Inputs: dflow.Parameters{"text": dflow.Ref("greeting", "message")}},
 		},
 		Edges: []dflow.Edge{{SourceNodeID: "greeting", TargetNodeID: "end"}},
-	}, registry)
+	})
 	if err != nil {
 		log.Fatal(err)
 	}

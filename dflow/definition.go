@@ -2,18 +2,16 @@ package dflow
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
-	"encoding/json"
 	"fmt"
+	"maps"
 	"reflect"
+	"slices"
 )
 
 type NodeSpec struct {
-	ID     string          `json:"id"`
-	Type   string          `json:"type"`
-	Inputs Parameters      `json:"inputsValues,omitempty"`
-	Config json.RawMessage `json:"config,omitempty"`
+	ID     string
+	Node   Node
+	Inputs Parameters
 }
 
 type Edge struct {
@@ -38,22 +36,22 @@ type Graph struct {
 	specs      map[string]NodeSpec
 	incoming   map[string][]Edge
 	outgoing   map[string][]Edge
-	registry   *Registry
 }
 
 // Compile validates topology, references and node configurations without running nodes.
-func Compile(definition Definition, registry *Registry) (*Graph, error) {
-	if registry == nil {
-		registry = DefaultRegistry()
+func Compile(definition Definition) (*Graph, error) {
+	if definition.Version == "" {
+		return nil, fmt.Errorf("%w: immutable definition version required", ErrInvalidDefinition)
 	}
-	def, err := cloneJSON(definition)
-	if err != nil {
-		return nil, fmt.Errorf("%w: %v", ErrInvalidDefinition, err)
+	def := definition
+	def.Nodes = slices.Clone(definition.Nodes)
+	def.Edges = slices.Clone(definition.Edges)
+	for index := range def.Nodes {
+		def.Nodes[index].Inputs = maps.Clone(def.Nodes[index].Inputs)
 	}
 	g := &Graph{
 		definition: def, specs: map[string]NodeSpec{},
 		incoming: map[string][]Edge{}, outgoing: map[string][]Edge{},
-		registry: registry,
 	}
 	fail := func(id, detail string, cause error) (*Graph, error) {
 		return nil, &ValidationError{NodeID: id, Detail: detail, Cause: cause}
@@ -113,11 +111,17 @@ func Compile(definition Definition, registry *Registry) (*Graph, error) {
 			}
 		}
 		for key, parameter := range g.specs[id].Inputs {
-			refs, err := parameter.references()
+			if isNil(parameter) {
+				return fail(id, "input "+key, ErrInvalidReference)
+			}
+			refs, err := parameter.References()
 			if err != nil {
 				return fail(id, "input "+key, err)
 			}
 			for _, path := range refs {
+				if err := validatePath(path); err != nil {
+					return fail(id, "input "+key, err)
+				}
 				if path[0] != InputSource && !ancestors[id][path[0]] {
 					return fail(id, fmt.Sprintf("input %q references non-ancestor %q", key, path[0]), ErrInvalidReference)
 				}
@@ -125,14 +129,16 @@ func Compile(definition Definition, registry *Registry) (*Graph, error) {
 		}
 	}
 	for _, spec := range def.Nodes {
-		_, err := registry.DecodeNode(spec)
-		if err != nil {
-			return fail(spec.ID, "node configuration", err)
+		if isNil(spec.Node) {
+			return fail(spec.ID, "node required", ErrInvalidDefinition)
+		}
+		if validator, ok := spec.Node.(NodeValidator); ok {
+			if err := validator.Validate(); err != nil {
+				return fail(spec.ID, "node configuration", err)
+			}
 		}
 	}
-	raw, _ := json.Marshal(def)
-	hash := sha256.Sum256(raw)
-	g.hash = hex.EncodeToString(hash[:])
+	g.hash = def.Version
 	return g, nil
 }
 
@@ -142,7 +148,7 @@ type Manifest struct {
 	Roots []string `json:"roots"`
 }
 
-// PublishedNode is a serializable node definition plus validated topology.
+// PublishedNode contains an executable node plus validated topology.
 // Incoming contains UNIQUE predecessor IDs, not the number of incoming ports.
 type PublishedNode struct {
 	Spec     NodeSpec `json:"spec"`
@@ -152,7 +158,8 @@ type PublishedNode struct {
 
 // DefinitionProvider binds to ONE immutable, already validated publication.
 // Implementations load individual database records, not the whole definition.
-// Return independent copies. Manifest.Hash must change when definitions change.
+// Return independent metadata copies with immutable nodes and parameters.
+// Manifest.Hash is an application-supplied version; change it when definitions change.
 type DefinitionProvider interface {
 	Manifest(context.Context) (Manifest, error)
 	LoadNode(context.Context, string) (*PublishedNode, error)
@@ -198,7 +205,8 @@ func (g *Graph) LoadNode(ctx context.Context, id string) (*PublishedNode, error)
 	if !exists {
 		return nil, fmt.Errorf("%w: node %q", ErrInvalidDefinition, id)
 	}
-	node := PublishedNode{Spec: spec, Outgoing: g.outgoing[id]}
+	spec.Inputs = maps.Clone(spec.Inputs)
+	node := PublishedNode{Spec: spec, Outgoing: slices.Clone(g.outgoing[id])}
 	seen := map[string]bool{}
 	for _, edge := range g.incoming[id] {
 		if !seen[edge.SourceNodeID] {
@@ -206,12 +214,11 @@ func (g *Graph) LoadNode(ctx context.Context, id string) (*PublishedNode, error)
 			node.Incoming = append(node.Incoming, edge.SourceNodeID)
 		}
 	}
-	copy, err := cloneJSON(node)
-	return &copy, err
+	return &node, nil
 }
 
-// Publication exports individual records for database persistence. Compiled Go
-// instances and service clients are deliberately excluded.
+// Publication exports executable records. The application decides how to store
+// configuration and rebuild nodes and dependencies.
 func (g *Graph) Publication() (Manifest, []PublishedNode, error) {
 	m, err := g.Manifest(context.Background())
 	if err != nil {

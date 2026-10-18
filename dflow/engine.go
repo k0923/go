@@ -2,9 +2,9 @@ package dflow
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"slices"
 	"time"
 
@@ -22,7 +22,6 @@ type Options struct {
 
 type Engine struct {
 	definitions DefinitionProvider
-	registry    *Registry
 	infra       Infrastructure
 	leases      *lease.Runner
 	options     Options
@@ -33,17 +32,13 @@ func NewEngine(graph *Graph, infra Infrastructure, options Options) (*Engine, er
 	if graph == nil {
 		return nil, ErrInvalidDefinition
 	}
-	return NewEngineWithProvider(graph, graph.registry, infra, options)
+	return NewEngineWithProvider(graph, infra, options)
 }
 
-// NewEngineWithProvider reconstructs only ready nodes through registry. Provider
-// binds an immutable validated publication; no full-graph decode during recovery.
-func NewEngineWithProvider(provider DefinitionProvider, registry *Registry, infra Infrastructure, options Options) (*Engine, error) {
+// NewEngineWithProvider loads executable nodes from an immutable publication.
+func NewEngineWithProvider(provider DefinitionProvider, infra Infrastructure, options Options) (*Engine, error) {
 	if isNil(provider) || isNil(infra) {
 		return nil, fmt.Errorf("dflow: provider and infrastructure required")
-	}
-	if registry == nil {
-		registry = DefaultRegistry()
 	}
 	if options.MaxConcurrency == 0 {
 		options.MaxConcurrency = 4
@@ -58,17 +53,13 @@ func NewEngineWithProvider(provider DefinitionProvider, registry *Registry, infr
 	if err != nil {
 		return nil, err
 	}
-	return &Engine{provider, registry, infra, runner, options}, nil
+	return &Engine{provider, infra, runner, options}, nil
 }
 
 // Run drains persistent ready tasks in memory. Returned Nodes contains only
 // nodes touched by this drive. Business observation uses GetNode/SnapshotReader.
 // Nil error means quiescence, not workflow completion.
 func (e *Engine) Run(ctx context.Context, input map[string]any) (state *State, err error) {
-	input, err = cloneJSON(input)
-	if err != nil {
-		return nil, err
-	}
 	if input == nil {
 		input = map[string]any{}
 	}
@@ -139,7 +130,7 @@ func (e *Engine) drive(parent context.Context, token lease.Token, observed *Stat
 			observed.Nodes[task.NodeID] = task.State
 			active++
 			go func() {
-				node, result, err := e.execute(ctx, task, observed.Input)
+				node, result, err := e.execute(ctx, task)
 				done <- completion{task, node, result, err}
 			}()
 		}
@@ -164,12 +155,8 @@ func (e *Engine) drive(parent context.Context, token lease.Token, observed *Stat
 				}
 				next.Status, next.Error = Failed, result.err.Error()
 			} else if result.result.Suspend != nil {
-				payload, err := EncodeSuspension(result.result.Suspend)
-				if err != nil {
-					return err
-				}
 				next.Status = Suspended
-				next.Suspension = &SuspensionState{Token: uuid.NewString(), Payload: payload}
+				next.Suspension = &SuspensionState{Token: uuid.NewString(), Payload: result.result.Suspend}
 			} else {
 				next.Status = Succeeded
 				if !task.State.Enabled {
@@ -203,7 +190,7 @@ func (e *Engine) drive(parent context.Context, token lease.Token, observed *Stat
 	}
 }
 
-func (e *Engine) execute(parent context.Context, task *NodeTask, input map[string]any) (published *PublishedNode, result Result, err error) {
+func (e *Engine) execute(parent context.Context, task *NodeTask) (published *PublishedNode, result Result, err error) {
 	ctx, cancel := context.WithTimeout(context.WithValue(parent, nodeIDKey{}, task.NodeID), e.options.NodeTimeout)
 	defer cancel()
 	defer func() {
@@ -221,19 +208,25 @@ func (e *Engine) execute(parent context.Context, task *NodeTask, input map[strin
 	if !task.State.Enabled {
 		return published, result, nil
 	} // no executable instance for skipped nodes
-	node, err := e.registry.DecodeNode(published.Spec)
-	if err != nil {
-		return published, result, err
+	node := published.Spec.Node
+	if isNil(node) {
+		return published, result, &InfrastructureError{"LoadNode", ErrInvalidDefinition}
 	}
 	nodeInput := task.State.Input
 	if task.State.Suspension == nil {
 		upstream := map[string]NodeState{}
 		for _, parameter := range published.Spec.Inputs {
-			refs, refErr := parameter.references()
+			if isNil(parameter) {
+				return published, result, ErrInvalidReference
+			}
+			refs, refErr := parameter.References()
 			if refErr != nil {
 				return published, result, refErr
 			}
 			for _, path := range refs {
+				if err := validatePath(path); err != nil {
+					return published, result, err
+				}
 				if path[0] == InputSource {
 					continue
 				}
@@ -253,7 +246,7 @@ func (e *Engine) execute(parent context.Context, task *NodeTask, input map[strin
 		if err != nil {
 			return published, result, err
 		}
-		if published.Spec.Type == "start" && len(published.Spec.Inputs) == 0 {
+		if _, start := node.(*StartNode); start && len(published.Spec.Inputs) == 0 {
 			value, readErr := e.infra.GetInput(ctx)
 			if readErr != nil {
 				return published, result, &InfrastructureError{"GetInput", readErr}
@@ -267,14 +260,7 @@ func (e *Engine) execute(parent context.Context, task *NodeTask, input map[strin
 		if err != nil {
 			return published, result, err
 		}
-		task.State.Input, err = cloneJSON(nodeInput)
-		if err != nil {
-			return published, result, err
-		}
-	}
-	nodeInput, err = cloneJSON(nodeInput)
-	if err != nil {
-		return published, result, err
+		task.State.Input = nodeInput
 	}
 	if suspension := task.State.Suspension; suspension != nil {
 		response, readErr := e.infra.GetResponse(ctx, task.NodeID, suspension.Token)
@@ -288,17 +274,9 @@ func (e *Engine) execute(parent context.Context, task *NodeTask, input map[strin
 		if !ok {
 			return published, result, ErrInvalidSuspension
 		}
-		var value any
-		if err := json.Unmarshal(response.Value, &value); err != nil {
-			return published, result, err
-		}
-		payload, decodeErr := e.registry.DecodeSuspension(suspension.Payload)
-		if decodeErr != nil {
-			return published, result, &InfrastructureError{"DecodeSuspension", decodeErr}
-		}
-		result, err = resumable.Resume(ctx, nodeInput, ResumeInput{Token: suspension.Token, Suspension: payload, Response: value})
+		result, err = resumable.Resume(ctx, maps.Clone(nodeInput), ResumeInput{Token: suspension.Token, Suspension: suspension.Payload, Response: response.Value})
 	} else {
-		result, err = node.Run(ctx, nodeInput)
+		result, err = node.Run(ctx, maps.Clone(nodeInput))
 	}
 	if ctx.Err() != nil {
 		return published, Result{}, ctx.Err()
@@ -307,16 +285,8 @@ func (e *Engine) execute(parent context.Context, task *NodeTask, input map[strin
 		return published, result, err
 	}
 	if result.Suspend != nil {
-		if _, ok := node.(ResumableNode); !ok || isNil(result.Suspend) || result.Output != nil || result.Ports != nil {
+		if _, ok := node.(ResumableNode); !ok || isNil(result.Suspend) || result.Suspend.Type() == "" || result.Output != nil || result.Ports != nil {
 			return published, result, ErrInvalidSuspension
-		}
-		envelope, encodeErr := EncodeSuspension(result.Suspend)
-		if encodeErr != nil {
-			return published, result, encodeErr
-		}
-		result.Suspend, err = e.registry.DecodeSuspension(envelope)
-		if err != nil {
-			return published, result, err
 		}
 	}
 	for _, port := range result.Ports {
@@ -330,9 +300,6 @@ func (e *Engine) execute(parent context.Context, task *NodeTask, input map[strin
 			return published, result, fmt.Errorf("unknown outgoing port %q", port)
 		}
 	}
-	suspend := result.Suspend
-	result, err = cloneJSON(result)
-	result.Suspend = suspend
 	return published, result, err
 }
 

@@ -4,7 +4,6 @@ package sqlite
 import (
 	"context"
 	"database/sql"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"net/url"
@@ -22,14 +21,23 @@ var _ dflow.Outbox = (*Infrastructure)(nil)
 type Infrastructure struct {
 	db    *sql.DB
 	scope string
+	codec Codec
+}
+
+// Codec is supplied by the application. It must preserve concrete Node,
+// Parameter, Suspension and response types, and reject unsupported values.
+// SQLite owns transactions and indexes, not the application's wire format.
+type Codec interface {
+	Encode(any) ([]byte, error)
+	Decode([]byte, any) error
 }
 
 // Open creates the schema and binds this handle to scope (e.g. tenant/run ID).
 // Multiple handles/processes can share the file. The directory must exist.
 // WAL + synchronous FULL protects committed checkpoints across process crashes.
-func Open(ctx context.Context, path, scope string) (*Infrastructure, error) {
-	if path == "" || scope == "" {
-		return nil, fmt.Errorf("sqlite dflow: path and scope are required")
+func Open(ctx context.Context, path, scope string, codec Codec) (*Infrastructure, error) {
+	if path == "" || scope == "" || codec == nil {
+		return nil, fmt.Errorf("sqlite dflow: path, scope and application codec are required")
 	}
 	absolute, err := filepath.Abs(path)
 	if err != nil {
@@ -87,7 +95,7 @@ CREATE INDEX IF NOT EXISTS dflow_outbox_scope ON dflow_outbox(scope,id);
 		db.Close()
 		return nil, err
 	}
-	return &Infrastructure{db: db, scope: scope}, nil
+	return &Infrastructure{db: db, scope: scope, codec: codec}, nil
 }
 
 func (i *Infrastructure) Close() error { return i.db.Close() }
@@ -188,7 +196,7 @@ func (i *Infrastructure) Load(ctx context.Context) (*dflow.State, error) {
 			return nil, err
 		}
 		var node dflow.NodeState
-		if err := json.Unmarshal(raw, &node); err != nil {
+		if err := i.codec.Decode(raw, &node); err != nil {
 			return nil, err
 		}
 		state.Nodes[id] = node
@@ -213,7 +221,11 @@ func (i *Infrastructure) getResponse(ctx context.Context, query reader, nodeID, 
 	if data == nil {
 		return nil, nil
 	}
-	return &dflow.Response{Value: data}, nil
+	var response dflow.Response
+	if err := i.codec.Decode(data, &response); err != nil {
+		return nil, err
+	}
+	return &response, nil
 }
 
 func (i *Infrastructure) GetResponse(ctx context.Context, nodeID, token string) (*dflow.Response, error) {
@@ -221,12 +233,20 @@ func (i *Infrastructure) GetResponse(ctx context.Context, nodeID, token string) 
 }
 
 func (i *Infrastructure) notify(ctx context.Context, tx *sql.Tx, notification dflow.Notification) error {
+	var raw []byte
+	if notification.Request != nil {
+		var err error
+		raw, err = i.codec.Encode(notification.Request)
+		if err != nil {
+			return err
+		}
+	}
 	_, err := tx.ExecContext(ctx, `INSERT INTO dflow_outbox(scope,kind,node,token,request) VALUES(?,?,?,?,?)`,
-		i.scope, string(notification.Kind), notification.NodeID, notification.Token, []byte(notification.Request))
+		i.scope, string(notification.Kind), notification.NodeID, notification.Token, raw)
 	return err
 }
 
-func (i *Infrastructure) Resolve(ctx context.Context, nodeID, token string, value json.RawMessage) (accepted bool, err error) {
+func (i *Infrastructure) Resolve(ctx context.Context, nodeID, token string, value any) (accepted bool, err error) {
 	err = i.transaction(ctx, func(tx *sql.Tx) error {
 		response, err := i.getResponse(ctx, tx, nodeID, token)
 		if err != nil {
@@ -242,11 +262,12 @@ func (i *Infrastructure) Resolve(ctx context.Context, nodeID, token string, valu
 		if node == nil || node.Suspension == nil || node.Suspension.Token != token {
 			return nil
 		}
-		if !json.Valid(value) {
-			return dflow.ErrInvalidSuspension
+		raw, err := i.codec.Encode(dflow.Response{Value: value})
+		if err != nil {
+			return err
 		}
 		if _, err := tx.ExecContext(ctx, `UPDATE dflow_waits SET response=? WHERE scope=? AND node=? AND token=?`,
-			[]byte(value), i.scope, nodeID, token); err != nil {
+			raw, i.scope, nodeID, token); err != nil {
 			return err
 		}
 		if err := i.notify(ctx, tx, dflow.Notification{Kind: dflow.WakeNotification, NodeID: nodeID, Token: token}); err != nil {
@@ -279,7 +300,11 @@ func (i *Infrastructure) Pending(ctx context.Context) ([]dflow.Notification, err
 		if err := rows.Scan(&item.ID, &item.Kind, &item.NodeID, &item.Token, &request); err != nil {
 			return nil, err
 		}
-		item.Request = request
+		if request != nil {
+			if err := i.codec.Decode(request, &item.Request); err != nil {
+				return nil, err
+			}
+		}
 		result = append(result, item)
 	}
 	return result, rows.Err()
