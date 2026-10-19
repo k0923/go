@@ -9,6 +9,7 @@ import (
 	"log"
 
 	"github.com/k0923/go/dflow"
+	"github.com/k0923/go/dflow/driver"
 	"github.com/k0923/go/dflow/examples/internal/appcodec"
 	"github.com/k0923/go/dflow/sqlite"
 )
@@ -74,9 +75,9 @@ func main() {
 		if *token == "" {
 			log.Fatal("-token from the original request is required with -answer")
 		}
-		_, err = engine.ResumeNode(ctx, "task", *token, *answer)
+		_, err = driver.Resume(ctx, engine, "task", *token, *answer)
 	} else {
-		_, err = engine.Run(ctx, nil)
+		_, err = driver.Run(ctx, engine, nil)
 	}
 	if err != nil {
 		log.Fatal(err)

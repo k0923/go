@@ -183,15 +183,16 @@ func TestRepeatedSuspensionAndResumeFailure(t *testing.T) {
 
 type earlyWake struct{ *memory.Infrastructure }
 
-func (s *earlyWake) Commit(ctx context.Context, token lease.Token, commit dflow.NodeCommit) error {
-	if err := s.Infrastructure.Commit(ctx, token, commit); err != nil {
-		return err
+func (s *earlyWake) Commit(ctx context.Context, token lease.Token, commit dflow.NodeCommit) ([]string, error) {
+	ready, err := s.Infrastructure.Commit(ctx, token, commit)
+	if err != nil {
+		return nil, err
 	}
 	if commit.NodeID == "wait" && commit.State.Status == dflow.Suspended {
 		_, err := s.Resolve(ctx, "wait", commit.State.Suspension.Token, "early")
-		return err
+		return ready, err
 	}
-	return nil
+	return ready, nil
 }
 
 func TestEarlyResponseAndIndependentBranch(t *testing.T) {
@@ -210,7 +211,7 @@ func TestEarlyResponseAndIndependentBranch(t *testing.T) {
 		if early {
 			infra = &earlyWake{infra.(*memory.Infrastructure)}
 		}
-		state, err := engine(t, def, asyncRegistry(t, node), infra, dflow.Options{MaxConcurrency: 1}).Run(context.Background(), nil)
+		state, err := engine(t, def, asyncRegistry(t, node), infra, dflow.Options{}).Run(context.Background(), nil)
 		if err != nil || state.Nodes["independent"].Status != dflow.Succeeded {
 			t.Fatal("suspension occupied execution slot", state, err)
 		}

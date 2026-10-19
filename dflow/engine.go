@@ -6,27 +6,50 @@ import (
 	"fmt"
 	"maps"
 	"slices"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/k0923/go/lease"
 )
 
-const runLeaseKey = "dflow/run"
-
 type Options struct {
-	MaxConcurrency int
-	NodeTimeout    time.Duration
-	Lease          lease.Options
+	NodeTimeout time.Duration
+	// Lease configures the per-node execution lease (TTL, renewal at TTL/3, and
+	// bounded release). A node whose owner stops renewing becomes claimable by any
+	// instance once the TTL elapses.
+	Lease lease.Options
 	// Hooks observes node lifecycle transitions. It never affects scheduling.
 	Hooks Hooks
 }
 
+// Engine drives one node per call and keeps no workflow status: Drive executes a
+// single node, persists its outcome and returns the downstream nodes that became
+// ready. Execution ownership is per node, so distinct nodes of one run may be
+// driven concurrently from goroutines, workers or instances. The caller decides
+// how to continue — recurse in-process, enqueue to a queue, or stop — giving the
+// business full control over concurrency, ordering and failure handling.
 type Engine struct {
 	definitions DefinitionProvider
 	infra       Infrastructure
-	leases      *lease.Runner
 	options     Options
+}
+
+// Executed reports the outcome of one Drive step. Ready lists downstream nodes
+// that became ready from THIS step, for the caller to drive next. Suspension
+// carries the business-defined payload when Status is Suspended; the caller
+// type-asserts it to its own type and decides what to do (spawn a child, request
+// approval, loop, ...), then later calls Wakeup and drives the node again.
+type Executed struct {
+	NodeID     string
+	Status     Status
+	Output     any
+	Suspension Suspension
+	Token      string
+	Ready      []string
+	// Err is the business failure when Status is Failed. Drive also returns it as
+	// the function error so a caller loop stops on failure (fail-fast).
+	Err error
 }
 
 // NewEngine is the in-process publication convenience API.
@@ -42,155 +65,169 @@ func NewEngineWithProvider(provider DefinitionProvider, infra Infrastructure, op
 	if isNil(provider) || isNil(infra) {
 		return nil, fmt.Errorf("dflow: provider and infrastructure required")
 	}
-	if options.MaxConcurrency == 0 {
-		options.MaxConcurrency = 4
-	}
 	if options.NodeTimeout == 0 {
 		options.NodeTimeout = 5 * time.Minute
 	}
-	if options.MaxConcurrency < 1 || options.NodeTimeout < 0 {
+	if options.NodeTimeout < 0 {
 		return nil, fmt.Errorf("dflow: invalid options")
 	}
-	runner, err := lease.NewRunner(infra, options.Lease)
-	if err != nil {
+	// Validate lease options once; Drive builds a runner per node lease.
+	if _, err := lease.NewRunner(&nodeLease{}, options.Lease); err != nil {
 		return nil, err
 	}
-	return &Engine{provider, infra, runner, options}, nil
+	return &Engine{provider, infra, options}, nil
 }
 
-// Run drains persistent ready tasks in memory. Returned Nodes contains only
-// nodes touched by this drive. Business observation uses GetNode/SnapshotReader.
-// Nil error means quiescence, not workflow completion.
-func (e *Engine) Run(ctx context.Context, input map[string]any) (state *State, err error) {
+// Start initializes or verifies the execution and returns the node IDs that are
+// ready to drive. It is idempotent and takes no lease: concurrent calls from
+// several instances bind the same execution once.
+func (e *Engine) Start(ctx context.Context, input map[string]any) ([]string, error) {
 	if input == nil {
 		input = map[string]any{}
 	}
-	err = e.leases.Run(ctx, runLeaseKey, func(ctx context.Context, token lease.Token) error {
-		manifest, err := e.definitions.Manifest(ctx)
-		if err != nil {
-			return err
-		}
-		if err := e.infra.Initialize(ctx, token, manifest, input); err != nil {
-			return &InfrastructureError{"Initialize", err}
-		}
-		state = &State{DefinitionHash: manifest.Hash, Input: input, Nodes: map[string]NodeState{}}
-		return e.drive(ctx, token, state, nil, false)
-	})
-	return state, err
+	manifest, err := e.definitions.Manifest(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if err := e.infra.Initialize(ctx, manifest, input); err != nil {
+		return nil, &InfrastructureError{"Initialize", err}
+	}
+	ready, err := e.infra.ReadyNodes(ctx)
+	if err != nil {
+		return nil, &InfrastructureError{"ReadyNodes", err}
+	}
+	return ready, nil
 }
 
-type completion struct {
-	task   *NodeTask
-	node   *PublishedNode
-	result Result
-	err    error
+// Recover returns the node IDs that are currently drivable without reinitializing
+// the execution: freshly ready nodes and nodes whose previous owner lost its
+// lease. Nodes executing under a live lease elsewhere are not listed. It takes no
+// lease. Use it after process loss to repopulate a work queue.
+func (e *Engine) Recover(ctx context.Context) ([]string, error) {
+	ready, err := e.infra.ReadyNodes(ctx)
+	if err != nil {
+		return nil, &InfrastructureError{"ReadyNodes", err}
+	}
+	return ready, nil
 }
 
-func (e *Engine) drive(parent context.Context, token lease.Token, observed *State, first *NodeTask, scoped bool) error {
-	ctx, cancel := context.WithCancel(parent)
-	defer cancel()
-	done := make(chan completion, e.options.MaxConcurrency)
-	active := 0
-	queue := []string{}
-	queued := map[string]bool{}
-	defer func() {
-		cancel()
-		for active > 0 {
-			<-done
-			active--
+// Drive executes exactly one node and persists its outcome. It holds only that
+// node's lease — claimed, renewed while Run/Resume executes, and ended by Commit
+// — so distinct nodes of one run proceed in parallel, across processes too.
+// Duplicate deliveries of the same node are safe: only one claim wins.
+//
+// A node that is pending, suspended, terminal or owned by a live lease yields a
+// zero Executed and nil error. A business node failure returns Status Failed with
+// the error (fail-fast): no downstream node becomes ready. Infrastructure/lease
+// errors are uncertain and should be retried by driving the same node again.
+func (e *Engine) Drive(ctx context.Context, nodeID string) (executed Executed, err error) {
+	if nodeID == "" {
+		return Executed{}, ErrInvalidDefinition
+	}
+	owner := &nodeLease{infra: e.infra}
+	runner, err := lease.NewRunner(owner, e.options.Lease)
+	if err != nil {
+		return Executed{}, err
+	}
+	err = runner.Run(ctx, nodeID, func(ctx context.Context, token lease.Token) error {
+		task := owner.task
+		executed.NodeID = nodeID
+		e.options.Hooks.claim(ctx, NodeEvent{NodeID: nodeID, Attempt: task.State.Generation})
+		node, result, execErr := e.execute(ctx, task)
+		if ctx.Err() != nil {
+			// Lease lost or caller cancelled: the outcome is uncertain, not a
+			// business failure. Leave the node Running for a retry/reclaim.
+			return &InfrastructureError{"Execute", context.Cause(ctx)}
 		}
-	}()
-	for {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		for active < e.options.MaxConcurrency {
-			var task *NodeTask
-			var err error
-			if first != nil {
-				task = first
-				first = nil
-			} else if scoped {
-				for len(queue) > 0 && task == nil {
-					id := queue[0]
-					queue = queue[1:]
-					delete(queued, id)
-					task, err = e.infra.ClaimNode(ctx, token, id)
-					if err != nil {
-						break
-					}
-				}
-			} else {
-				task, err = e.infra.ClaimReady(ctx, token)
+		next := task.State
+		var arrivals []Arrival
+		if execErr != nil {
+			var infraErr *InfrastructureError
+			if errors.As(execErr, &infraErr) {
+				return execErr
 			}
+			next.Status, next.Error = Failed, execErr.Error()
+		} else if result.Suspend != nil {
+			next.Status = Suspended
+			next.Suspension = &SuspensionState{Token: uuid.NewString(), Payload: result.Suspend}
+		} else {
+			next.Status = Succeeded
+			if !task.State.Enabled {
+				next.Status = Skipped
+			}
+			next.Output, next.Ports, next.Suspension = result.Output, result.Ports, nil
+			arrivals, err = e.arrivals(ctx, nodeID, node, next)
 			if err != nil {
-				return &InfrastructureError{"ClaimReady", err}
-			}
-			if task == nil {
-				break
-			}
-			observed.Nodes[task.NodeID] = task.State
-			e.options.Hooks.claim(ctx, NodeEvent{NodeID: task.NodeID, Attempt: task.State.Generation})
-			active++
-			go func() {
-				node, result, err := e.execute(ctx, task)
-				done <- completion{task, node, result, err}
-			}()
-		}
-		if active == 0 {
-			return nil
-		}
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case result := <-done:
-			active--
-			if err := ctx.Err(); err != nil {
 				return err
 			}
-			task := result.task
-			next := task.State
-			var arrivals []Arrival
-			if result.err != nil {
-				var infraErr *InfrastructureError
-				if errors.As(result.err, &infraErr) {
-					return result.err
-				}
-				next.Status, next.Error = Failed, result.err.Error()
-			} else if result.result.Suspend != nil {
-				next.Status = Suspended
-				next.Suspension = &SuspensionState{Token: uuid.NewString(), Payload: result.result.Suspend}
-			} else {
-				next.Status = Succeeded
-				if !task.State.Enabled {
-					next.Status = Skipped
-				}
-				next.Output, next.Ports, next.Suspension = result.result.Output, result.result.Ports, nil
-				var err error
-				arrivals, err = e.arrivals(ctx, task.NodeID, result.node, next)
-				if err != nil {
-					return err
-				}
-			}
-			next.Ready = false
-			if err := e.infra.Commit(ctx, token, NodeCommit{task.NodeID, task.State.Version, next, arrivals}); err != nil {
-				return &InfrastructureError{"Commit", err}
-			}
-			next.Version++
-			observed.Nodes[task.NodeID] = next
-			if scoped {
-				for _, arrival := range arrivals {
-					if !queued[arrival.TargetNodeID] {
-						queue = append(queue, arrival.TargetNodeID)
-						queued[arrival.TargetNodeID] = true
-					}
-				}
-			}
-			if result.err != nil {
-				return &NodeError{task.NodeID, "execute", result.err}
-			}
 		}
+		next.Ready = false
+		owner.ending.Store(true)
+		ready, commitErr := e.infra.Commit(ctx, token, NodeCommit{nodeID, task.State.Version, next, arrivals})
+		if commitErr != nil {
+			owner.ending.Store(false)
+			return &InfrastructureError{"Commit", commitErr}
+		}
+		owner.committed.Store(true)
+		executed.Status = next.Status
+		executed.Output = next.Output
+		executed.Ready = ready
+		if next.Suspension != nil {
+			executed.Suspension = next.Suspension.Payload
+			executed.Token = next.Suspension.Token
+		}
+		if execErr != nil {
+			executed.Err = execErr
+			return &NodeError{nodeID, "execute", execErr}
+		}
+		return nil
+	})
+	if errors.Is(err, errNotDrivable) {
+		return Executed{}, nil
 	}
+	return executed, err
+}
+
+// errNotDrivable reports that ClaimNode found nothing to do. Drive maps it to a
+// zero Executed rather than an error.
+var errNotDrivable = errors.New("dflow: node not drivable")
+
+// nodeLease adapts one Drive's node claim to lease.Runner, reusing its renewal,
+// cancellation-on-loss and bounded release. Commit validates the lease and ends
+// ownership in storage, so renewal pauses while Commit is in flight (a renewal
+// racing the commit would otherwise report a spurious loss) and a committed
+// lease is not released.
+type nodeLease struct {
+	infra             Infrastructure
+	task              *NodeTask
+	ending, committed atomic.Bool
+}
+
+func (l *nodeLease) Claim(ctx context.Context, nodeID string, ttl time.Duration) (*lease.Token, error) {
+	task, err := l.infra.ClaimNode(ctx, nodeID, ttl)
+	if err != nil {
+		return nil, &InfrastructureError{"ClaimNode", err}
+	}
+	if task == nil {
+		return nil, errNotDrivable
+	}
+	l.task = task
+	token := task.Lease
+	return &token, nil
+}
+
+func (l *nodeLease) Renew(ctx context.Context, token lease.Token, ttl time.Duration) (*lease.Token, error) {
+	if l.ending.Load() {
+		return &token, nil
+	}
+	return l.infra.RenewNode(ctx, token, ttl)
+}
+
+func (l *nodeLease) Release(ctx context.Context, token lease.Token) error {
+	if l.committed.Load() {
+		return nil
+	}
+	return l.infra.ReleaseNode(ctx, token)
 }
 
 func (e *Engine) execute(parent context.Context, task *NodeTask) (published *PublishedNode, result Result, err error) {
@@ -259,9 +296,6 @@ func (e *Engine) execute(parent context.Context, task *NodeTask) (published *Pub
 			if !ok {
 				return published, result, ErrInvalidDefinition
 			}
-		}
-		if err != nil {
-			return published, result, err
 		}
 		task.State.Input = nodeInput
 	}

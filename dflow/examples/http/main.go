@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 
 	"github.com/k0923/go/dflow"
+	"github.com/k0923/go/dflow/driver"
 	"github.com/k0923/go/dflow/memory"
 )
 
@@ -40,7 +41,7 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	state, err := engine.Run(context.Background(), map[string]any{"query": map[string]any{"name": "HTTP"}})
+	state, err := driver.Run(context.Background(), engine, map[string]any{"query": map[string]any{"name": "HTTP"}})
 	if err != nil {
 		log.Fatal(err)
 	}

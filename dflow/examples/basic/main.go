@@ -6,6 +6,7 @@ import (
 	"log"
 
 	"github.com/k0923/go/dflow"
+	"github.com/k0923/go/dflow/driver"
 	"github.com/k0923/go/dflow/memory"
 )
 
@@ -35,7 +36,7 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	state, err := engine.Run(context.Background(), map[string]any{"price": 21})
+	state, err := driver.Run(context.Background(), engine, map[string]any{"price": 21})
 	if err != nil {
 		log.Fatal(err)
 	}

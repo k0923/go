@@ -61,9 +61,7 @@ func Open(ctx context.Context, path, scope string, codec Codec) (*Infrastructure
 	}
 	_, err = db.ExecContext(ctx, `
 CREATE TABLE IF NOT EXISTS dflow_runs (
- scope TEXT PRIMARY KEY, state BLOB, version INTEGER NOT NULL DEFAULT 0,
- generation INTEGER NOT NULL DEFAULT 0, lease_key TEXT NOT NULL DEFAULT '',
- expires INTEGER NOT NULL DEFAULT 0
+ scope TEXT PRIMARY KEY, state BLOB, version INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS dflow_waits (
  scope TEXT NOT NULL, node TEXT NOT NULL, token TEXT NOT NULL, response BLOB,
@@ -72,6 +70,7 @@ CREATE TABLE IF NOT EXISTS dflow_waits (
 CREATE TABLE IF NOT EXISTS dflow_nodes (
  scope TEXT NOT NULL, node TEXT NOT NULL, state BLOB NOT NULL,
  ready INTEGER NOT NULL, status TEXT NOT NULL, generation INTEGER NOT NULL,
+ lease_expires INTEGER NOT NULL DEFAULT 0,
  PRIMARY KEY(scope,node)
 );
 CREATE INDEX IF NOT EXISTS dflow_nodes_ready ON dflow_nodes(scope,ready,status,generation);
@@ -89,6 +88,9 @@ CREATE TABLE IF NOT EXISTS dflow_outbox (
 CREATE INDEX IF NOT EXISTS dflow_outbox_scope ON dflow_outbox(scope,id);
 `)
 	if err == nil {
+		err = addNodeLeaseColumn(ctx, db)
+	}
+	if err == nil {
 		_, err = db.ExecContext(ctx, `INSERT OR IGNORE INTO dflow_runs(scope) VALUES (?)`, scope)
 	}
 	if err != nil {
@@ -96,6 +98,18 @@ CREATE INDEX IF NOT EXISTS dflow_outbox_scope ON dflow_outbox(scope,id);
 		return nil, err
 	}
 	return &Infrastructure{db: db, scope: scope, codec: codec}, nil
+}
+
+// addNodeLeaseColumn upgrades databases created before per-node leases. The
+// former run-lease columns of dflow_runs are left in place and ignored.
+func addNodeLeaseColumn(ctx context.Context, db *sql.DB) error {
+	var present int
+	err := db.QueryRowContext(ctx, `SELECT count(*) FROM pragma_table_info('dflow_nodes') WHERE name='lease_expires'`).Scan(&present)
+	if err != nil || present != 0 {
+		return err
+	}
+	_, err = db.ExecContext(ctx, `ALTER TABLE dflow_nodes ADD COLUMN lease_expires INTEGER NOT NULL DEFAULT 0`)
+	return err
 }
 
 func (i *Infrastructure) Close() error { return i.db.Close() }
@@ -112,32 +126,14 @@ func (i *Infrastructure) transaction(ctx context.Context, fn func(*sql.Tx) error
 	return tx.Commit()
 }
 
-func (i *Infrastructure) Claim(ctx context.Context, key string, ttl time.Duration) (*lease.Token, error) {
-	if key != "dflow/run" || ttl <= 0 {
-		return nil, lease.ErrInvalid
-	}
-	now := time.Now()
-	token := &lease.Token{Key: key, ExpiresAt: now.Add(ttl)}
-	err := i.db.QueryRowContext(ctx, `UPDATE dflow_runs
-SET generation=generation+1,lease_key=?,expires=? WHERE scope=? AND expires<=? RETURNING generation`,
-		key, token.ExpiresAt.UnixNano(), i.scope, now.UnixNano()).Scan(&token.Generation)
-	if errors.Is(err, sql.ErrNoRows) {
-		return nil, lease.ErrConflict
-	}
-	if err != nil {
-		return nil, err
-	}
-	return token, nil
-}
-
-func (i *Infrastructure) Renew(ctx context.Context, token lease.Token, ttl time.Duration) (*lease.Token, error) {
+func (i *Infrastructure) RenewNode(ctx context.Context, token lease.Token, ttl time.Duration) (*lease.Token, error) {
 	if ttl <= 0 {
 		return nil, lease.ErrInvalid
 	}
 	now := time.Now()
 	token.ExpiresAt = now.Add(ttl)
-	result, err := i.db.ExecContext(ctx, `UPDATE dflow_runs SET expires=?
-WHERE scope=? AND lease_key=? AND generation=? AND expires>?`,
+	result, err := i.db.ExecContext(ctx, `UPDATE dflow_nodes SET lease_expires=?
+WHERE scope=? AND node=? AND generation=? AND lease_expires>?`,
 		token.ExpiresAt.UnixNano(), i.scope, token.Key, token.Generation, now.UnixNano())
 	if err := affected(result, err, lease.ErrConflict); err != nil {
 		return nil, err
@@ -145,9 +141,9 @@ WHERE scope=? AND lease_key=? AND generation=? AND expires>?`,
 	return &token, nil
 }
 
-func (i *Infrastructure) Release(ctx context.Context, token lease.Token) error {
-	result, err := i.db.ExecContext(ctx, `UPDATE dflow_runs SET expires=0,lease_key=''
-WHERE scope=? AND lease_key=? AND generation=?`, i.scope, token.Key, token.Generation)
+func (i *Infrastructure) ReleaseNode(ctx context.Context, token lease.Token) error {
+	result, err := i.db.ExecContext(ctx, `UPDATE dflow_nodes SET lease_expires=0
+WHERE scope=? AND node=? AND generation=? AND lease_expires<>0`, i.scope, token.Key, token.Generation)
 	return affected(result, err, lease.ErrConflict)
 }
 
@@ -165,14 +161,19 @@ func affected(result sql.Result, err, conflict error) error {
 	return nil
 }
 
-func (i *Infrastructure) checkLease(ctx context.Context, tx *sql.Tx, token lease.Token) error {
+// checkNodeLease fences a writer inside tx: the node generation must match the
+// token and the stored lease must not have expired.
+func (i *Infrastructure) checkNodeLease(ctx context.Context, tx *sql.Tx, token lease.Token) error {
 	var generation, expires int64
-	var key string
-	if err := tx.QueryRowContext(ctx, `SELECT generation,lease_key,expires FROM dflow_runs WHERE scope=?`,
-		i.scope).Scan(&generation, &key, &expires); err != nil {
+	err := tx.QueryRowContext(ctx, `SELECT generation,lease_expires FROM dflow_nodes WHERE scope=? AND node=?`,
+		i.scope, token.Key).Scan(&generation, &expires)
+	if errors.Is(err, sql.ErrNoRows) {
+		return lease.ErrConflict
+	}
+	if err != nil {
 		return err
 	}
-	if generation != token.Generation || key != token.Key || expires <= time.Now().UnixNano() {
+	if generation != token.Generation || expires <= time.Now().UnixNano() {
 		return lease.ErrConflict
 	}
 	return nil

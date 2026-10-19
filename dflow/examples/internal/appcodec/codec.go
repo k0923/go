@@ -7,6 +7,7 @@ import (
 	"encoding/gob"
 
 	"github.com/k0923/go/dflow"
+	"github.com/k0923/go/dflow/childflow"
 )
 
 type Codec struct{}
@@ -30,12 +31,12 @@ func init() {
 	gob.Register(map[string]any{})
 	gob.Register([]any{})
 	gob.Register(&dflow.EndNode{})
-	gob.Register(&dflow.LoopNode{})
+	gob.Register(&childflow.LoopNode{})
 	gob.Register(dflow.ConstantParameter{})
 	gob.Register(dflow.ReferenceParameter{})
 	gob.Register(dflow.TemplateParameter{})
 	gob.Register(&dflow.ValueSuspension{})
-	gob.Register(&dflow.ChildSuspension{})
-	gob.Register(&dflow.LoopSuspension{})
-	gob.Register(dflow.ChildResponse{})
+	gob.Register(&childflow.ChildSuspension{})
+	gob.Register(&childflow.LoopSuspension{})
+	gob.Register(childflow.ChildResponse{})
 }

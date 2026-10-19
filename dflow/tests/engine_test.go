@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/k0923/go/dflow"
+	"github.com/k0923/go/dflow/driver"
 	"github.com/k0923/go/dflow/memory"
 	"github.com/k0923/go/lease"
 )
@@ -19,14 +20,20 @@ type observedEngine struct {
 }
 
 func (e *observedEngine) Run(ctx context.Context, input map[string]any) (*dflow.State, error) {
-	_, err := e.Engine.Run(ctx, input)
+	_, err := driver.Run(ctx, e.Engine, input)
 	state, readErr := e.store.Load(context.WithoutCancel(ctx))
 	return state, errors.Join(err, readErr)
 }
 func (e *observedEngine) Drain(ctx context.Context) (*dflow.State, error) {
-	_, err := e.Engine.Drain(ctx)
+	_, err := driver.Drain(ctx, e.Engine)
 	state, readErr := e.store.Load(context.WithoutCancel(ctx))
 	return state, errors.Join(err, readErr)
+}
+
+// ResumeNode mirrors the old engine helper by driving through the reference
+// driver: the returned State contains only nodes this resume touched.
+func (e *observedEngine) ResumeNode(ctx context.Context, nodeID, token string, response ...any) (*dflow.State, error) {
+	return driver.Resume(ctx, e.Engine, nodeID, token, response...)
 }
 func engine(t *testing.T, def dflow.Definition, registry testRegistry, infra dflow.Infrastructure, options dflow.Options) *observedEngine {
 	t.Helper()
@@ -206,78 +213,48 @@ func TestBranchSkipAndMerge(t *testing.T) {
 	}
 }
 
-func TestConcurrentFanoutWaitsForAllPredecessors(t *testing.T) {
+func TestSerialFanoutWaitsForAllPredecessors(t *testing.T) {
 	registry := testRegistry{}
-	started := make(chan struct{}, 2)
-	release := make(chan struct{})
-	register(t, registry, "wait", func(ctx context.Context, input map[string]any) (dflow.Result, error) {
-		started <- struct{}{}
-		select {
-		case <-release:
-		case <-ctx.Done():
-			return dflow.Result{}, ctx.Err()
-		}
-		return dflow.Result{Output: input}, nil
+	var order atomic.Int32
+	register(t, registry, "mark", func(ctx context.Context, input map[string]any) (dflow.Result, error) {
+		return dflow.Result{Output: int(order.Add(1))}, nil
 	})
 	def := dflow.Definition{
 		Nodes: []dflow.NodeSpec{
-			{ID: "a", Node: namedNode("wait"), Inputs: dflow.Parameters{"value": dflow.Constant(1)}},
-			{ID: "b", Node: namedNode("wait"), Inputs: dflow.Parameters{"value": dflow.Constant(2)}},
-			{ID: "join", Node: &dflow.EndNode{}, Inputs: dflow.Parameters{"a": dflow.Ref("a", "value"), "b": dflow.Ref("b", "value")}},
+			{ID: "a", Node: namedNode("mark")},
+			{ID: "b", Node: namedNode("mark")},
+			{ID: "join", Node: &dflow.EndNode{}, Inputs: dflow.Parameters{"a": dflow.Ref("a"), "b": dflow.Ref("b")}},
 		},
 		Edges: []dflow.Edge{edge("a", "join"), edge("b", "join")},
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
-	e := engine(t, def, registry, memory.New(), dflow.Options{MaxConcurrency: 2})
-	done := make(chan error, 1)
-	go func() {
-		state, err := e.Run(ctx, nil)
-		if err == nil && (state.Nodes["join"].Output.(map[string]any)["a"] != 1 ||
-			state.Nodes["join"].Output.(map[string]any)["b"] != 2) {
-			err = errors.New("join has wrong inputs")
-		}
-		done <- err
-	}()
-	for range 2 {
-		select {
-		case <-started:
-		case <-ctx.Done():
-			t.Fatal("fanout did not start concurrently")
-		}
-	}
-	close(release)
-	if err := <-done; err != nil {
+	e := engine(t, def, registry, memory.New(), dflow.Options{})
+	state, err := e.Run(ctx, nil)
+	if err != nil {
 		t.Fatal(err)
+	}
+	// join runs only after both predecessors, and the driver never ran it twice.
+	out := state.Nodes["join"].Output.(map[string]any)
+	if state.Nodes["join"].Status != dflow.Succeeded || out["a"] == nil || out["b"] == nil {
+		t.Fatalf("join did not wait for both predecessors: %+v", state)
 	}
 }
 
-func TestRunLeaseAndCancellation(t *testing.T) {
+func TestNodeLeaseEndsWithCommit(t *testing.T) {
 	registry := testRegistry{}
-	started := make(chan struct{})
-	var exited atomic.Bool
-	register(t, registry, "wait", func(ctx context.Context, _ map[string]any) (dflow.Result, error) {
-		close(started)
-		<-ctx.Done()
-		exited.Store(true)
-		return dflow.Result{}, ctx.Err()
+	register(t, registry, "value", func(context.Context, map[string]any) (dflow.Result, error) {
+		return dflow.Result{Output: 1}, nil
 	})
-	e := engine(t, dflow.Definition{Nodes: []dflow.NodeSpec{{ID: "a", Node: namedNode("wait")}}}, registry, memory.New(), dflow.Options{})
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	defer cancel()
-	done := make(chan error, 1)
-	go func() { _, err := e.Run(ctx, nil); done <- err }()
-	select {
-	case <-started:
-	case <-ctx.Done():
-		t.Fatal("node not started")
+	infra := memory.New()
+	e := engine(t, dflow.Definition{Nodes: []dflow.NodeSpec{{ID: "a", Node: namedNode("value")}}}, registry, infra, dflow.Options{})
+	ctx := context.Background()
+	if _, err := e.Run(ctx, nil); err != nil {
+		t.Fatal(err)
 	}
-	if _, err := e.Run(context.Background(), nil); !errors.Is(err, lease.ErrConflict) {
-		t.Fatalf("second driver acquired occupied run: %v", err)
-	}
-	cancel()
-	if err := <-done; !errors.Is(err, context.Canceled) || !exited.Load() {
-		t.Fatalf("cancellation did not drain node: %v", err)
+	// Commit ends the node lease; a terminal node is never claimable again.
+	if task, err := infra.ClaimNode(ctx, "a", 30*time.Second); err != nil || task != nil {
+		t.Fatalf("terminal node claimed again: %+v %v", task, err)
 	}
 }
 
@@ -286,9 +263,9 @@ type failingSave struct {
 	fail atomic.Bool
 }
 
-func (s *failingSave) Commit(ctx context.Context, token lease.Token, commit dflow.NodeCommit) error {
+func (s *failingSave) Commit(ctx context.Context, token lease.Token, commit dflow.NodeCommit) ([]string, error) {
 	if commit.NodeID == "a" && commit.State.Status == dflow.Succeeded && s.fail.CompareAndSwap(true, false) {
-		return errors.New("storage unavailable")
+		return nil, errors.New("storage unavailable")
 	}
 	return s.Infrastructure.Commit(ctx, token, commit)
 }

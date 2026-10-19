@@ -4,9 +4,10 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/k0923/go/dflow"
-	"github.com/k0923/go/lease"
+	"github.com/k0923/go/dflow/driver"
 )
 
 type inputCounter struct {
@@ -44,11 +45,11 @@ func TestResumeNodeTargetsOneBranchAndReadsInputOnDemand(t *testing.T) {
 			},
 			Edges: []dflow.Edge{edge("a", "after")},
 		}, registry)
-		e, err := dflow.NewEngine(graph, counter, dflow.Options{MaxConcurrency: 1})
+		e, err := dflow.NewEngine(graph, counter, dflow.Options{})
 		if err != nil {
 			t.Fatal(err)
 		}
-		_, err = e.Run(ctx, map[string]any{"value": "original"})
+		_, err = driver.Run(ctx, e, map[string]any{"value": "original"})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -58,7 +59,7 @@ func TestResumeNodeTargetsOneBranchAndReadsInputOnDemand(t *testing.T) {
 			t.Fatal(err)
 		}
 		counter.reads = 0
-		state, err := e.ResumeNode(ctx, "a", a.Suspension.Token, "answer")
+		state, err := driver.Resume(ctx, e, "a", a.Suspension.Token, "answer")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -73,11 +74,11 @@ func TestResumeNodeTargetsOneBranchAndReadsInputOnDemand(t *testing.T) {
 		if counter.reads != 1 {
 			t.Fatal("resume read original input unnecessarily", counter.reads)
 		}
-		if state, err := e.ResumeNode(ctx, "a", a.Suspension.Token); err != nil || len(state.Nodes) != 0 {
+		if state, err := driver.Resume(ctx, e, "a", a.Suspension.Token); err != nil || len(state.Nodes) != 0 {
 			t.Fatal("duplicate resume executed work", state, err)
 		}
 		counter.reads = 0
-		state, err = e.ResumeNode(ctx, "b", b.Suspension.Token)
+		state, err = driver.Resume(ctx, e, "b", b.Suspension.Token)
 		if err != nil || state.Nodes["b"].Output != "other" || counter.reads != 0 {
 			t.Fatal("persisted wake needs no input read", state, err, counter.reads)
 		}
@@ -87,12 +88,7 @@ func TestResumeNodeTargetsOneBranchAndReadsInputOnDemand(t *testing.T) {
 func TestGetInputMissingNullAndArray(t *testing.T) {
 	backends(t, func(t *testing.T, infra dflow.Infrastructure) {
 		ctx := context.Background()
-		token, err := infra.Claim(ctx, "dflow/run", 30_000_000_000)
-		if err != nil {
-			t.Fatal(err)
-		}
-		defer infra.Release(ctx, *token)
-		err = infra.Initialize(ctx, *token, dflow.Manifest{Hash: "input"},
+		err := infra.Initialize(ctx, dflow.Manifest{Hash: "input"},
 			map[string]any{"items": []any{map[string]any{"value": "ok"}}, "null": nil})
 		if err != nil {
 			t.Fatal(err)
@@ -135,29 +131,35 @@ func TestResumeNodeDoesNotAcceptOldLoopToken(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		initial, err := e.Run(ctx, nil)
+		initial, err := driver.Run(ctx, e, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
 		old := initial.Nodes["wait"].Suspension.Token
-		if _, err := e.ResumeNode(ctx, "wait", old, nil); err != nil {
+		if _, err := driver.Resume(ctx, e, "wait", old, nil); err != nil {
 			t.Fatal(err)
 		}
 		current, _ := infra.GetNode(ctx, "wait")
 		if current.Suspension.Token == old {
 			t.Fatal("token did not change")
 		}
-		if state, err := e.ResumeNode(ctx, "wait", old, "late"); err != nil || len(state.Nodes) != 0 {
+		if state, err := driver.Resume(ctx, e, "wait", old, "late"); err != nil || len(state.Nodes) != 0 {
 			t.Fatal(state, err)
 		}
-		// A occupied execution lease is still enforced for targeted resume.
-		token, err := infra.Claim(ctx, "dflow/run", 30_000_000_000)
-		if err != nil {
+		// A live node lease held by another instance blocks the targeted resume:
+		// it drives nothing instead of executing Resume twice.
+		if accepted, err := e.Wakeup(ctx, "wait", current.Suspension.Token, "answer"); err != nil || !accepted {
+			t.Fatal(accepted, err)
+		}
+		task, err := infra.ClaimNode(ctx, "wait", 30*time.Second)
+		if err != nil || task == nil {
+			t.Fatal(task, err)
+		}
+		if state, err := driver.Resume(ctx, e, "wait", current.Suspension.Token); err != nil || len(state.Nodes) != 0 {
+			t.Fatal(state, err)
+		}
+		if err := infra.ReleaseNode(ctx, task.Lease); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := e.ResumeNode(ctx, "wait", current.Suspension.Token); !errors.Is(err, lease.ErrConflict) {
-			t.Fatal(err)
-		}
-		_ = infra.Release(ctx, *token)
 	})
 }

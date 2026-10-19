@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/k0923/go/dflow"
+	"github.com/k0923/go/dflow/driver"
 	"github.com/k0923/go/dflow/memory"
 )
 
@@ -49,7 +50,7 @@ func TestCustomParameterAndConcreteGoValues(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	state, err := engine.Run(context.Background(), nil)
+	state, err := driver.Run(context.Background(), engine, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -107,7 +108,7 @@ func TestImmutableParameterRenderingAndInputPaths(t *testing.T) {
 		t.Fatal(err)
 	}
 	engine, _ := dflow.NewEngine(graph, memory.New(), dflow.Options{})
-	state, err := engine.Run(context.Background(), map[string]any{"name": "{{unknown.secret}}"})
+	state, err := driver.Run(context.Background(), engine, map[string]any{"name": "{{unknown.secret}}"})
 	if err != nil {
 		t.Fatal(err)
 	}

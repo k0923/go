@@ -10,6 +10,7 @@ import (
 	"sync/atomic"
 
 	"github.com/k0923/go/dflow"
+	"github.com/k0923/go/dflow/childflow"
 )
 
 // These helpers adapt old fixture descriptions at the application boundary.
@@ -27,9 +28,9 @@ func configuredFixture(kind string, raw json.RawMessage) dflow.Node {
 	case "http":
 		node = &dflow.HTTPNode{}
 	case "loop":
-		node = &dflow.LoopNode{}
+		node = &childflow.LoopNode{}
 	case "subflow":
-		node = &dflow.SubflowNode{}
+		node = &childflow.SubflowNode{}
 	case "code":
 		var config dflow.CodeConfig
 		if err := json.Unmarshal(raw, &config); err != nil {
@@ -41,6 +42,15 @@ func configuredFixture(kind string, raw json.RawMessage) dflow.Node {
 		}
 		return code
 	}
+	if err := json.Unmarshal(raw, node); err != nil {
+		panic(err)
+	}
+	return node
+}
+
+// configuredLoop builds a childflow.LoopNode fixture from its JSON configuration.
+func configuredLoop(raw json.RawMessage) dflow.Node {
+	node := &childflow.LoopNode{}
 	if err := json.Unmarshal(raw, node); err != nil {
 		panic(err)
 	}
@@ -115,8 +125,8 @@ func init() {
 	gob.Register(dflow.ReferenceParameter{})
 	gob.Register(dflow.TemplateParameter{})
 	gob.Register(&dflow.ValueSuspension{})
-	gob.Register(&dflow.ChildSuspension{})
-	gob.Register(&dflow.LoopSuspension{})
-	gob.Register(dflow.ChildResponse{})
+	gob.Register(&childflow.ChildSuspension{})
+	gob.Register(&childflow.LoopSuspension{})
+	gob.Register(childflow.ChildResponse{})
 	gob.Register(&approvalSuspension{})
 }

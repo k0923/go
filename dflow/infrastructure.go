@@ -2,6 +2,7 @@ package dflow
 
 import (
 	"context"
+	"time"
 
 	"github.com/k0923/go/lease"
 )
@@ -53,42 +54,65 @@ type State struct {
 // Infrastructure is scoped by the business to one execution (RunID/TenantID are
 // not API parameters). All calls honor ctx. Implementations own serialization,
 // type reconstruction and snapshot isolation, and reject unsupported values.
+//
+// Execution ownership is per node, not per run: distinct nodes of one run may
+// execute concurrently on different goroutines or instances. A node lease is a
+// lease.Token whose Key is the node ID and whose Generation is the node's
+// attempt counter (NodeState.Generation). Storage validates the generation and
+// its OWN current expiry atomically; Token.ExpiresAt is only a receipt.
 type Infrastructure interface {
-	lease.Infrastructure
 	// Initialize binds hash/input and inserts ready roots atomically, or verifies
-	// an existing execution. It never resets node states. No workflow status.
-	Initialize(context.Context, lease.Token, Manifest, map[string]any) error
+	// an existing execution. It is idempotent and safe to call concurrently from
+	// several instances. It never resets node states. No workflow status.
+	Initialize(context.Context, Manifest, map[string]any) error
 	// GetInput returns an original input value by object/array path. Empty path
 	// selects the whole input. Missing paths return ErrMissingValue, null is valid.
 	GetInput(context.Context, ...string) (any, error)
 	GetNode(context.Context, string) (*NodeState, error)
-	// ClaimReady fences the lease, atomically selects one ready/recoverable node
-	// and marks it Running with the current generation/version. Running/failed
-	// nodes from a PREVIOUS generation may be retried; never twice per claim.
-	ClaimReady(context.Context, lease.Token) (*NodeTask, error)
-	// ClaimNode claims ONLY this node using the same readiness/fencing rules.
-	// Nil means blocked, terminal, or already claimed in this generation.
-	ClaimNode(context.Context, lease.Token, string) (*NodeTask, error)
-	// Commit fences lease + node version/generation. Atomically saves outcome,
-	// inserts suspension Request, records unique predecessor arrivals in targets,
-	// and creates readiness ONCE when the expected predecessor set is complete.
-	// No caller may overwrite an existing arrival with a different value.
-	// All changes roll back on error. Terminal nodes may not commit again.
-	Commit(context.Context, lease.Token, NodeCommit) error
+	// ReadyNodes lists the IDs of nodes that are drivable now, i.e. whose node
+	// lease is free or expired: freshly ready nodes, nodes left Running by a lost
+	// attempt, and Failed nodes a new round may retry. Nodes owned by a live lease
+	// (possibly on another instance) are omitted. It performs no claim.
+	ReadyNodes(context.Context) ([]string, error)
+	// ClaimNode is the pre-execution check and acquisition in one atomic step.
+	// It succeeds only when the node lease is free or expired AND the node is
+	// Ready, Running (left by a lost attempt) or Failed. It increments the node
+	// generation and version, marks it Running, and holds the lease for ttl.
+	// Nil means not drivable: pending, suspended, terminal, or owned by a live
+	// lease. ttl <= 0 returns lease.ErrInvalid.
+	ClaimNode(ctx context.Context, nodeID string, ttl time.Duration) (*NodeTask, error)
+	// RenewNode extends a live node lease. It returns lease.ErrConflict when the
+	// generation no longer matches or the stored lease already expired.
+	RenewNode(ctx context.Context, owner lease.Token, ttl time.Duration) (*lease.Token, error)
+	// ReleaseNode frees the lease so the node can be claimed again without
+	// waiting for expiry. A stale generation returns lease.ErrConflict.
+	ReleaseNode(ctx context.Context, owner lease.Token) error
+	// Commit fences the node lease (generation + current expiry, else
+	// lease.ErrConflict) and node version (else ErrConflict). Atomically saves
+	// outcome, inserts suspension Request, records unique predecessor arrivals in
+	// targets, and creates readiness ONCE when the expected predecessor set is
+	// complete, even when predecessors commit concurrently from different
+	// instances. No caller may overwrite an existing arrival with a different
+	// value. It returns the IDs of downstream nodes that became ready from THIS
+	// commit. All changes roll back on error. Terminal nodes may not commit again.
+	Commit(context.Context, lease.Token, NodeCommit) ([]string, error)
 	// GetResponse returns nil until a response is durably available.
 	// A delivered nil value is a non-nil *Response with Value == nil.
 	GetResponse(ctx context.Context, nodeID, suspensionToken string) (*Response, error)
 	// Resolve stores the first response AND a distinct Wake notification
-	// atomically, without acquiring the execution lease. Only the node's current
+	// atomically, without acquiring a node lease. Only the node's current
 	// suspension token may be resolved. Duplicate/stale callbacks return false.
 	// Unknown nodes/tokens return ErrWaitNotFound. Responses remain readable
-	// through Resume retries until the node's next outcome is committed.
+	// through Resume retries until the node's next outcome is committed. A resolved
+	// node becomes drivable again so the caller can drive its Resume.
 	Resolve(ctx context.Context, nodeID, suspensionToken string, value any) (bool, error)
 }
 
+// NodeTask is a claimed node. Lease authorizes RenewNode/ReleaseNode/Commit.
 type NodeTask struct {
 	NodeID string
 	State  NodeState
+	Lease  lease.Token
 }
 
 // Arrival carries only the target topology, not its executable configuration.

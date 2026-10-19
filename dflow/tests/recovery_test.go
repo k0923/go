@@ -36,36 +36,35 @@ func TestSQLiteConcurrentResolveAndFencing(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer right.Close()
-	old, err := left.Claim(ctx, "dflow/run", time.Minute)
-	if err != nil {
+	if err := right.Initialize(ctx, dflow.Manifest{Hash: "v1", Roots: []string{"node"}}, nil); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := right.Claim(ctx, "dflow/run", time.Minute); !errors.Is(err, lease.ErrConflict) {
-		t.Fatal("multiple owners", err)
+	if err := left.Initialize(ctx, dflow.Manifest{Hash: "v1", Roots: []string{"node"}}, nil); err != nil {
+		t.Fatal("concurrent initialize must be idempotent", err)
 	}
-	if err := left.Release(ctx, *old); err != nil {
+	old, err := left.ClaimNode(ctx, "node", time.Minute)
+	if err != nil || old == nil {
+		t.Fatal(old, err)
+	}
+	if task, err := right.ClaimNode(ctx, "node", time.Minute); err != nil || task != nil {
+		t.Fatal("multiple owners", task, err)
+	}
+	if err := left.ReleaseNode(ctx, old.Lease); err != nil {
 		t.Fatal(err)
 	}
-	current, err := right.Claim(ctx, "dflow/run", time.Minute)
-	if err != nil {
-		t.Fatal(err)
+	task, err := right.ClaimNode(ctx, "node", time.Minute)
+	if err != nil || task == nil {
+		t.Fatal(task, err)
 	}
 	state := suspendedSnapshot()
-	if err := right.Initialize(ctx, *current, dflow.Manifest{Hash: "v1", Roots: []string{"node"}}, nil); err != nil {
-		t.Fatal(err)
-	}
-	task, err := right.ClaimReady(ctx, *current)
-	if err != nil {
-		t.Fatal(err)
-	}
 	commit := dflow.NodeCommit{NodeID: "node", ExpectedVersion: task.State.Version, State: state.Nodes["node"]}
-	if err := left.Commit(ctx, *old, commit); !errors.Is(err, lease.ErrConflict) {
+	if _, err := left.Commit(ctx, old.Lease, commit); !errors.Is(err, lease.ErrConflict) {
 		t.Fatal("stale writer accepted", err)
 	}
-	if err := right.Commit(ctx, *current, commit); err != nil {
+	if _, err := right.Commit(ctx, task.Lease, commit); err != nil {
 		t.Fatal(err)
 	}
-	if err := right.Commit(ctx, *current, commit); !errors.Is(err, dflow.ErrConflict) {
+	if _, err := right.Commit(ctx, task.Lease, commit); !errors.Is(err, dflow.ErrConflict) {
 		t.Fatal("stale snapshot accepted", err)
 	}
 	type response struct {
@@ -90,7 +89,7 @@ func TestSQLiteConcurrentResolveAndFencing(t *testing.T) {
 		}
 	}
 	// An old snapshot saved after callback arrival must not overwrite it.
-	if err := right.Commit(ctx, *current, commit); !errors.Is(err, dflow.ErrConflict) {
+	if _, err := right.Commit(ctx, task.Lease, commit); !errors.Is(err, dflow.ErrConflict) {
 		t.Fatal(err)
 	}
 	messages, err := left.Pending(ctx)
@@ -130,24 +129,20 @@ func TestSQLiteOutboxFailuresRollbackNodeState(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer db.Close()
-	token, err := store.Claim(ctx, "dflow/run", time.Minute)
-	if err != nil {
-		t.Fatal(err)
-	}
 	if _, err := db.Exec(`CREATE TRIGGER reject_notification BEFORE INSERT ON dflow_outbox
 BEGIN SELECT RAISE(ABORT, 'injected outbox failure'); END`); err != nil {
 		t.Fatal(err)
 	}
 	state := suspendedSnapshot()
-	if err := store.Initialize(ctx, *token, dflow.Manifest{Hash: "v1", Roots: []string{"node"}}, nil); err != nil {
+	if err := store.Initialize(ctx, dflow.Manifest{Hash: "v1", Roots: []string{"node"}}, nil); err != nil {
 		t.Fatal(err)
 	}
-	task, err := store.ClaimReady(ctx, *token)
+	task, err := store.ClaimNode(ctx, "node", time.Minute)
 	if err != nil {
 		t.Fatal(err)
 	}
 	commit := dflow.NodeCommit{NodeID: "node", ExpectedVersion: task.State.Version, State: state.Nodes["node"]}
-	if err := store.Commit(ctx, *token, commit); err == nil {
+	if _, err := store.Commit(ctx, task.Lease, commit); err == nil {
 		t.Fatal("expected request notification failure")
 	}
 	if loaded, err := store.GetNode(ctx, "node"); err != nil || loaded.Status != dflow.Running {
@@ -159,7 +154,7 @@ BEGIN SELECT RAISE(ABORT, 'injected outbox failure'); END`); err != nil {
 	if _, err := db.Exec(`DROP TRIGGER reject_notification`); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.Commit(ctx, *token, commit); err != nil {
+	if _, err := store.Commit(ctx, task.Lease, commit); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := db.Exec(`CREATE TRIGGER reject_notification BEFORE INSERT ON dflow_outbox
@@ -179,14 +174,15 @@ BEGIN SELECT RAISE(ABORT, 'injected wake failure'); END`); err != nil {
 // can return and before lease cleanup. Simulates uncertain commit on process loss.
 type crashAfterSuspend struct{ *sqlite.Infrastructure }
 
-func (s *crashAfterSuspend) Commit(ctx context.Context, token lease.Token, commit dflow.NodeCommit) error {
-	if err := s.Infrastructure.Commit(ctx, token, commit); err != nil {
-		return err
+func (s *crashAfterSuspend) Commit(ctx context.Context, token lease.Token, commit dflow.NodeCommit) ([]string, error) {
+	ready, err := s.Infrastructure.Commit(ctx, token, commit)
+	if err != nil {
+		return nil, err
 	}
 	if commit.NodeID == "wait" && commit.State.Status == dflow.Suspended {
 		os.Exit(23)
 	}
-	return nil
+	return ready, nil
 }
 
 func crashDefinition() dflow.Definition {
@@ -287,6 +283,8 @@ func TestSQLiteCrashRecovery(t *testing.T) {
 	}
 }
 
+// driveAfterLeaseExpires polls until the node lease left by a crashed attempt
+// expires: until then the node is owned by a live lease and drives nothing.
 func driveAfterLeaseExpires(t *testing.T, e *observedEngine) *dflow.State {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -295,11 +293,11 @@ func driveAfterLeaseExpires(t *testing.T, e *observedEngine) *dflow.State {
 	defer ticker.Stop()
 	for {
 		state, err := e.Run(ctx, nil)
-		if err == nil {
-			return state
-		}
-		if !errors.Is(err, lease.ErrConflict) {
+		if err != nil {
 			t.Fatal(err)
+		}
+		if state.Nodes["end"].Status == dflow.Succeeded {
+			return state
 		}
 		select {
 		case <-ctx.Done():

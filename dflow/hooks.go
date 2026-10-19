@@ -14,8 +14,8 @@ import (
 // decisions, and the engine ignores any error a hook might imply.
 type Hooks struct {
 	// OnClaim fires after a node is claimed and marked Running, before input
-	// resolution. Attempt carries the driving lease generation, which advances
-	// on each recovery, so a rising Attempt for one node indicates retries.
+	// resolution. Attempt carries the node lease generation, which advances on
+	// each claim, so a rising Attempt for one node indicates retries/takeovers.
 	OnClaim func(context.Context, NodeEvent)
 	// OnStart fires immediately before Run or Resume is invoked. Resume reports
 	// IsResume true and carries the suspension token.

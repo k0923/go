@@ -1,4 +1,9 @@
-package dflow
+// Package childflow composes dflow executions: a parent node suspends with a
+// child invocation, and a dispatcher runs the child execution and resolves the
+// parent. It is built entirely on dflow's public API and the reference driver,
+// demonstrating that subflows and loops are business compositions, not engine
+// features. Copy or adapt it freely.
+package childflow
 
 import (
 	"context"
@@ -8,6 +13,8 @@ import (
 	"errors"
 	"fmt"
 
+	"github.com/k0923/go/dflow"
+	"github.com/k0923/go/dflow/driver"
 	"github.com/k0923/go/lease"
 )
 
@@ -30,7 +37,7 @@ func (n *ChildSuspension) ChildCall() ChildRequest { return n.ChildRequest }
 
 // ChildInvocation is shared by subflow and loop suspension payloads.
 type ChildInvocation interface {
-	Suspension
+	dflow.Suspension
 	ChildCall() ChildRequest
 }
 
@@ -57,7 +64,11 @@ func (c ChildExecution) ScopeKey() string {
 	return "dflow-child/" + hex.EncodeToString(hash[:])
 }
 
-type ChildBinder func(context.Context, ChildExecution) (*Engine, Infrastructure, error)
+// ChildBinder returns the child engine, its own run-scoped infrastructure and a
+// provider pinned to the requested publication. All three are usually created at
+// the call site from one storage handle, so returning them needs no engine
+// internals.
+type ChildBinder func(context.Context, ChildExecution) (*dflow.Engine, dflow.Infrastructure, dflow.DefinitionProvider, error)
 
 // ChildDispatcher handles ONE Request. The caller owns outbox polling/Ack and
 // resources returned by Bind. Handle returns false while the child is blocked;
@@ -70,60 +81,63 @@ type ChildDispatcher struct {
 	Bind ChildBinder
 }
 
-func (d ChildDispatcher) Handle(ctx context.Context, parent *Engine, parentScope string, notification Notification) (bool, error) {
-	if parent == nil || parentScope == "" || d.Bind == nil || notification.Kind != RequestNotification {
-		return false, fmt.Errorf("dflow: invalid child dispatch")
+// Handle drives one child invocation to resolution. parentInfra is the parent's
+// run-scoped infrastructure; parentEngine is used only to resolve the parent
+// suspension via Wakeup.
+func (d ChildDispatcher) Handle(ctx context.Context, parentEngine *dflow.Engine, parentInfra dflow.Infrastructure, parentScope string, notification dflow.Notification) (bool, error) {
+	if parentEngine == nil || parentInfra == nil || parentScope == "" || d.Bind == nil || notification.Kind != dflow.RequestNotification {
+		return false, fmt.Errorf("childflow: invalid child dispatch")
 	}
 	payload := notification.Request
-	if isNil(payload) {
-		return false, ErrInvalidSuspension
+	if payload == nil {
+		return false, dflow.ErrInvalidSuspension
 	}
 	call, ok := payload.(ChildInvocation)
 	if !ok {
-		return false, fmt.Errorf("dflow: suspension %q is not a child invocation", payload.Type())
+		return false, fmt.Errorf("childflow: suspension %q is not a child invocation", payload.Type())
 	}
 	request := call.ChildCall()
 	if request.Publication == "" || request.OutputNode == "" {
-		return false, fmt.Errorf("dflow: invalid child request")
+		return false, fmt.Errorf("childflow: invalid child request")
 	}
-	current, err := parent.infra.GetNode(ctx, notification.NodeID)
+	current, err := parentInfra.GetNode(ctx, notification.NodeID)
 	if err != nil {
 		return false, err
 	}
 	if current == nil || current.Suspension == nil || current.Suspension.Token != notification.Token {
 		return true, nil // Late request for an old suspension.
 	}
-	response, err := parent.infra.GetResponse(ctx, notification.NodeID, notification.Token)
+	response, err := parentInfra.GetResponse(ctx, notification.NodeID, notification.Token)
 	if err != nil {
 		return false, err
 	}
 	if response != nil {
 		return true, nil
 	}
-	child, store, err := d.Bind(ctx, ChildExecution{
+	child, store, provider, err := d.Bind(ctx, ChildExecution{
 		ParentScope: parentScope, NodeID: notification.NodeID, Token: notification.Token, Request: request,
 	})
 	if err != nil {
 		return false, err
 	}
-	if child == nil || isNil(store) {
-		return false, fmt.Errorf("dflow: child binder must return engine's own infrastructure")
+	if child == nil || store == nil || provider == nil {
+		return false, fmt.Errorf("childflow: binder must return engine, infrastructure and provider")
 	}
 	// Validate the return contract before starting, so a typo cannot leave the
 	// parent waiting forever for a node that is absent from the publication.
-	returnNode, err := child.definitions.LoadNode(ctx, request.OutputNode)
+	returnNode, err := provider.LoadNode(ctx, request.OutputNode)
 	if err != nil {
 		return false, err
 	}
 	if returnNode == nil || returnNode.Spec.ID != request.OutputNode {
-		return false, ErrInvalidDefinition
+		return false, dflow.ErrInvalidDefinition
 	}
-	_, driveErr := child.Run(ctx, request.Input)
+	_, driveErr := driver.Run(ctx, child, request.Input)
 	// Only an actual durable business node failure is returned to the parent.
 	// Infrastructure failures and uncertain commits must remain retryable.
 	if driveErr != nil {
-		var nodeErr *NodeError
-		var infraErr *InfrastructureError
+		var nodeErr *dflow.NodeError
+		var infraErr *dflow.InfrastructureError
 		var leaseErr *lease.Error
 		if errors.As(driveErr, &infraErr) || errors.As(driveErr, &leaseErr) ||
 			errors.Is(driveErr, context.Canceled) || errors.Is(driveErr, context.DeadlineExceeded) ||
@@ -134,24 +148,24 @@ func (d ChildDispatcher) Handle(ctx context.Context, parent *Engine, parentScope
 		if err != nil {
 			return false, err
 		}
-		if failed == nil || failed.Status != Failed {
+		if failed == nil || failed.Status != dflow.Failed {
 			return false, driveErr
 		}
-		_, err = parent.Wakeup(ctx, notification.NodeID, notification.Token, ChildResponse{Error: failed.Error})
+		_, err = parentEngine.Wakeup(ctx, notification.NodeID, notification.Token, ChildResponse{Error: failed.Error})
 		return err == nil, err
 	}
 	output, err := store.GetNode(ctx, request.OutputNode)
 	if err != nil {
 		return false, err
 	}
-	if output == nil || (output.Status != Succeeded && output.Status != Skipped && output.Status != Failed) {
+	if output == nil || (output.Status != dflow.Succeeded && output.Status != dflow.Skipped && output.Status != dflow.Failed) {
 		return false, nil
 	}
 	result := ChildResponse{Output: output.Output}
-	if output.Status != Succeeded {
+	if output.Status != dflow.Succeeded {
 		result.Error = fmt.Sprintf("child return node %q is %s: %s", request.OutputNode, output.Status, output.Error)
 	}
-	_, err = parent.Wakeup(ctx, notification.NodeID, notification.Token, result)
+	_, err = parentEngine.Wakeup(ctx, notification.NodeID, notification.Token, result)
 	return err == nil, err
 }
 

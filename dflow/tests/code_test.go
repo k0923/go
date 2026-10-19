@@ -88,47 +88,42 @@ func TestCodeRejectsInvalidResultsAndSupportsCancellation(t *testing.T) {
 func TestMemoryFencingAndVersionCAS(t *testing.T) {
 	ctx := context.Background()
 	infra := memory.New()
-	first, err := infra.Claim(ctx, "dflow/run", time.Minute)
-	if err != nil {
+	if err := infra.Initialize(ctx, dflow.Manifest{Hash: "v1", Roots: []string{"node"}}, nil); err != nil {
 		t.Fatal(err)
 	}
-	if err := infra.Initialize(ctx, *first, dflow.Manifest{Hash: "v1", Roots: []string{"node"}}, nil); err != nil {
+	first, err := infra.ClaimNode(ctx, "node", time.Minute)
+	if err != nil || first == nil {
+		t.Fatal(first, err)
+	}
+	if again, err := infra.ClaimNode(ctx, "node", time.Minute); err != nil || again != nil {
+		t.Fatal("live node lease claimed twice", again, err)
+	}
+	if err := infra.ReleaseNode(ctx, first.Lease); err != nil {
 		t.Fatal(err)
 	}
-	task, err := infra.ClaimReady(ctx, *first)
-	if err != nil {
-		t.Fatal(err)
+	second, err := infra.ClaimNode(ctx, "node", time.Minute)
+	if err != nil || second == nil {
+		t.Fatal(second, err)
 	}
-	if err := infra.Release(ctx, *first); err != nil {
-		t.Fatal(err)
+	if second.Lease.Generation <= first.Lease.Generation {
+		t.Fatal("node generation did not advance")
 	}
-	second, err := infra.Claim(ctx, "dflow/run", time.Minute)
-	if err != nil {
-		t.Fatal(err)
-	}
-	commit := dflow.NodeCommit{NodeID: "node", ExpectedVersion: task.State.Version, State: dflow.NodeState{Status: dflow.Succeeded}}
-	if err := infra.Commit(ctx, *first, commit); !errors.Is(err, lease.ErrConflict) {
+	commit := dflow.NodeCommit{NodeID: "node", ExpectedVersion: first.State.Version, State: dflow.NodeState{Status: dflow.Succeeded}}
+	if _, err := infra.Commit(ctx, first.Lease, commit); !errors.Is(err, lease.ErrConflict) {
 		t.Fatalf("stale owner accepted: %v", err)
 	}
-	if second.Generation <= first.Generation {
-		t.Fatal("lease generation did not advance")
+	if _, err := infra.Commit(ctx, second.Lease, commit); !errors.Is(err, dflow.ErrConflict) {
+		t.Fatal("old node version accepted", err)
 	}
-	if err := infra.Commit(ctx, *second, commit); !errors.Is(err, dflow.ErrConflict) {
-		t.Fatal("old node generation accepted", err)
-	}
-	task, err = infra.ClaimReady(ctx, *second)
-	if err != nil {
+	commit.ExpectedVersion = second.State.Version
+	if _, err := infra.Commit(ctx, second.Lease, commit); err != nil {
 		t.Fatal(err)
 	}
-	commit.ExpectedVersion = task.State.Version
-	if err := infra.Commit(ctx, *second, commit); err != nil {
-		t.Fatal(err)
-	}
-	if err := infra.Commit(ctx, *second, commit); !errors.Is(err, dflow.ErrConflict) {
+	if _, err := infra.Commit(ctx, second.Lease, commit); !errors.Is(err, dflow.ErrConflict) {
 		t.Fatal("duplicate terminal commit accepted", err)
 	}
 	loaded, err := infra.Load(ctx)
-	if err != nil || loaded.Nodes["node"].Version != task.State.Version+1 {
+	if err != nil || loaded.Nodes["node"].Version != second.State.Version+1 {
 		t.Fatalf("incorrect snapshot version: %+v %v", loaded, err)
 	}
 	loaded.Nodes["node"] = dflow.NodeState{Status: dflow.Failed}

@@ -8,6 +8,8 @@ import (
 	"log"
 
 	"github.com/k0923/go/dflow"
+	"github.com/k0923/go/dflow/childflow"
+	"github.com/k0923/go/dflow/driver"
 	"github.com/k0923/go/dflow/examples/internal/appcodec"
 	"github.com/k0923/go/dflow/sqlite"
 )
@@ -42,7 +44,7 @@ func main() {
 		parent, err := dflow.Compile(dflow.Definition{
 			Version: "1",
 			Nodes: []dflow.NodeSpec{{ID: "loop",
-				Node:   &dflow.LoopNode{Publication: "loop-body-v1", OutputNode: "out", Mode: "foreach", MaxIterations: 10},
+				Node:   &childflow.LoopNode{Publication: "loop-body-v1", OutputNode: "out", Mode: "foreach", MaxIterations: 10},
 				Inputs: dflow.Parameters{"items": dflow.Input("items")},
 			}},
 		})
@@ -57,7 +59,7 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	if _, err := parent.Run(ctx, map[string]any{"items": []any{"alpha", "beta", "gamma"}}); err != nil {
+	if _, err := driver.Run(ctx, parent, map[string]any{"items": []any{"alpha", "beta", "gamma"}}); err != nil {
 		log.Fatal(err)
 	}
 	var handles []*sqlite.Infrastructure
@@ -66,14 +68,15 @@ func main() {
 			_ = handle.Close()
 		}
 	}()
-	dispatcher := dflow.ChildDispatcher{Bind: func(ctx context.Context, call dflow.ChildExecution) (*dflow.Engine, dflow.Infrastructure, error) {
+	dispatcher := childflow.ChildDispatcher{Bind: func(ctx context.Context, call childflow.ChildExecution) (*dflow.Engine, dflow.Infrastructure, dflow.DefinitionProvider, error) {
 		childStore, err := sqlite.Open(ctx, *path, call.ScopeKey(), appcodec.Codec{})
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, nil, err
 		}
 		handles = append(handles, childStore)
-		child, err := dflow.NewEngineWithProvider(childStore.Provider(call.Request.Publication), childStore, dflow.Options{})
-		return child, childStore, err
+		provider := childStore.Provider(call.Request.Publication)
+		child, err := dflow.NewEngineWithProvider(provider, childStore, dflow.Options{})
+		return child, childStore, provider, err
 	}}
 	// This example's children are synchronous. Production dispatchers retain
 	// blocked requests, resume child scopes on Wake, then retry parent requests.
@@ -95,7 +98,7 @@ func main() {
 		for _, msg := range messages {
 			switch msg.Kind {
 			case dflow.RequestNotification:
-				complete, err := dispatcher.Handle(ctx, parent, *scope, msg)
+				complete, err := dispatcher.Handle(ctx, parent, store, *scope, msg)
 				if err != nil {
 					log.Fatal(err)
 				}
@@ -103,7 +106,7 @@ func main() {
 					continue
 				}
 			case dflow.WakeNotification:
-				if _, err := parent.ResumeNode(ctx, msg.NodeID, msg.Token); err != nil {
+				if _, err := driver.Resume(ctx, parent, msg.NodeID, msg.Token); err != nil {
 					log.Fatal(err)
 				}
 			default:

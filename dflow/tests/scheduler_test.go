@@ -9,7 +9,9 @@ import (
 	"time"
 
 	"github.com/k0923/go/dflow"
+	"github.com/k0923/go/dflow/driver"
 	"github.com/k0923/go/dflow/sqlite"
+	"github.com/k0923/go/lease"
 )
 
 type countedProvider struct {
@@ -56,7 +58,7 @@ func TestPersistedPublicationLazyResume(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	state, err := e.Run(ctx, nil)
+	state, err := driver.Run(ctx, e, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -81,7 +83,7 @@ func TestPersistedPublicationLazyResume(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	state, err = e.Drain(ctx)
+	state, err = driver.Drain(ctx, e)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -94,7 +96,7 @@ func TestPersistedPublicationLazyResume(t *testing.T) {
 	if state.Nodes["end"].Status != dflow.Succeeded {
 		t.Fatal(state)
 	}
-	if again, err := e.Drain(ctx); err != nil || len(again.Nodes) != 0 {
+	if again, err := driver.Drain(ctx, e); err != nil || len(again.Nodes) != 0 {
 		t.Fatal("terminal graph was reloaded", again, err)
 	}
 }
@@ -102,38 +104,42 @@ func TestPersistedPublicationLazyResume(t *testing.T) {
 func TestAtomicFanInAndDuplicateCommit(t *testing.T) {
 	backends(t, func(t *testing.T, infra dflow.Infrastructure) {
 		ctx := context.Background()
-		token, err := infra.Claim(ctx, "dflow/run", time.Minute)
+		if err := infra.Initialize(ctx, dflow.Manifest{Hash: "v1", Roots: []string{"a", "b"}}, nil); err != nil {
+			t.Fatal(err)
+		}
+		first, err := infra.ClaimNode(ctx, "a", time.Minute)
 		if err != nil {
 			t.Fatal(err)
 		}
-		if err := infra.Initialize(ctx, *token, dflow.Manifest{Hash: "v1", Roots: []string{"a", "b"}}, nil); err != nil {
-			t.Fatal(err)
-		}
-		first, err := infra.ClaimReady(ctx, *token)
-		if err != nil {
-			t.Fatal(err)
-		}
-		second, err := infra.ClaimReady(ctx, *token)
+		second, err := infra.ClaimNode(ctx, "b", time.Minute)
 		if err != nil {
 			t.Fatal(err)
 		}
 		if first == nil || second == nil || first.NodeID == second.NodeID {
 			t.Fatal(first, second)
 		}
-		commits := make(chan error, 2)
+		commits := make(chan []string, 2)
+		errs := make(chan error, 2)
 		for _, task := range []*dflow.NodeTask{first, second} {
 			go func() {
-				commits <- infra.Commit(ctx, *token, dflow.NodeCommit{
+				ready, err := infra.Commit(ctx, task.Lease, dflow.NodeCommit{
 					NodeID: task.NodeID, ExpectedVersion: task.State.Version,
 					State:    dflow.NodeState{Status: dflow.Succeeded},
 					Arrivals: []dflow.Arrival{{TargetNodeID: "join", Incoming: []string{"a", "b"}, Active: task.NodeID == "a"}},
 				})
+				commits <- ready
+				errs <- err
 			}()
 		}
+		reported := 0
 		for range 2 {
-			if err := <-commits; err != nil {
+			if err := <-errs; err != nil {
 				t.Fatal(err)
 			}
+			reported += len(<-commits)
+		}
+		if reported != 1 {
+			t.Fatal("join must be reported ready exactly once", reported)
 		}
 		join, err := infra.GetNode(ctx, "join")
 		if err != nil || !join.Ready || !join.Enabled || len(join.Incoming) != 2 {
@@ -141,14 +147,14 @@ func TestAtomicFanInAndDuplicateCommit(t *testing.T) {
 		}
 		var wg sync.WaitGroup
 		tasks := make(chan *dflow.NodeTask, 2)
-		errs := make(chan error, 2)
+		claimErrs := make(chan error, 2)
 		for range 2 {
-			wg.Go(func() { task, err := infra.ClaimReady(ctx, *token); tasks <- task; errs <- err })
+			wg.Go(func() { task, err := infra.ClaimNode(ctx, "join", time.Minute); tasks <- task; claimErrs <- err })
 		}
 		wg.Wait()
 		close(tasks)
-		close(errs)
-		for err := range errs {
+		close(claimErrs)
+		for err := range claimErrs {
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -165,7 +171,7 @@ func TestAtomicFanInAndDuplicateCommit(t *testing.T) {
 		if claimed != 1 {
 			t.Fatal("join claimed multiple times", claimed)
 		}
-		err = infra.Commit(ctx, *token, dflow.NodeCommit{
+		_, err = infra.Commit(ctx, first.Lease, dflow.NodeCommit{
 			NodeID: first.NodeID, ExpectedVersion: first.State.Version, State: dflow.NodeState{Status: dflow.Succeeded},
 			Arrivals: []dflow.Arrival{{TargetNodeID: "join", Incoming: []string{"a", "b"}, Active: true}},
 		})

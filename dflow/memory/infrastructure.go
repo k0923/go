@@ -15,74 +15,41 @@ import (
 var _ dflow.Infrastructure = (*Infrastructure)(nil)
 
 type Infrastructure struct {
-	mu         sync.Mutex
-	state      *dflow.State
-	generation int64
-	token      *lease.Token
-	responses  map[[2]string]*dflow.Response
-	outbox     map[int64]dflow.Notification
-	sequence   int64
+	mu        sync.Mutex
+	state     *dflow.State
+	leases    map[string]time.Time // node ID -> current lease expiry
+	responses map[[2]string]*dflow.Response
+	outbox    map[int64]dflow.Notification
+	sequence  int64
 }
 
-func New() *Infrastructure { return &Infrastructure{} }
+func New() *Infrastructure { return &Infrastructure{leases: map[string]time.Time{}} }
 
-func (i *Infrastructure) valid(token lease.Token) bool {
-	return i.token != nil && token.Key == i.token.Key && token.Generation == i.token.Generation && time.Now().Before(i.token.ExpiresAt)
+// owned reports whether token is the node's live lease. Caller holds mu.
+func (i *Infrastructure) owned(token lease.Token) bool {
+	if i.state == nil {
+		return false
+	}
+	node, ok := i.state.Nodes[token.Key]
+	expires, held := i.leases[token.Key]
+	return ok && held && node.Generation == token.Generation && time.Now().Before(expires)
 }
-func (i *Infrastructure) Claim(ctx context.Context, key string, ttl time.Duration) (*lease.Token, error) {
-	i.mu.Lock()
-	defer i.mu.Unlock()
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
-	if key != "dflow/run" || ttl <= 0 {
-		return nil, lease.ErrInvalid
-	}
-	if i.token != nil && time.Now().Before(i.token.ExpiresAt) {
-		return nil, lease.ErrConflict
-	}
-	i.generation++
-	token := lease.Token{Key: key, Generation: i.generation, ExpiresAt: time.Now().Add(ttl)}
-	i.token = &token
-	copy := token
-	return &copy, nil
+
+// leased reports whether a live lease currently owns the node. Caller holds mu.
+func (i *Infrastructure) leased(id string) bool {
+	expires, held := i.leases[id]
+	return held && time.Now().Before(expires)
 }
-func (i *Infrastructure) Renew(ctx context.Context, token lease.Token, ttl time.Duration) (*lease.Token, error) {
-	i.mu.Lock()
-	defer i.mu.Unlock()
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
-	if ttl <= 0 {
-		return nil, lease.ErrInvalid
-	}
-	if !i.valid(token) {
-		return nil, lease.ErrConflict
-	}
-	i.token.ExpiresAt = time.Now().Add(ttl)
-	copy := *i.token
-	return &copy, nil
+
+func drivable(node dflow.NodeState) bool {
+	return node.Ready || node.Status == dflow.Running || node.Status == dflow.Failed
 }
-func (i *Infrastructure) Release(ctx context.Context, token lease.Token) error {
+
+func (i *Infrastructure) Initialize(ctx context.Context, m dflow.Manifest, input map[string]any) error {
 	i.mu.Lock()
 	defer i.mu.Unlock()
 	if err := ctx.Err(); err != nil {
 		return err
-	}
-	if i.token == nil || token.Key != i.token.Key || token.Generation != i.token.Generation {
-		return lease.ErrConflict
-	}
-	i.token = nil
-	return nil
-}
-func (i *Infrastructure) Initialize(ctx context.Context, token lease.Token, m dflow.Manifest, input map[string]any) error {
-	i.mu.Lock()
-	defer i.mu.Unlock()
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-	if !i.valid(token) {
-		return lease.ErrConflict
 	}
 	if i.state != nil {
 		if i.state.DefinitionHash != m.Hash || !reflect.DeepEqual(i.state.Input, input) {
@@ -140,77 +107,124 @@ func (i *Infrastructure) GetNode(ctx context.Context, id string) (*dflow.NodeSta
 	copy, err := clone(node)
 	return &copy, err
 }
-func (i *Infrastructure) ClaimReady(ctx context.Context, token lease.Token) (*dflow.NodeTask, error) {
-	return i.claimNode(ctx, token, "")
-}
-func (i *Infrastructure) ClaimNode(ctx context.Context, token lease.Token, id string) (*dflow.NodeTask, error) {
-	if id == "" {
-		return nil, dflow.ErrInvalidDefinition
-	}
-	return i.claimNode(ctx, token, id)
-}
-func (i *Infrastructure) claimNode(ctx context.Context, token lease.Token, only string) (*dflow.NodeTask, error) {
+
+// ReadyNodes lists drivable node IDs not owned by a live lease: freshly ready
+// nodes, nodes left Running by a lost attempt, and Failed nodes a new run may
+// retry. The driver stops the current sweep on the first failure (fail-fast);
+// retrying is a deliberate new Run/Drain by the business.
+func (i *Infrastructure) ReadyNodes(ctx context.Context) ([]string, error) {
 	i.mu.Lock()
 	defer i.mu.Unlock()
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	if !i.valid(token) {
-		return nil, lease.ErrConflict
+	if i.state == nil {
+		return nil, nil
+	}
+	var ready []string
+	for id, node := range i.state.Nodes {
+		if drivable(node) && !i.leased(id) {
+			ready = append(ready, id)
+		}
+	}
+	slices.Sort(ready)
+	return ready, nil
+}
+func (i *Infrastructure) ClaimNode(ctx context.Context, id string, ttl time.Duration) (*dflow.NodeTask, error) {
+	if id == "" {
+		return nil, dflow.ErrInvalidDefinition
+	}
+	if ttl <= 0 {
+		return nil, lease.ErrInvalid
+	}
+	i.mu.Lock()
+	defer i.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 	if i.state == nil {
 		return nil, nil
 	}
-	ids := make([]string, 0, len(i.state.Nodes))
-	for id := range i.state.Nodes {
-		if only != "" && id != only {
-			continue
-		}
-		ids = append(ids, id)
+	node, ok := i.state.Nodes[id]
+	if !ok || !drivable(node) || i.leased(id) {
+		return nil, nil
 	}
-	slices.Sort(ids)
-	for _, id := range ids {
-		node := i.state.Nodes[id]
-		retry := (node.Status == dflow.Running || node.Status == dflow.Failed) && node.Generation != token.Generation
-		if !node.Ready && !retry {
-			continue
-		}
-		if node.Status == dflow.Running && node.Generation == token.Generation {
-			continue
-		}
-		node.Status, node.Ready, node.Generation, node.Error = dflow.Running, false, token.Generation, ""
-		node.Version++
-		i.state.Nodes[id] = node
-		i.state.Version++
-		copy, err := clone(node)
-		return &dflow.NodeTask{NodeID: id, State: copy}, err
-	}
-	return nil, nil
+	expires := time.Now().Add(ttl)
+	node.Status, node.Ready, node.Error = dflow.Running, false, ""
+	node.Generation++
+	node.Version++
+	i.state.Nodes[id] = node
+	i.state.Version++
+	i.leases[id] = expires
+	copy, err := clone(node)
+	return &dflow.NodeTask{NodeID: id, State: copy, Lease: lease.Token{Key: id, Generation: node.Generation, ExpiresAt: expires}}, err
 }
-func (i *Infrastructure) Commit(ctx context.Context, token lease.Token, c dflow.NodeCommit) error {
+func (i *Infrastructure) RenewNode(ctx context.Context, token lease.Token, ttl time.Duration) (*lease.Token, error) {
+	if ttl <= 0 {
+		return nil, lease.ErrInvalid
+	}
+	i.mu.Lock()
+	defer i.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if !i.owned(token) {
+		return nil, lease.ErrConflict
+	}
+	token.ExpiresAt = time.Now().Add(ttl)
+	i.leases[token.Key] = token.ExpiresAt
+	return &token, nil
+}
+func (i *Infrastructure) ReleaseNode(ctx context.Context, token lease.Token) error {
 	i.mu.Lock()
 	defer i.mu.Unlock()
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if !i.valid(token) {
+	if i.state == nil || i.state.Nodes[token.Key].Generation != token.Generation {
 		return lease.ErrConflict
 	}
+	if _, held := i.leases[token.Key]; !held {
+		return lease.ErrConflict
+	}
+	delete(i.leases, token.Key)
+	return nil
+}
+func (i *Infrastructure) Commit(ctx context.Context, token lease.Token, c dflow.NodeCommit) ([]string, error) {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if i.state == nil || token.Key != c.NodeID {
+		return nil, lease.ErrConflict
+	}
 	current := i.state.Nodes[c.NodeID]
+	if current.Generation != token.Generation {
+		return nil, lease.ErrConflict // fenced: a newer attempt claimed the node
+	}
 	if err := dflow.ValidateCommit(current, c, token.Generation); err != nil {
-		return err
+		return nil, err
+	}
+	if !i.owned(token) {
+		return nil, lease.ErrConflict // lease expired or released
 	}
 	next, err := clone(c.State)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	targets := map[string]dflow.NodeState{}
+	var ready []string
 	for _, arrival := range c.Arrivals {
-		target, err := dflow.ApplyArrival(i.state.Nodes[arrival.TargetNodeID], c.NodeID, arrival)
+		previous := i.state.Nodes[arrival.TargetNodeID]
+		target, err := dflow.ApplyArrival(previous, c.NodeID, arrival)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		targets[arrival.TargetNodeID] = target
+		if target.Ready && !previous.Ready {
+			ready = append(ready, arrival.TargetNodeID)
+		}
 	}
 	var request dflow.Suspension
 	newWait := false
@@ -222,7 +236,7 @@ func (i *Infrastructure) Commit(ctx context.Context, token lease.Token, c dflow.
 		newWait = !exists
 		request, err = clone(next.Suspension.Payload)
 		if err != nil {
-			return err
+			return nil, err
 		}
 	}
 	next.Version = current.Version + 1
@@ -231,6 +245,7 @@ func (i *Infrastructure) Commit(ctx context.Context, token lease.Token, c dflow.
 	next.Ready = false
 	next.Enabled = current.Enabled
 	i.state.Nodes[c.NodeID] = next
+	delete(i.leases, c.NodeID) // the outcome ends this attempt's ownership
 	for id, target := range targets {
 		i.state.Nodes[id] = target
 	}
@@ -239,5 +254,6 @@ func (i *Infrastructure) Commit(ctx context.Context, token lease.Token, c dflow.
 		i.responses[[2]string{c.NodeID, next.Suspension.Token}] = nil
 		i.notify(dflow.Notification{Kind: dflow.RequestNotification, NodeID: c.NodeID, Token: next.Suspension.Token, Request: request})
 	}
-	return nil
+	slices.Sort(ready)
+	return ready, nil
 }

@@ -9,6 +9,8 @@ import (
 	"testing"
 
 	"github.com/k0923/go/dflow"
+	"github.com/k0923/go/dflow/childflow"
+	"github.com/k0923/go/dflow/driver"
 	"github.com/k0923/go/dflow/memory"
 	"github.com/k0923/go/dflow/sqlite"
 )
@@ -54,7 +56,7 @@ func TestSubflowSQLiteRestartAndDuplicateDelivery(t *testing.T) {
 		{ID: "out", Node: namedNode("echo"), Inputs: dflow.Parameters{"text": dflow.Input("text")}},
 	}}, registry)
 	parentGraph := compile(t, dflow.Definition{Nodes: []dflow.NodeSpec{
-		{ID: "call", Node: &dflow.SubflowNode{Publication: "child-v1", OutputNode: "out"},
+		{ID: "call", Node: &childflow.SubflowNode{Publication: "child-v1", OutputNode: "out"},
 			Inputs: dflow.Parameters{"text": dflow.Input("text")}},
 	}}, registry)
 	if _, err := store.Publish(ctx, "child-v1", child); err != nil {
@@ -64,21 +66,22 @@ func TestSubflowSQLiteRestartAndDuplicateDelivery(t *testing.T) {
 		t.Fatal(err)
 	}
 	parent, _ := dflow.NewEngineWithProvider(store.Provider("parent-v1"), store, dflow.Options{})
-	if _, err := parent.Run(ctx, map[string]any{"text": "hello"}); err != nil {
+	if _, err := driver.Run(ctx, parent, map[string]any{"text": "hello"}); err != nil {
 		t.Fatal(err)
 	}
 	request := childRequests(t, store)[0]
 	var opened []*sqlite.Infrastructure
-	dispatcher := dflow.ChildDispatcher{Bind: func(ctx context.Context, call dflow.ChildExecution) (*dflow.Engine, dflow.Infrastructure, error) {
+	dispatcher := childflow.ChildDispatcher{Bind: func(ctx context.Context, call childflow.ChildExecution) (*dflow.Engine, dflow.Infrastructure, dflow.DefinitionProvider, error) {
 		childStore, err := sqlite.Open(ctx, path, call.ScopeKey(), fixtureCodec{})
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, nil, err
 		}
 		opened = append(opened, childStore)
-		engine, err := dflow.NewEngineWithProvider(childStore.Provider(call.Request.Publication), childStore, dflow.Options{})
-		return engine, childStore, err
+		provider := childStore.Provider(call.Request.Publication)
+		engine, err := dflow.NewEngineWithProvider(provider, childStore, dflow.Options{})
+		return engine, childStore, provider, err
 	}}
-	if complete, err := dispatcher.Handle(ctx, parent, "parent", request); err != nil || !complete {
+	if complete, err := dispatcher.Handle(ctx, parent, store, "parent", request); err != nil || !complete {
 		t.Fatal(complete, err)
 	}
 	for _, childStore := range opened {
@@ -96,17 +99,17 @@ func TestSubflowSQLiteRestartAndDuplicateDelivery(t *testing.T) {
 	defer store.Close()
 	parent, _ = dflow.NewEngineWithProvider(store.Provider("parent-v1"), store, dflow.Options{})
 	// Callback committed but parent not resumed; request re-delivery must not restart child.
-	if complete, err := dispatcher.Handle(ctx, parent, "parent", request); err != nil || !complete || calls.Load() != 1 {
+	if complete, err := dispatcher.Handle(ctx, parent, store, "parent", request); err != nil || !complete || calls.Load() != 1 {
 		t.Fatal(complete, err, calls.Load())
 	}
-	if _, err := parent.Drain(ctx); err != nil {
+	if _, err := driver.Drain(ctx, parent); err != nil {
 		t.Fatal(err)
 	}
 	node, _ := store.GetNode(ctx, "call")
 	if node.Status != dflow.Succeeded || node.Output.(map[string]any)["text"] != "hello" {
 		t.Fatal(node)
 	}
-	if complete, err := dispatcher.Handle(ctx, parent, "parent", request); err != nil || !complete {
+	if complete, err := dispatcher.Handle(ctx, parent, store, "parent", request); err != nil || !complete {
 		t.Fatal("late request", complete, err)
 	}
 }
@@ -134,16 +137,16 @@ func TestChildSuspensionAndError(t *testing.T) {
 			childGraph = compile(t, dflow.Definition{Nodes: []dflow.NodeSpec{{ID: "out", Node: namedNode("custom")}}}, registry)
 		}
 		parentGraph := compile(t, dflow.Definition{Nodes: []dflow.NodeSpec{
-			{ID: "call", Node: &dflow.SubflowNode{Publication: "child", OutputNode: "out"}},
+			{ID: "call", Node: &childflow.SubflowNode{Publication: "child", OutputNode: "out"}},
 		}}, registry)
 		parent, _ := dflow.NewEngine(parentGraph, parentStore, dflow.Options{})
 		child, _ := dflow.NewEngine(childGraph, childStore, dflow.Options{})
-		_, _ = parent.Run(context.Background(), nil)
+		_, _ = driver.Run(context.Background(), parent, nil)
 		request := childRequests(t, parentStore)[0]
-		dispatcher := dflow.ChildDispatcher{Bind: func(context.Context, dflow.ChildExecution) (*dflow.Engine, dflow.Infrastructure, error) {
-			return child, childStore, nil
+		dispatcher := childflow.ChildDispatcher{Bind: func(context.Context, childflow.ChildExecution) (*dflow.Engine, dflow.Infrastructure, dflow.DefinitionProvider, error) {
+			return child, childStore, childGraph, nil
 		}}
-		complete, err := dispatcher.Handle(context.Background(), parent, "parent", request)
+		complete, err := dispatcher.Handle(context.Background(), parent, parentStore, "parent", request)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -155,14 +158,14 @@ func TestChildSuspensionAndError(t *testing.T) {
 			if _, err := child.Wakeup(context.Background(), "out", node.Suspension.Token, "answer"); err != nil {
 				t.Fatal(err)
 			}
-			complete, err = dispatcher.Handle(context.Background(), parent, "parent", request)
+			complete, err = dispatcher.Handle(context.Background(), parent, parentStore, "parent", request)
 			if err != nil || !complete {
 				t.Fatal(complete, err)
 			}
 		} else if !complete {
 			t.Fatal("durable child failure not returned")
 		}
-		_, err = parent.Drain(context.Background())
+		_, err = driver.Drain(context.Background(), parent)
 		node, _ := parentStore.GetNode(context.Background(), "call")
 		if businessError {
 			if err == nil || node.Status != dflow.Failed {
@@ -189,37 +192,37 @@ func TestLoopReusesChildProtocol(t *testing.T) {
 			body := compile(t, dflow.Definition{Nodes: []dflow.NodeSpec{
 				{ID: "out", Node: namedNode("body"), Inputs: dflow.Parameters{"item": dflow.Input("item"), "value": dflow.Input("value")}},
 			}}, registry)
-			config, _ := json.Marshal(dflow.LoopNode{Publication: "body", OutputNode: "out", Mode: mode, MaxIterations: 3})
+			config, _ := json.Marshal(childflow.LoopNode{Publication: "body", OutputNode: "out", Mode: mode, MaxIterations: 3})
 			parentGraph := compile(t, dflow.Definition{Nodes: []dflow.NodeSpec{
-				{ID: "loop", Node: configuredFixture("loop", config), Inputs: dflow.Parameters{
+				{ID: "loop", Node: configuredLoop(config), Inputs: dflow.Parameters{
 					"items": dflow.Constant([]any{"a", "b", "c"}), "value": dflow.Constant(0),
 				}},
 			}}, registry)
 			parentStore := memory.New()
 			children := map[string]*memory.Infrastructure{}
-			dispatcher := dflow.ChildDispatcher{Bind: func(_ context.Context, call dflow.ChildExecution) (*dflow.Engine, dflow.Infrastructure, error) {
+			dispatcher := childflow.ChildDispatcher{Bind: func(_ context.Context, call childflow.ChildExecution) (*dflow.Engine, dflow.Infrastructure, dflow.DefinitionProvider, error) {
 				store := children[call.ScopeKey()]
 				if store == nil {
 					store = memory.New()
 					children[call.ScopeKey()] = store
 				}
 				child, err := dflow.NewEngine(body, store, dflow.Options{})
-				return child, store, err
+				return child, store, body, err
 			}}
 			parent, _ := dflow.NewEngine(parentGraph, parentStore, dflow.Options{})
-			_, _ = parent.Run(ctx, nil)
+			_, _ = driver.Run(ctx, parent, nil)
 			for iteration := 0; iteration < 3; iteration++ {
 				requests := childRequests(t, parentStore)
 				request := requests[len(requests)-1]
-				if complete, err := dispatcher.Handle(ctx, parent, "parent", request); err != nil || !complete {
+				if complete, err := dispatcher.Handle(ctx, parent, parentStore, "parent", request); err != nil || !complete {
 					t.Fatal(complete, err)
 				}
-				if complete, err := dispatcher.Handle(ctx, parent, "parent", request); err != nil || !complete {
+				if complete, err := dispatcher.Handle(ctx, parent, parentStore, "parent", request); err != nil || !complete {
 					t.Fatal("duplicate", complete, err)
 				}
 				// Recreate the parent engine each iteration: no local loop state survives.
 				parent, _ = dflow.NewEngine(parentGraph, parentStore, dflow.Options{})
-				if _, err := parent.Drain(ctx); err != nil {
+				if _, err := driver.Drain(ctx, parent); err != nil {
 					t.Fatal(err)
 				}
 			}
@@ -240,7 +243,7 @@ func TestLoopReusesChildProtocol(t *testing.T) {
 }
 
 func TestLoopEmptyAndLimit(t *testing.T) {
-	node := &dflow.LoopNode{Publication: "body", OutputNode: "out", MaxIterations: 1}
+	node := &childflow.LoopNode{Publication: "body", OutputNode: "out", MaxIterations: 1}
 	result, err := node.Run(context.Background(), map[string]any{"items": []any{}})
 	if err != nil || result.Suspend != nil || len(result.Output.([]any)) != 0 {
 		t.Fatal(result, err)
@@ -254,7 +257,7 @@ func TestLoopEmptyAndLimit(t *testing.T) {
 		t.Fatal(err)
 	}
 	_, err = node.Resume(context.Background(), map[string]any{"value": 0}, dflow.ResumeInput{
-		Suspension: result.Suspend, Response: dflow.ChildResponse{Output: map[string]any{"done": false, "value": 1}},
+		Suspension: result.Suspend, Response: childflow.ChildResponse{Output: map[string]any{"done": false, "value": 1}},
 	})
 	if err == nil {
 		t.Fatal("until iteration cap ignored")
