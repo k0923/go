@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"path/filepath"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -11,7 +12,6 @@ import (
 	"github.com/k0923/go/dflow"
 	"github.com/k0923/go/dflow/driver"
 	"github.com/k0923/go/dflow/sqlite"
-	"github.com/k0923/go/lease"
 )
 
 type countedProvider struct {
@@ -44,7 +44,7 @@ func TestPersistedPublicationLazyResume(t *testing.T) {
 	})
 	def := waitDefinition()
 	def.Nodes = append([]dflow.NodeSpec{{ID: "before", Node: &dflow.PassthroughNode{}}}, def.Nodes...)
-	def.Edges = append(def.Edges, edge("before", "wait"))
+	def.Edges = append([]dflow.Edge{edge("start", "before"), edge("before", "wait")}, def.Edges[1:]...)
 	graph, err := dflow.Compile(fixtureDefinition(def, registry))
 	if err != nil {
 		t.Fatal(err)
@@ -104,8 +104,23 @@ func TestPersistedPublicationLazyResume(t *testing.T) {
 func TestAtomicFanInAndDuplicateCommit(t *testing.T) {
 	backends(t, func(t *testing.T, infra dflow.Infrastructure) {
 		ctx := context.Background()
-		if err := infra.Initialize(ctx, dflow.Manifest{Hash: "v1", Roots: []string{"a", "b"}}, nil); err != nil {
+		if err := infra.Initialize(ctx, dflow.Manifest{Hash: "v1", Start: "start"}, nil); err != nil {
 			t.Fatal(err)
+		}
+		start, err := infra.ClaimNode(ctx, "start", time.Minute)
+		if err != nil || start == nil {
+			t.Fatal(start, err)
+		}
+		ready, err := infra.Commit(ctx, start.Lease, dflow.NodeCommit{
+			NodeID: start.NodeID, ExpectedVersion: start.State.Version,
+			State: dflow.NodeState{Status: dflow.Succeeded},
+			Arrivals: []dflow.Arrival{
+				{TargetNodeID: "a", Incoming: []string{"start"}, Active: true},
+				{TargetNodeID: "b", Incoming: []string{"start"}, Active: true},
+			},
+		})
+		if err != nil || !slices.Equal(ready, []string{"a", "b"}) {
+			t.Fatal(ready, err)
 		}
 		first, err := infra.ClaimNode(ctx, "a", time.Minute)
 		if err != nil {

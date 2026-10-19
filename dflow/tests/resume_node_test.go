@@ -37,13 +37,14 @@ func TestResumeNodeTargetsOneBranchAndReadsInputOnDemand(t *testing.T) {
 		})
 		graph := compile(t, dflow.Definition{
 			Nodes: []dflow.NodeSpec{
+				{ID: "start", Node: &dflow.StartNode{}},
 				{ID: "a", Node: namedNode("custom"), Inputs: dflow.Parameters{"saved": dflow.Input("value")}},
 				{ID: "b", Node: namedNode("custom"), Inputs: dflow.Parameters{"saved": dflow.Input("value")}},
 				{ID: "after", Node: &dflow.EndNode{}, Inputs: dflow.Parameters{
 					"text": dflow.PlainTemplate(`{{$input.value}} {{a}}`),
 				}},
 			},
-			Edges: []dflow.Edge{edge("a", "after")},
+			Edges: []dflow.Edge{edge("start", "a"), edge("start", "b"), edge("a", "after")},
 		}, registry)
 		e, err := dflow.NewEngine(graph, counter, dflow.Options{})
 		if err != nil {
@@ -88,7 +89,7 @@ func TestResumeNodeTargetsOneBranchAndReadsInputOnDemand(t *testing.T) {
 func TestGetInputMissingNullAndArray(t *testing.T) {
 	backends(t, func(t *testing.T, infra dflow.Infrastructure) {
 		ctx := context.Background()
-		err := infra.Initialize(ctx, dflow.Manifest{Hash: "input"},
+		err := infra.Initialize(ctx, dflow.Manifest{Hash: "input", Start: "start"},
 			map[string]any{"items": []any{map[string]any{"value": "ok"}}, "null": nil})
 		if err != nil {
 			t.Fatal(err)

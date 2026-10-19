@@ -11,16 +11,16 @@ import (
 	"github.com/k0923/go/dflow"
 )
 
-// Run starts (or verifies) the execution and drives every ready node to
+// Run starts (or verifies) the execution and drives from the unique start node to
 // quiescence, serially and in-process. The returned State contains only the
 // nodes this call touched, mirroring the engine's per-step reporting.
 func Run(ctx context.Context, e *dflow.Engine, input map[string]any) (*dflow.State, error) {
-	ready, err := e.Start(ctx, input)
+	start, err := e.Start(ctx, input)
 	if err != nil {
 		return nil, err
 	}
 	state := &dflow.State{Nodes: map[string]dflow.NodeState{}}
-	return state, driveToQuiescence(ctx, e, state, ready)
+	return state, driveToQuiescence(ctx, e, state, []string{start})
 }
 
 // Drain recovers drivable work after process loss and drives it to quiescence.

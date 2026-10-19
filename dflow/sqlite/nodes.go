@@ -62,10 +62,11 @@ func (i *Infrastructure) Initialize(ctx context.Context, m dflow.Manifest, input
 		if _, err := tx.ExecContext(ctx, `UPDATE dflow_runs SET state=?,version=1 WHERE scope=?`, raw, i.scope); err != nil {
 			return err
 		}
-		for _, id := range m.Roots {
-			if err := i.putNode(ctx, tx, id, dflow.NodeState{Version: 1, Status: dflow.Pending, Ready: true, Enabled: true}); err != nil {
-				return err
-			}
+		if m.Start == "" {
+			return dflow.ErrInvalidDefinition
+		}
+		if err := i.putNode(ctx, tx, m.Start, dflow.NodeState{Version: 1, Status: dflow.Pending, Ready: true, Enabled: true}); err != nil {
+			return err
 		}
 		return nil
 	})

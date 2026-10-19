@@ -81,8 +81,9 @@ func TestCompileRejectsInvalidGraphsAndReferences(t *testing.T) {
 			d.Nodes[0].Inputs = dflow.Parameters{"x": dflow.Ref("b")}
 		}, dflow.ErrInvalidReference},
 		{"sibling reference", func(d *dflow.Definition) {
-			d.Edges = nil
-			d.Nodes[1].Inputs = dflow.Parameters{"x": dflow.Ref("a")}
+			d.Nodes = append(d.Nodes, dflow.NodeSpec{ID: "c", Node: &dflow.PassthroughNode{}})
+			d.Edges = append(d.Edges, edge("a", "c"))
+			d.Nodes[1].Inputs = dflow.Parameters{"x": dflow.Ref("c")}
 		}, dflow.ErrInvalidReference},
 		{"hidden template reference", func(d *dflow.Definition) {
 			d.Nodes[0].Inputs = dflow.Parameters{"x": dflow.Template("{{ b.secret }}")}
@@ -221,11 +222,12 @@ func TestSerialFanoutWaitsForAllPredecessors(t *testing.T) {
 	})
 	def := dflow.Definition{
 		Nodes: []dflow.NodeSpec{
+			{ID: "start", Node: &dflow.StartNode{}},
 			{ID: "a", Node: namedNode("mark")},
 			{ID: "b", Node: namedNode("mark")},
 			{ID: "join", Node: &dflow.EndNode{}, Inputs: dflow.Parameters{"a": dflow.Ref("a"), "b": dflow.Ref("b")}},
 		},
-		Edges: []dflow.Edge{edge("a", "join"), edge("b", "join")},
+		Edges: []dflow.Edge{edge("start", "a"), edge("start", "b"), edge("a", "join"), edge("b", "join")},
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()

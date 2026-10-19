@@ -20,8 +20,9 @@ type Edge struct {
 	SourcePortID string `json:"sourcePortID,omitempty"`
 }
 
-// Definition supports multiple roots and sinks. All nodes participate in the run.
-// Version must change when application-provided node implementations change.
+// Definition has exactly one root/start node and may have multiple sinks. All
+// nodes participate in the run. Version must change when application-provided
+// node implementations change.
 type Definition struct {
 	Version string     `json:"version,omitempty"`
 	Nodes   []NodeSpec `json:"nodes"`
@@ -101,6 +102,15 @@ func Compile(definition Definition) (*Graph, error) {
 	if len(g.order) != len(def.Nodes) {
 		return fail("", "graph contains a cycle", ErrInvalidDefinition)
 	}
+	roots := 0
+	for _, id := range g.order {
+		if len(g.incoming[id]) == 0 {
+			roots++
+		}
+	}
+	if roots != 1 {
+		return fail("", "exactly one start node is required", ErrInvalidDefinition)
+	}
 	ancestors := map[string]map[string]bool{}
 	for _, id := range g.order {
 		ancestors[id] = map[string]bool{}
@@ -144,8 +154,8 @@ func Compile(definition Definition) (*Graph, error) {
 
 // Manifest is the small immutable header needed to start or recover execution.
 type Manifest struct {
-	Hash  string   `json:"hash"`
-	Roots []string `json:"roots"`
+	Hash  string `json:"hash"`
+	Start string `json:"start"`
 }
 
 // PublishedNode contains an executable node plus validated topology.
@@ -191,10 +201,11 @@ func (g *Graph) Manifest(ctx context.Context) (Manifest, error) {
 	m := Manifest{Hash: g.hash}
 	for _, id := range g.order {
 		if len(g.incoming[id]) == 0 {
-			m.Roots = append(m.Roots, id)
+			m.Start = id
+			return m, nil
 		}
 	}
-	return m, nil
+	return Manifest{}, ErrInvalidDefinition
 }
 
 func (g *Graph) LoadNode(ctx context.Context, id string) (*PublishedNode, error) {

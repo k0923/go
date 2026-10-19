@@ -36,10 +36,11 @@ func asyncRegistry(t *testing.T, node asyncNode) testRegistry {
 func waitDefinition() dflow.Definition {
 	return dflow.Definition{
 		Nodes: []dflow.NodeSpec{
+			{ID: "start", Node: &dflow.StartNode{}},
 			{ID: "wait", Node: namedNode("custom"), Inputs: dflow.Parameters{"original": dflow.Constant("input")}},
 			{ID: "end", Node: &dflow.EndNode{}, Inputs: dflow.Parameters{"value": dflow.Ref("wait")}},
 		},
-		Edges: []dflow.Edge{edge("wait", "end")},
+		Edges: []dflow.Edge{edge("start", "wait"), edge("wait", "end")},
 	}
 }
 
@@ -206,6 +207,7 @@ func TestEarlyResponseAndIndependentBranch(t *testing.T) {
 	}
 	def := waitDefinition()
 	def.Nodes = append(def.Nodes, dflow.NodeSpec{ID: "independent", Node: &dflow.PassthroughNode{}})
+	def.Edges = append(def.Edges, edge("start", "independent"))
 	for _, early := range []bool{false, true} {
 		var infra dflow.Infrastructure = memory.New()
 		if early {

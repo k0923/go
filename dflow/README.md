@@ -25,18 +25,18 @@ if err != nil { return err }
 engine, err := dflow.NewEngine(graph, memory.New(), dflow.Options{})
 if err != nil { return err }
 
-// 单步原语：Start 返回就绪根节点，Drive 执行一个节点并返回新就绪的下游。
-ready, err := engine.Start(ctx, map[string]any{"price": 21})
-for _, id := range ready {
-    executed, err := engine.Drive(ctx, id)
-    // executed.Ready 是本步新就绪的下游节点，交给业务继续驱动或入队。
-    _ = executed
-}
+// 单步原语：Start 返回唯一 start 节点，Drive 执行一个节点并返回新就绪的下游。
+start, err := engine.Start(ctx, map[string]any{"price": 21})
+if err != nil { return err }
+executed, err := engine.Drive(ctx, start)
+if err != nil { return err }
+// executed.Ready 是本步新就绪的下游节点，交给业务继续驱动或入队。
+_ = executed
 ```
 
 同进程把整张图驱动到静止，可直接用参考驱动包 [driver](driver/driver.go)：`driver.Run(ctx, engine, input)`、`driver.Drain(ctx, engine)`、`driver.Resume(ctx, engine, nodeID, token, response...)`。它只是对 `Start`/`Drive`/`Recover`/`Wakeup` 的串行 BFS 封装；生产系统可换成把就绪节点 ID 入队、多 worker 各自 `Drive`。
 
-`Compile` 校验节点非空、拓扑无环、边和 ID 唯一，以及输入引用是否来自祖先节点。配置实现 `NodeValidator.Validate() error` 时也会提前校验。`Definition.Version` 必填，业务必须在节点实现、参数或拓扑变化时更新版本；`Manifest.Hash` 使用该版本作为执行身份，不自动序列化定义计算 hash。
+`Compile` 校验节点非空、拓扑无环、边和 ID 唯一、全图只有一个 root/start 节点，以及输入引用是否来自祖先节点。配置实现 `NodeValidator.Validate() error` 时也会提前校验。`Definition.Version` 必填，业务必须在节点实现、参数或拓扑变化时更新版本；`Manifest.Hash` 使用该版本作为执行身份，不自动序列化定义计算 hash。
 
 `Graph` 可复用；节点配置和 Parameter 不可变，可能被多个执行并发使用。业务依赖直接注入节点。函数节点可直接使用 `NodeFunc`。
 
@@ -126,7 +126,7 @@ Infrastructure 绑定一个业务执行 scope，不在每个方法中传递 RunI
 - 原子保存首次响应和独立 Wake 通知。
 - 存储编码、具体类型恢复和快照隔离；不支持的值应返回错误。
 
-`Start` 幂等地初始化或校验已有执行并返回就绪根节点，多实例并发调用安全；`Drive` 执行一个节点、持久化结果并返回新就绪的下游；`Recover` 不重新初始化地列出当前可驱动且未被有效租约占用的节点（就绪、租约过期的 Running、以及可被新一轮重试的 Failed）用于进程恢复；`Wakeup` 保存回调。Engine 只按需读取节点和原输入路径，不加载整份状态或定义。`Executed.Ready` 和 `Recover` 只报告可驱动的节点 ID；驱动与排程由业务完成。失败即终态，当前驱动据此停止；是否重试由业务发起新一轮 `Start`/`Drive`/`Recover` 决定。
+`Start` 幂等地初始化或校验已有执行并返回唯一 start 节点 ID，多实例并发调用安全；`Drive` 执行一个节点、持久化结果并返回新就绪的下游；`Recover` 不重新初始化地列出当前可驱动且未被有效租约占用的节点（就绪、租约过期的 Running、以及可被新一轮重试的 Failed）用于进程恢复；`Wakeup` 保存回调。Engine 只按需读取节点和原输入路径，不加载整份状态或定义。`Executed.Ready` 和 `Recover` 只报告可驱动的节点 ID；驱动与排程由业务完成。失败即终态，当前驱动据此停止；是否重试由业务发起新一轮 `Start`/`Drive`/`Recover` 决定。
 
 没有工作流整体 Status。业务通过 `GetNode` 或可选 `SnapshotReader.Load` 判断完成条件。`Options` 控制节点超时（默认 5 分钟）、节点租约选项和可观测性 `Hooks`。
 

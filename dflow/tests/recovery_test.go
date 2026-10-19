@@ -36,10 +36,10 @@ func TestSQLiteConcurrentResolveAndFencing(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer right.Close()
-	if err := right.Initialize(ctx, dflow.Manifest{Hash: "v1", Roots: []string{"node"}}, nil); err != nil {
+	if err := right.Initialize(ctx, dflow.Manifest{Hash: "v1", Start: "node"}, nil); err != nil {
 		t.Fatal(err)
 	}
-	if err := left.Initialize(ctx, dflow.Manifest{Hash: "v1", Roots: []string{"node"}}, nil); err != nil {
+	if err := left.Initialize(ctx, dflow.Manifest{Hash: "v1", Start: "node"}, nil); err != nil {
 		t.Fatal("concurrent initialize must be idempotent", err)
 	}
 	old, err := left.ClaimNode(ctx, "node", time.Minute)
@@ -134,7 +134,7 @@ BEGIN SELECT RAISE(ABORT, 'injected outbox failure'); END`); err != nil {
 		t.Fatal(err)
 	}
 	state := suspendedSnapshot()
-	if err := store.Initialize(ctx, dflow.Manifest{Hash: "v1", Roots: []string{"node"}}, nil); err != nil {
+	if err := store.Initialize(ctx, dflow.Manifest{Hash: "v1", Start: "node"}, nil); err != nil {
 		t.Fatal(err)
 	}
 	task, err := store.ClaimNode(ctx, "node", time.Minute)
@@ -188,7 +188,7 @@ func (s *crashAfterSuspend) Commit(ctx context.Context, token lease.Token, commi
 func crashDefinition() dflow.Definition {
 	def := waitDefinition()
 	def.Nodes = append([]dflow.NodeSpec{{ID: "before", Node: namedNode("before")}}, def.Nodes...)
-	def.Edges = append(def.Edges, edge("before", "wait"))
+	def.Edges = append([]dflow.Edge{edge("start", "before"), edge("before", "wait")}, def.Edges[1:]...)
 	return def
 }
 

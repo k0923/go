@@ -78,25 +78,21 @@ func NewEngineWithProvider(provider DefinitionProvider, infra Infrastructure, op
 	return &Engine{provider, infra, options}, nil
 }
 
-// Start initializes or verifies the execution and returns the node IDs that are
-// ready to drive. It is idempotent and takes no lease: concurrent calls from
-// several instances bind the same execution once.
-func (e *Engine) Start(ctx context.Context, input map[string]any) ([]string, error) {
+// Start initializes or verifies the execution and returns the unique start node
+// ID to drive. It is idempotent and takes no lease: concurrent calls from several
+// instances bind the same execution once.
+func (e *Engine) Start(ctx context.Context, input map[string]any) (string, error) {
 	if input == nil {
 		input = map[string]any{}
 	}
 	manifest, err := e.definitions.Manifest(ctx)
 	if err != nil {
-		return nil, err
+		return "", err
 	}
 	if err := e.infra.Initialize(ctx, manifest, input); err != nil {
-		return nil, &InfrastructureError{"Initialize", err}
+		return "", &InfrastructureError{"Initialize", err}
 	}
-	ready, err := e.infra.ReadyNodes(ctx)
-	if err != nil {
-		return nil, &InfrastructureError{"ReadyNodes", err}
-	}
-	return ready, nil
+	return manifest.Start, nil
 }
 
 // Recover returns the node IDs that are currently drivable without reinitializing

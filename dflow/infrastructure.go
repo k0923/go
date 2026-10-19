@@ -61,9 +61,10 @@ type State struct {
 // attempt counter (NodeState.Generation). Storage validates the generation and
 // its OWN current expiry atomically; Token.ExpiresAt is only a receipt.
 type Infrastructure interface {
-	// Initialize binds hash/input and inserts ready roots atomically, or verifies
-	// an existing execution. It is idempotent and safe to call concurrently from
-	// several instances. It never resets node states. No workflow status.
+	// Initialize binds hash/input and inserts the ready start node atomically, or
+	// verifies an existing execution. It is idempotent and safe to call
+	// concurrently from several instances. It never resets node states. No
+	// workflow status.
 	Initialize(context.Context, Manifest, map[string]any) error
 	// GetInput returns an original input value by object/array path. Empty path
 	// selects the whole input. Missing paths return ErrMissingValue, null is valid.

@@ -43,11 +43,12 @@ func instances(t *testing.T, test func(*testing.T, [2]dflow.Infrastructure)) {
 func fanInDefinition() dflow.Definition {
 	return dflow.Definition{
 		Nodes: []dflow.NodeSpec{
+			{ID: "start", Node: &dflow.StartNode{}},
 			{ID: "a", Node: namedNode("barrier")},
 			{ID: "b", Node: namedNode("barrier")},
 			{ID: "join", Node: &dflow.EndNode{}, Inputs: dflow.Parameters{"a": dflow.Ref("a"), "b": dflow.Ref("b")}},
 		},
-		Edges: []dflow.Edge{edge("a", "join"), edge("b", "join")},
+		Edges: []dflow.Edge{edge("start", "a"), edge("start", "b"), edge("a", "join"), edge("b", "join")},
 	}
 }
 
@@ -72,13 +73,17 @@ func TestNodesOfOneRunExecuteInParallelAcrossInstances(t *testing.T) {
 			engine(t, fanInDefinition(), registry, infra[0], dflow.Options{}),
 			engine(t, fanInDefinition(), registry, infra[1], dflow.Options{}),
 		}
-		ready, err := engines[0].Start(ctx, nil)
-		if err != nil || !slices.Equal(ready, []string{"a", "b"}) {
-			t.Fatal(ready, err)
+		start, err := engines[0].Start(ctx, nil)
+		if err != nil || start != "start" {
+			t.Fatal(start, err)
+		}
+		started, err := engines[0].Drive(ctx, start)
+		if err != nil || !slices.Equal(started.Ready, []string{"a", "b"}) {
+			t.Fatal(started, err)
 		}
 		results := make(chan dflow.Executed, 2)
 		errs := make(chan error, 2)
-		for index, id := range ready {
+		for index, id := range started.Ready {
 			go func() {
 				executed, err := engines[index].Drive(ctx, id)
 				results <- executed
@@ -161,7 +166,7 @@ func TestDuplicateDriveExecutesNodeOnce(t *testing.T) {
 func TestExpiredNodeLeaseIsReclaimedAndStaleOwnerFenced(t *testing.T) {
 	instances(t, func(t *testing.T, infra [2]dflow.Infrastructure) {
 		ctx := context.Background()
-		if err := infra[0].Initialize(ctx, dflow.Manifest{Hash: "v1", Roots: []string{"a"}}, nil); err != nil {
+		if err := infra[0].Initialize(ctx, dflow.Manifest{Hash: "v1", Start: "a"}, nil); err != nil {
 			t.Fatal(err)
 		}
 		stale, err := infra[0].ClaimNode(ctx, "a", 50*time.Millisecond)
@@ -203,7 +208,7 @@ func TestExpiredNodeLeaseIsReclaimedAndStaleOwnerFenced(t *testing.T) {
 func TestCommitRejectsExpiredOwnLease(t *testing.T) {
 	instances(t, func(t *testing.T, infra [2]dflow.Infrastructure) {
 		ctx := context.Background()
-		if err := infra[0].Initialize(ctx, dflow.Manifest{Hash: "v1", Roots: []string{"a"}}, nil); err != nil {
+		if err := infra[0].Initialize(ctx, dflow.Manifest{Hash: "v1", Start: "a"}, nil); err != nil {
 			t.Fatal(err)
 		}
 		task, err := infra[0].ClaimNode(ctx, "a", 30*time.Millisecond)

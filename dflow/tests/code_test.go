@@ -88,7 +88,7 @@ func TestCodeRejectsInvalidResultsAndSupportsCancellation(t *testing.T) {
 func TestMemoryFencingAndVersionCAS(t *testing.T) {
 	ctx := context.Background()
 	infra := memory.New()
-	if err := infra.Initialize(ctx, dflow.Manifest{Hash: "v1", Roots: []string{"node"}}, nil); err != nil {
+	if err := infra.Initialize(ctx, dflow.Manifest{Hash: "v1", Start: "node"}, nil); err != nil {
 		t.Fatal(err)
 	}
 	first, err := infra.ClaimNode(ctx, "node", time.Minute)

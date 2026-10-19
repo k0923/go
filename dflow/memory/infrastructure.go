@@ -57,10 +57,12 @@ func (i *Infrastructure) Initialize(ctx context.Context, m dflow.Manifest, input
 		}
 		return nil
 	}
-	state := &dflow.State{Version: 1, DefinitionHash: m.Hash, Input: input, Nodes: map[string]dflow.NodeState{}}
-	for _, id := range m.Roots {
-		state.Nodes[id] = dflow.NodeState{Version: 1, Status: dflow.Pending, Ready: true, Enabled: true}
+	if m.Start == "" {
+		return dflow.ErrInvalidDefinition
 	}
+	state := &dflow.State{Version: 1, DefinitionHash: m.Hash, Input: input, Nodes: map[string]dflow.NodeState{
+		m.Start: {Version: 1, Status: dflow.Pending, Ready: true, Enabled: true},
+	}}
 	copy, err := clone(state)
 	if err != nil {
 		return err
