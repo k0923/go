@@ -117,7 +117,9 @@ Infrastructure 绑定一个业务执行 scope，不在每个方法中传递 RunI
 
 `Run` 初始化或校验已有执行，消费就绪任务；`Drain` 恢复已有执行；`ResumeNode` 只驱动指定节点及可达后继。Engine 只按需读取节点和原输入路径，不加载整份状态或定义。返回 State.Nodes 仅包含本次驱动触及的节点；nil error 表示当前没有可执行任务。
 
-没有工作流整体 Status。业务通过 `GetNode` 或可选 `SnapshotReader.Load` 判断完成条件。`Options` 控制并发数（默认 4）、节点超时（默认 5 分钟）和租约选项。
+没有工作流整体 Status。业务通过 `GetNode` 或可选 `SnapshotReader.Load` 判断完成条件。`Options` 控制并发数（默认 4）、节点超时（默认 5 分钟）、租约选项和可观测性 `Hooks`。
+
+`Hooks` 观测节点生命周期用于 metrics、trace 和日志：`OnClaim`（节点被 claim 并置 Running 后）、`OnStart`（调用 Run/Resume 前）、`OnFinish`（节点返回后、Commit 前，带 `Outcome`、`Duration` 和失败时的 `Err`）。所有字段可选，nil 跳过。Hook 是旁路，不影响调度、提交或重试；hook 内部 panic 会被框架 recover 并忽略，不污染执行。`NodeEvent.Attempt` 携带驱动租约的 generation，同一节点 Attempt 递增即表示发生了重试。`OnFinish` 从节点 goroutine 并发触发，实现需自行同步。
 
 `DefinitionProvider` 按发布版本返回可执行的 PublishedNode。业务从配置构造 Node、Parameter 并注入依赖；重启后按节点重建。编译 Graph 本身也实现这个接口，可传给 `NewEngine`。
 

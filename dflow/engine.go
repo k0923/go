@@ -18,6 +18,8 @@ type Options struct {
 	MaxConcurrency int
 	NodeTimeout    time.Duration
 	Lease          lease.Options
+	// Hooks observes node lifecycle transitions. It never affects scheduling.
+	Hooks Hooks
 }
 
 type Engine struct {
@@ -128,6 +130,7 @@ func (e *Engine) drive(parent context.Context, token lease.Token, observed *Stat
 				break
 			}
 			observed.Nodes[task.NodeID] = task.State
+			e.options.Hooks.claim(ctx, NodeEvent{NodeID: task.NodeID, Attempt: task.State.Generation})
 			active++
 			go func() {
 				node, result, err := e.execute(ctx, task)
@@ -274,9 +277,15 @@ func (e *Engine) execute(parent context.Context, task *NodeTask) (published *Pub
 		if !ok {
 			return published, result, ErrInvalidSuspension
 		}
+		e.options.Hooks.start(ctx, NodeEvent{NodeID: task.NodeID, Attempt: task.State.Generation, IsResume: true, Token: suspension.Token})
+		started := time.Now()
 		result, err = resumable.Resume(ctx, maps.Clone(nodeInput), ResumeInput{Token: suspension.Token, Suspension: suspension.Payload, Response: response.Value})
+		e.finish(ctx, task, started, result, err)
 	} else {
+		e.options.Hooks.start(ctx, NodeEvent{NodeID: task.NodeID, Attempt: task.State.Generation})
+		started := time.Now()
 		result, err = node.Run(ctx, maps.Clone(nodeInput))
+		e.finish(ctx, task, started, result, err)
 	}
 	if ctx.Err() != nil {
 		return published, Result{}, ctx.Err()
@@ -301,6 +310,32 @@ func (e *Engine) execute(parent context.Context, task *NodeTask) (published *Pub
 		}
 	}
 	return published, result, err
+}
+
+func (e *Engine) finish(ctx context.Context, task *NodeTask, started time.Time, result Result, err error) {
+	if e.options.Hooks.OnFinish == nil {
+		return
+	}
+	event := NodeEvent{
+		NodeID:   task.NodeID,
+		Attempt:  task.State.Generation,
+		IsResume: task.State.Suspension != nil,
+		Duration: time.Since(started),
+	}
+	if task.State.Suspension != nil {
+		event.Token = task.State.Suspension.Token
+	}
+	switch {
+	case err != nil:
+		event.Outcome, event.Err = Failed, err
+	case result.Suspend != nil:
+		event.Outcome = Suspended
+	case !task.State.Enabled:
+		event.Outcome = Skipped
+	default:
+		event.Outcome = Succeeded
+	}
+	e.options.Hooks.finish(ctx, event)
 }
 
 func (e *Engine) arrivals(ctx context.Context, source string, node *PublishedNode, state NodeState) ([]Arrival, error) {
