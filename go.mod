@@ -1,6 +1,6 @@
 module github.com/k0923/go
 
-go 1.27.1
+go 1.27.0
 
 require (
 	github.com/dop251/goja v0.0.0-20260311135729-065cd970411c
