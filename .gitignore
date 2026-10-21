@@ -13,3 +13,4 @@ reviews/
 *.log
 *.out
 .trae/
+inner_docs/
