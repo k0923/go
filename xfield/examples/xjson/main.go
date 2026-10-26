@@ -43,9 +43,9 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	fmt.Printf("xjson 恢复的公共定义: %T\n", doc.Definitions["user:dialog"])
+	fmt.Printf("xjson 恢复的公共定义: %T\n", doc.Definitions["dialog"])
 
-	// 2. xfield 解析 user:dialog 的引用，生成运行时 Schema。
+	// 2. xfield 解析 dialog 的引用，生成运行时 Schema。
 	schema, err := xfield.CompileDocument(doc)
 	if err != nil {
 		return err

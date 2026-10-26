@@ -17,18 +17,15 @@ func main() {
 func run() error {
 	minLength, minAge, maxAge := 1, 0.0, 150.0
 	schema := xfield.Schema[struct{}]{
-
 		"name": &xfield.StringField[struct{}]{
 			Meta: xfield.Meta{Required: true}, MinLength: &minLength,
 		},
-
 		"age": &xfield.NumberField[struct{}]{
-			Meta: xfield.Meta{}, Min: &minAge, Max: &maxAge,
+			Min: &minAge, Max: &maxAge,
 		},
-		"active": &xfield.BooleanField[struct{}]{Meta: xfield.Meta{}},
-
+		"active": &xfield.BooleanField[struct{}]{},
 		"tags": &xfield.ArrayField[struct{}]{
-			Meta: xfield.Meta{}, Items: &xfield.StringField[struct{}]{},
+			Items: &xfield.StringField[struct{}]{},
 		},
 	}
 	clean, err := xfield.ValidateModel(map[string]any{

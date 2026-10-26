@@ -68,9 +68,8 @@ func main() {
 
 func run() error {
 	schema := xfield.Schema[Params]{
-
 		"images": &xfield.ArrayField[Params]{
-			Meta: xfield.Meta{}, Items: &ResourceField{},
+			Items: &ResourceField{},
 		},
 	}
 	clean, err := xfield.ValidateModel(map[string]any{"images": []any{" asset-1 "}}, schema, Params{

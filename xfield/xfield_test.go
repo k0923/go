@@ -60,9 +60,7 @@ type dependencies struct {
 
 func TestExternalFieldNested(t *testing.T) {
 	schema := xfield.Schema[*dependencies]{
-
 		"assets": &xfield.ArrayField[*dependencies]{
-			Meta: xfield.Meta{},
 			Items: &xfield.ObjectField[*dependencies]{
 				Properties: xfield.Schema[*dependencies]{
 					"image": &resourceField{Meta: xfield.Meta{Required: true}},
@@ -105,13 +103,12 @@ func TestBuiltinsRules(t *testing.T) {
 	minLength, maxLength, pattern := 2, 4, "^[一二三]+$"
 	min, max := 0.0, 100.0
 	schema := xfield.Schema[struct{}]{
-
 		"name": &xfield.StringField[struct{}]{
-			Meta: xfield.Meta{}, MinLength: &minLength, MaxLength: &maxLength,
+			MinLength: &minLength, MaxLength: &maxLength,
 			Pattern: &pattern, Enum: []string{"一二"},
 		},
-		"n":  &xfield.NumberField[struct{}]{Meta: xfield.Meta{}, Min: &min, Max: &max, Enum: []any{10}},
-		"ok": &xfield.BooleanField[struct{}]{Meta: xfield.Meta{}},
+		"n":  &xfield.NumberField[struct{}]{Min: &min, Max: &max, Enum: []any{10}},
+		"ok": &xfield.BooleanField[struct{}]{},
 	}
 	out, err := xfield.ValidateModel(map[string]any{"name": "一二", "n": uint8(10), "ok": true}, schema, struct{}{})
 	if err != nil || out["n"] != uint8(10) {
@@ -153,7 +150,7 @@ func TestRequiredPartialAndSchemaErrors(t *testing.T) {
 			t.Fatalf("bad schema %v: %v", bad, err)
 		}
 	}
-	cycle := &xfield.ArrayField[struct{}]{Meta: xfield.Meta{}}
+	cycle := &xfield.ArrayField[struct{}]{}
 	cycle.Items = cycle
 	if err := xfield.ValidateField(cycle); !errors.Is(err, xfield.ErrInvalidSchema) {
 		t.Fatalf("cycle: %v", err)
@@ -165,9 +162,8 @@ func TestNestedPathPreservesExternalError(t *testing.T) {
 	deps := &dependencies{ctx: context.Background(), err: sentinel}
 	schema := xfield.Schema[*dependencies]{
 		"assets": &xfield.ArrayField[*dependencies]{
-			Meta: xfield.Meta{},
 			Items: &xfield.ObjectField[*dependencies]{Properties: xfield.Schema[*dependencies]{
-				"image": &resourceField{Meta: xfield.Meta{}},
+				"image": &resourceField{},
 			}},
 		}}
 	_, err := xfield.ValidateModel(
@@ -209,7 +205,7 @@ func TestNamedContainers(t *testing.T) {
 	type namedMap map[string]any
 	type namedSlice []any
 	field := &xfield.ObjectField[struct{}]{Properties: xfield.Schema[struct{}]{
-		"items": &xfield.ArrayField[struct{}]{Meta: xfield.Meta{}, Items: &xfield.NumberField[struct{}]{}},
+		"items": &xfield.ArrayField[struct{}]{Items: &xfield.NumberField[struct{}]{}},
 	}}
 	got, err := field.Parse(namedMap{"items": namedSlice{int8(1), uint16(2)}, "extra": true}, struct{}{})
 	want := map[string]any{"items": []any{int8(1), uint16(2)}}

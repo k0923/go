@@ -17,12 +17,10 @@ func main() {
 func run() error {
 	schema := xfield.Schema[struct{}]{
 		"title": &xfield.StringField[struct{}]{Meta: xfield.Meta{Required: true}},
-
 		"members": &xfield.ArrayField[struct{}]{
-			Meta: xfield.Meta{},
 			Items: &xfield.ObjectField[struct{}]{Properties: xfield.Schema[struct{}]{
 				"name":  &xfield.StringField[struct{}]{Meta: xfield.Meta{Required: true}},
-				"score": &xfield.NumberField[struct{}]{Meta: xfield.Meta{}},
+				"score": &xfield.NumberField[struct{}]{},
 			}},
 		},
 	}

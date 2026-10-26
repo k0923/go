@@ -5,10 +5,6 @@ import (
 	"strings"
 )
 
-// UserDefinitionPrefix separates user definitions from system field kinds.
-// Other namespaces are reserved for future use.
-const UserDefinitionPrefix = "user:"
-
 // SchemaDocument holds reusable definitions and keyed use-site fields.
 // Serialization and loading definitions from storage belong to the caller.
 type SchemaDocument[P any] struct {
@@ -49,7 +45,8 @@ type FieldCompiler[P any] interface {
 
 // CompileDocument resolves references without mutating the source document.
 // It checks every definition, including unused ones, and rejects missing or
-// circular references. Definition keys must use the user: namespace.
+// circular references. Definition keys must be non-empty and contain no
+// whitespace.
 // Compiled declarations may share immutable leaf fields and definitions.
 func CompileDocument[P any](doc SchemaDocument[P]) (Schema[P], error) {
 	c := documentCompiler[P]{
@@ -64,7 +61,7 @@ func CompileDocument[P any](doc SchemaDocument[P]) (Schema[P], error) {
 	sort.Strings(names)
 	for _, name := range names {
 		if !validDefinitionName(name) {
-			return nil, wrapPathError("definitions."+name, invalidSchema("definition name must be user:<name> without whitespace"))
+			return nil, wrapPathError("definitions."+name, invalidSchema("definition name must be non-empty and contain no whitespace"))
 		}
 	}
 	for _, name := range names {
@@ -83,9 +80,7 @@ func CompileDocument[P any](doc SchemaDocument[P]) (Schema[P], error) {
 }
 
 func validDefinitionName(name string) bool {
-	return strings.HasPrefix(name, UserDefinitionPrefix) &&
-		len(name) > len(UserDefinitionPrefix) &&
-		!strings.ContainsAny(name, " \t\r\n")
+	return name != "" && !strings.ContainsAny(name, " \t\r\n")
 }
 
 type documentCompiler[P any] struct {
@@ -101,7 +96,7 @@ type compiledDefinition[P any] struct {
 
 func (c *documentCompiler[P]) definition(name string, depth int) (Field[P], error) {
 	if !validDefinitionName(name) {
-		return nil, invalidSchema("reference name must use the user: namespace: %q", name)
+		return nil, invalidSchema("reference name must be non-empty and contain no whitespace: %q", name)
 	}
 	if c.visiting[name] {
 		return nil, invalidSchema("circular reference %q", name)

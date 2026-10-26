@@ -2,6 +2,8 @@
 
 测试日期：2026-10-25（Asia/Shanghai）。版本：`github.com/wk8/go-ordered-map/v2 v2.1.8`。环境：Go 1.27.1、macOS darwin/arm64、Apple M4 Pro。性能测试使用 `-cpu=1 -benchtime=100ms -count=5`，以下为五次测量的中位数；实际应用的 key 分布、字段类型和机器会影响结果。
 
+后续迁移说明（2026-10-26）：xfield 的 Schema 已改为原生 map，前端数组通过显式转换保留在应用层。兼容性测试已迁移至新 API；本报告的容器基准数据保留为原始实测结果。
+
 结论：查找接近原生 map，按 key 查找比线性扫描快；按顺序遍历比连续切片慢；构建需要更多分配。可以用来保存有序 Schema，但现有 xfield 接口需要适配。对任意 JSON 数据值，它不自动提供嵌套顺序和大整数精度。
 
 ## 性能

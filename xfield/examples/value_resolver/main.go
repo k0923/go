@@ -70,8 +70,8 @@ func main() {
 func run() error {
 	schema := xfield.Schema[struct{}]{
 		"name":     &xfield.StringField[struct{}]{Meta: xfield.Meta{Required: true}},
-		"nickname": &xfield.StringField[struct{}]{Meta: xfield.Meta{}},
-		"missing":  &xfield.StringField[struct{}]{Meta: xfield.Meta{}},
+		"nickname": &xfield.StringField[struct{}]{},
+		"missing":  &xfield.StringField[struct{}]{},
 	}
 	out, err := xfield.ApplyMappings(
 		`{"profile":{"display/name":"张三","nickname":null}}`,

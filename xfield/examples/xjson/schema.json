@@ -1,7 +1,7 @@
 {
   "definitions": [
     {
-      "name": "user:dialog",
+      "name": "dialog",
       "field": {
         "type": "object",
         "properties": [
@@ -60,7 +60,7 @@
     },
     {
       "type": "ref",
-      "ref": "user:dialog",
+      "ref": "dialog",
       "key": "dialog",
       "label": "模型台词",
       "required": true
@@ -72,7 +72,7 @@
       "required": true,
       "items": {
         "type": "ref",
-        "ref": "user:dialog"
+        "ref": "dialog"
       }
     }
   ]

@@ -11,14 +11,10 @@ import (
 
 func TestMappingsNestedParseOnce(t *testing.T) {
 	schema := xfield.Schema[*dependencies]{
-
 		"teams": &xfield.ArrayField[*dependencies]{
-			Meta: xfield.Meta{},
 			Items: &xfield.ObjectField[*dependencies]{Properties: xfield.Schema[*dependencies]{
 				"name": &xfield.StringField[*dependencies]{Meta: xfield.Meta{Required: true}},
-
 				"images": &xfield.ArrayField[*dependencies]{
-					Meta: xfield.Meta{},
 					Items: &xfield.ObjectField[*dependencies]{Properties: xfield.Schema[*dependencies]{
 						"url": &resourceField{Meta: xfield.Meta{Required: true}},
 					}},
@@ -54,7 +50,7 @@ func TestMappingsNestedParseOnce(t *testing.T) {
 func TestMappingsMissingNullResolverAndRawJSON(t *testing.T) {
 	schema := xfield.Schema[struct{}]{
 		"name": &xfield.StringField[struct{}]{Meta: xfield.Meta{Required: true}},
-		"id":   &xfield.NumberField[struct{}]{Meta: xfield.Meta{}},
+		"id":   &xfield.NumberField[struct{}]{},
 	}
 	mappings := []xfield.Mapping{{From: "name", To: "name"}, {From: "id", To: "id"}}
 	out, err := xfield.ApplyMappings(`{"name":null,"id":9007199254740993}`, mappings, schema, struct{}{}, xfield.MappingOptions{})
@@ -97,9 +93,8 @@ func TestMappingsMissingNullResolverAndRawJSON(t *testing.T) {
 func TestMappingsDoNotMutateInput(t *testing.T) {
 	schema := xfield.Schema[struct{}]{
 		"profile": &xfield.ObjectField[struct{}]{
-			Meta: xfield.Meta{},
 			Properties: xfield.Schema[struct{}]{
-				"name": &xfield.StringField[struct{}]{Meta: xfield.Meta{}},
+				"name": &xfield.StringField[struct{}]{},
 			},
 		}}
 	input := map[string]any{"profile": map[string]any{"name": "old"}, "replacement": "new"}
@@ -117,9 +112,8 @@ func TestMappingsDoNotMutateInput(t *testing.T) {
 func TestPathsAndSourceValidation(t *testing.T) {
 	schema := xfield.Schema[struct{}]{
 		"items": &xfield.ArrayField[struct{}]{
-			Meta: xfield.Meta{},
 			Items: &xfield.ObjectField[struct{}]{Properties: xfield.Schema[struct{}]{
-				"name": &xfield.StringField[struct{}]{Meta: xfield.Meta{}},
+				"name": &xfield.StringField[struct{}]{},
 			}},
 		}}
 	if err := xfield.ValidateMappingsWithSource(
@@ -166,11 +160,9 @@ func (*customObject) Type() string { return "custom_object" }
 
 func TestExternalContainer(t *testing.T) {
 	schema := xfield.Schema[*dependencies]{
-
 		"asset": &customObject{ObjectField: xfield.ObjectField[*dependencies]{
-			Meta: xfield.Meta{},
 			Properties: xfield.Schema[*dependencies]{
-				"image": &resourceField{Meta: xfield.Meta{}},
+				"image": &resourceField{},
 			},
 		}},
 	}

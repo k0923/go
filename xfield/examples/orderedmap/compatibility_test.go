@@ -184,14 +184,14 @@ func TestXFieldRuntimeMapCompatibility(t *testing.T) {
 	m.Set("content", "你好")
 	field := &xfield.ObjectField[Params]{
 		Properties: xfield.Schema[Params]{
-			&xfield.StringField[Params]{Meta: xfield.Meta{Key: "content", Required: true}},
+			"content": &xfield.StringField[Params]{Meta: xfield.Meta{Required: true}},
 		},
 	}
 	if _, err := field.Parse(m, Params{}); err == nil {
 		t.Fatal("ordered map unexpectedly accepted by xfield's native-map parser")
 	}
 	// OrderedMap is a struct containing a map and list, not a native Go map.
-	// Explicit conversion preserves values; xfield's Schema supplies order.
+	// Explicit conversion preserves values; xfield sorts schema property names.
 	native := make(map[string]any, m.Len())
 	for pair := m.Oldest(); pair != nil; pair = pair.Next() {
 		native[pair.Key] = pair.Value
@@ -206,25 +206,44 @@ type Params struct{}
 
 type FieldJSON = xjson.G[xfield.Field[Params]]
 
+type keyMetadata struct {
+	Key string `json:"key,omitempty"`
+}
+
+func (m keyMetadata) FieldKey() string { return m.Key }
+
+type StringJSON struct {
+	xfield.StringField[Params]
+	keyMetadata
+}
+
+type NumberJSON struct {
+	xfield.NumberField[Params]
+	keyMetadata
+}
+
 type ObjectJSON struct {
 	xfield.ObjectField[Params]
+	keyMetadata
 	Properties []FieldJSON `json:"properties,omitempty"`
 }
 
 type ArrayJSON struct {
 	xfield.ArrayField[Params]
+	keyMetadata
 	Items FieldJSON `json:"items"`
 }
 
 type RefJSON struct {
 	xfield.RefField[Params]
+	keyMetadata
 	Ref string `json:"ref"`
 }
 
 func init() {
 	xjson.Bind[xfield.Field[Params]](map[string]xfield.Field[Params]{
-		"string": &xfield.StringField[Params]{},
-		"number": &xfield.NumberField[Params]{},
+		"string": &StringJSON{},
+		"number": &NumberJSON{},
 		"object": &ObjectJSON{},
 		"array":  &ArrayJSON{},
 		"ref":    &RefJSON{},
@@ -232,8 +251,9 @@ func init() {
 		switch field := field.(type) {
 		case *ObjectJSON:
 			field.ObjectField.Properties = make(xfield.Schema[Params], len(field.Properties))
-			for i, child := range field.Properties {
-				field.ObjectField.Properties[i] = child.Value()
+			for _, child := range field.Properties {
+				key := child.Value().(interface{ FieldKey() string }).FieldKey()
+				field.ObjectField.Properties[key] = child.Value()
 			}
 		case *ArrayJSON:
 			field.ArrayField.Items = field.Items.Value()
@@ -274,32 +294,36 @@ func TestXJSONAndXField(t *testing.T) {
 	}
 	raw := []byte(`{
 		"definitions": {
-			"user:z": {"type":"string","minLength":1},
-			"user:dialog": {"type":"object","properties":[
+			"zDef": {"type":"string","minLength":1},
+			"dialog": {"type":"object","properties":[
 				{"type":"string","key":"speaker","required":true},
 				{"type":"number","key":"start","required":true},
 				{"type":"number","key":"end","required":true},
 				{"type":"string","key":"content","required":true}
 			]},
-			"user:a": {"type":"array","items":{"type":"ref","ref":"user:dialog"}}
+			"aDef": {"type":"array","items":{"type":"ref","ref":"dialog"}}
 		},
 		"fields": [
-			{"type":"ref","key":"dialog","required":true,"ref":"user:dialog"},
-			{"type":"ref","key":"mappedDialogs","required":true,"ref":"user:a"}
+			{"type":"ref","key":"dialog","required":true,"ref":"dialog"},
+			{"type":"ref","key":"mappedDialogs","required":true,"ref":"aDef"}
 		]
 	}`)
 	if err := json.Unmarshal(raw, &wire); err != nil {
 		t.Fatal(err)
 	}
-	if !reflect.DeepEqual(keys(&wire.Definitions), []string{"user:z", "user:dialog", "user:a"}) {
+	if !reflect.DeepEqual(keys(&wire.Definitions), []string{"zDef", "dialog", "aDef"}) {
 		t.Fatal("xjson values changed definition order")
 	}
-	doc := xfield.SchemaDocument[Params]{Definitions: make(map[string]xfield.Field[Params])}
+	doc := xfield.SchemaDocument[Params]{
+		Definitions: make(map[string]xfield.Field[Params]),
+		Fields:      make(xfield.Schema[Params]),
+	}
 	for pair := wire.Definitions.Oldest(); pair != nil; pair = pair.Next() {
 		doc.Definitions[pair.Key] = pair.Value.Value()
 	}
 	for _, field := range wire.Fields {
-		doc.Fields = append(doc.Fields, field.Value())
+		key := field.Value().(interface{ FieldKey() string }).FieldKey()
+		doc.Fields[key] = field.Value()
 	}
 	schema, err := xfield.CompileDocument(doc)
 	if err != nil {
@@ -321,12 +345,12 @@ func TestXJSONAndXField(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(encoded), `"ref":"user:dialog"`) {
+	if !strings.Contains(string(encoded), `"ref":"dialog"`) {
 		t.Fatalf("xjson reference was lost: %s", encoded)
 	}
-	first := strings.Index(string(encoded), `"user:z":`)
-	second := strings.Index(string(encoded), `"user:dialog":`)
-	third := strings.Index(string(encoded), `"user:a":`)
+	first := strings.Index(string(encoded), `"zDef":`)
+	second := strings.Index(string(encoded), `"dialog":`)
+	third := strings.Index(string(encoded), `"aDef":`)
 	if !(first >= 0 && first < second && second < third) {
 		t.Fatalf("encoded definitions lost order: %s", encoded)
 	}

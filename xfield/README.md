@@ -10,11 +10,10 @@ xfield 用字段接口描述结构化数据，提供声明校验、数据清洗�
 
 ```go
 schema := xfield.Schema[struct{}]{
-	&xfield.StringField[struct{}]{
-		Meta: xfield.Meta{Key: "name", Required: true},
+	"name": &xfield.StringField[struct{}]{
+		Meta: xfield.Meta{Required: true},
 	},
-	&xfield.ArrayField[struct{}]{
-		Meta: xfield.Meta{Key: "tags"},
+	"tags": &xfield.ArrayField[struct{}]{
 		Items: &xfield.StringField[struct{}]{},
 	},
 }
@@ -34,10 +33,12 @@ type Field[P any] interface {
 	Parse(data any, params P) (any, error)
 }
 
-type Schema[P any] []Field[P]
+type Schema[P any] map[string]Field[P]
 ```
 
-`Schema[P]` 是有序字段列表，直接放入具体字段，无需 Wrap 或 FieldRef。顺序用于展示、遍历及确定第一个校验错误。`ObjectField.Properties` 是 Schema，`ArrayField.Items` 是 Field。
+`Schema[P]` 将字段名映射到声明，直接放入具体字段，无需 Wrap 或 FieldRef。字段名由 map 的 key 提供，Meta 不重复保存 Key。`ObjectField.Properties` 是 Schema，`ArrayField.Items` 是 Field。路径查找直接按 key 访问；校验、解析和展示按字段名排序，保持执行顺序与首个错误稳定。
+
+前端 definitions、fields、properties 可以保持数组，用于交互排序。应用层转换为运行时 map，转换时检查重复名称；编辑和保存保留原始数组。完整转换过程见 xjson 示例。
 
 | 类型 | 支持的规则 |
 | --- | --- |
@@ -45,12 +46,12 @@ type Schema[P any] []Field[P]
 | `NumberField[P]` | Min/Max 范围、Enum 枚举；支持 Go 数值类型和 json.Number，拒绝非有限数 |
 | `BooleanField[P]` | 布尔类型检查 |
 | `ArrayField[P]` | Items 元素声明、MinItems/MaxItems、递归解析 |
-| `ObjectField[P]` | 有序 Properties、子字段 required、递归解析 |
+| `ObjectField[P]` | 按名称索引的 Properties、子字段 required、递归解析 |
 | `RefField[P]` | 引用 SchemaDocument 中的公共定义，编译后使用 |
 
-`Meta` 包含 ID、Key、Label、Required。Required 表示键必须存在；内置字段允许显式 nil 清空。NumberField 不限制整数，时间先后和角色 ID 等跨字段业务规则由应用处理。
+`Meta` 包含 ID、Label、Required。Required 表示键必须存在；内置字段允许显式 nil 清空。NumberField 不限制整数，时间先后和角色 ID 等跨字段业务规则由应用处理。
 
-`ValidateSchema` / `ValidateField` 检查空 key、重复 key、空 items、非法规则和嵌套深度。`ValidateModel` 检查完整模型，`ValidatePartial` 只跳过顶层 required；提供的嵌套对象仍须满足自身 required。两者过滤未声明字段，返回新容器。
+`ValidateSchema` / `ValidateField` 检查空属性名、空 items、非法规则和嵌套深度。数组输入中的重复名称由转换层检查，map 自身只保存每个名称的一条声明。`ValidateModel` 检查完整模型，`ValidatePartial` 只跳过顶层 required；提供的嵌套对象仍须满足自身 required。两者过滤未声明字段，返回新容器。
 
 数字比较避免将大整数转为 float64。StringField 的 Config.EnumOptions 是展示元数据，数据约束使用 Enum。
 
@@ -59,22 +60,21 @@ type Schema[P any] []Field[P]
 ```go
 doc := xfield.SchemaDocument[struct{}]{
 	Definitions: map[string]xfield.Field[struct{}]{
-		"user:dialog": &xfield.ObjectField[struct{}]{
+		"dialog": &xfield.ObjectField[struct{}]{
 			Properties: xfield.Schema[struct{}]{
-				&xfield.StringField[struct{}]{
-					Meta: xfield.Meta{Key: "content", Required: true},
+				"content": &xfield.StringField[struct{}]{
+					Meta: xfield.Meta{Required: true},
 				},
 			},
 		},
 	},
 	Fields: xfield.Schema[struct{}]{
-		&xfield.RefField[struct{}]{
-			Meta: xfield.Meta{Key: "dialog", Required: true},
-			Ref: "user:dialog",
+		"dialog": &xfield.RefField[struct{}]{
+			Meta: xfield.Meta{Required: true},
+			Ref: "dialog",
 		},
-		&xfield.ArrayField[struct{}]{
-			Meta: xfield.Meta{Key: "mappedDialogs"},
-			Items: &xfield.RefField[struct{}]{Ref: "user:dialog"},
+		"mappedDialogs": &xfield.ArrayField[struct{}]{
+			Items: &xfield.RefField[struct{}]{Ref: "dialog"},
 		},
 	},
 }
@@ -82,7 +82,7 @@ schema, err := xfield.CompileDocument(doc)
 // 检查 err 后，将 schema 交给 ValidateModel / PresentModel / ApplyMappings。
 ```
 
-公共定义的名称使用 `user:<name>`，不得包含空白；其他命名空间保留。定义可为对象、数组、叶子字段或其他定义的引用。引用位置的 Meta 决定该位置的 Key、Label、Required 等，不覆盖公共定义。
+公共定义的名称是普通字符串，例如 `dialog`，要求非空且不包含空白。定义可为对象、数组、叶子字段或其他定义的引用。引用位置的 Meta 决定该位置的 Label、Required 等，不覆盖公共定义；使用位置的字段名由 Schema 的 key 决定。
 
 CompileDocument 检查所有定义，包括未使用的定义；拒绝缺失引用、循环引用和过深结构。它返回可直接使用的 Schema，保留被引用字段的类型、Parse、Present 及容器遍历行为。未编译的引用不能用于校验。
 
@@ -153,3 +153,5 @@ type ValueResolver interface {
 `ErrInvalidSchema`、`ErrInvalidValue` 区分声明与数据错误。`PathError` 携带 assets[0].image 等路径并保留原始 error，支持 errors.Is/As。
 
 旧版 `Wrap` / `FieldRef` 改为直接使用 Field；`.Value()` 改为直接访问字段。Registry、Factory、Decoder、FieldDecoder、字段 JSON 编解码及基于 JSON 的 FieldEqual 已移除，声明编解码交给应用层。
+
+旧的 Schema 切片改为 `map[string]Field[P]`；将 `Meta.Key` 移至 map key，按位置的访问改为按字段名访问。Meta.Key 和 KeyOf 已移除。前端字段数组的 key 保留在应用 DTO 中。

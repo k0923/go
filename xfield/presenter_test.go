@@ -10,16 +10,12 @@ import (
 func TestPresentModel(t *testing.T) {
 	t.Run("nested params and unchanged fields", func(t *testing.T) {
 		schema := xfield.Schema[*dependencies]{
-
 			"profile": &xfield.ObjectField[*dependencies]{
-				Meta: xfield.Meta{},
 				Properties: xfield.Schema[*dependencies]{
-
 					"images": &xfield.ArrayField[*dependencies]{
-						Meta:  xfield.Meta{},
 						Items: &resourceField{},
 					},
-					"name": &xfield.StringField[*dependencies]{Meta: xfield.Meta{}},
+					"name": &xfield.StringField[*dependencies]{},
 				},
 			},
 		}
@@ -51,7 +47,7 @@ func TestPresentModel(t *testing.T) {
 
 	t.Run("nil and empty params", func(t *testing.T) {
 		schema := xfield.Schema[struct{}]{
-			"active": &xfield.BooleanField[struct{}]{Meta: xfield.Meta{}},
+			"active": &xfield.BooleanField[struct{}]{},
 		}
 		if result := xfield.PresentModel(nil, schema, struct{}{}); result != nil {
 			t.Fatalf("nil input became %v", result)

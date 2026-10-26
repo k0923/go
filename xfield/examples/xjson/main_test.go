@@ -69,10 +69,10 @@ func TestDialogJSONRoundTrip(t *testing.T) {
 	if err := json.Unmarshal(encoded, &shape); err != nil {
 		t.Fatal(err)
 	}
-	if len(shape.Definitions) != 1 || shape.Definitions[0].Name != "user:dialog" || shape.Definitions[0].Field == nil ||
-		shape.Fields[3].Type != "ref" || shape.Fields[3].Ref != "user:dialog" ||
+	if len(shape.Definitions) != 1 || shape.Definitions[0].Name != "dialog" || shape.Definitions[0].Field == nil ||
+		shape.Fields[3].Type != "ref" || shape.Fields[3].Ref != "dialog" ||
 		shape.Fields[3].Label != "模型台词" ||
-		shape.Fields[4].Items.Type != "ref" || shape.Fields[4].Items.Ref != "user:dialog" {
+		shape.Fields[4].Items.Type != "ref" || shape.Fields[4].Items.Ref != "dialog" {
 		t.Fatalf("flat JSON did not preserve definitions and references: %s", encoded)
 	}
 	var restored DocumentJSON
@@ -110,7 +110,7 @@ func TestConstructWithNG(t *testing.T) {
 	minItems := 2
 	wire := DocumentJSON{
 		Definitions: []DefinitionJSON{
-			{Name: "user:flag", Field: wrap(&BooleanJSON{})},
+			{Name: "flag", Field: wrap(&BooleanJSON{})},
 		},
 		Fields: SchemaJSON{
 			wrap(&ObjectJSON{
@@ -130,7 +130,7 @@ func TestConstructWithNG(t *testing.T) {
 			wrap(&RefJSON{
 				Meta:    xfield.Meta{Required: true},
 				KeyJSON: KeyJSON{Key: "flag"},
-				Ref:     "user:flag",
+				Ref:     "flag",
 			}),
 		},
 	}
@@ -175,15 +175,15 @@ func TestRejectInvalidDeclarations(t *testing.T) {
 	for _, raw := range []string{
 		`{"fields":[{"type":"unknown","key":"bad"}]}`,
 		`{"fields":[{"type":"array","key":"bad","items":{"type":"unknown"}}]}`,
-		`{"fields":[{"type":"ref","key":"bad","ref":"user:missing"}]}`,
+		`{"fields":[{"type":"ref","key":"bad","ref":"missing"}]}`,
 		`{"fields":[{"type":"array","key":"bad","items":null}]}`,
-		`{"definitions":[{"name":"user:bad","field":null}],"fields":[]}`,
+		`{"definitions":[{"name":"bad","field":null}],"fields":[]}`,
 		`{"definitions":[{"field":{"type":"string"}}],"fields":[]}`,
-		`{"definitions":[{"name":"user:bad","field":{"type":"string"}},{"name":"user:bad","field":{"type":"number"}}],"fields":[]}`,
+		`{"definitions":[{"name":"bad","field":{"type":"string"}},{"name":"bad","field":{"type":"number"}}],"fields":[]}`,
 		`{"fields":[{"type":"string","key":"same"},{"type":"number","key":"same"}]}`,
 		`{"fields":[{"type":"string"}]}`,
 		`{"fields":[{"type":"object","key":"group","properties":[{"type":"string","key":"same"},{"type":"number","key":"same"}]}]}`,
-		`{"definitions":[{"name":"user:bad","field":{"type":"object","properties":[{"type":"string","key":"same"},{"type":"number","key":"same"}]}}]}`,
+		`{"definitions":[{"name":"bad","field":{"type":"object","properties":[{"type":"string","key":"same"},{"type":"number","key":"same"}]}}]}`,
 	} {
 		t.Run(raw, func(t *testing.T) {
 			var wire DocumentJSON
@@ -199,5 +199,54 @@ func TestRejectInvalidDeclarations(t *testing.T) {
 				t.Fatal("invalid declaration was accepted")
 			}
 		})
+	}
+}
+
+func TestFrontendArrayOrderSurvivesConversion(t *testing.T) {
+	raw := []byte(`{
+		"definitions":[
+			{"name":"zDef","field":{"type":"string"}},
+			{"name":"aDef","field":{"type":"object","properties":[
+				{"type":"string","key":"z"},{"type":"number","key":"a"}
+			]}}
+		],
+		"fields":[
+			{"type":"ref","key":"z","ref":"aDef"},
+			{"type":"ref","key":"a","ref":"zDef"}
+		]
+	}`)
+	var wire DocumentJSON
+	if err := json.Unmarshal(raw, &wire); err != nil {
+		t.Fatal(err)
+	}
+	before, err := json.Marshal(wire)
+	if err != nil {
+		t.Fatal(err)
+	}
+	doc, err := wire.Document()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(doc.Definitions) != 2 || len(doc.Fields) != 2 || doc.Fields["z"] == nil {
+		t.Fatalf("arrays did not convert to keyed declarations: %v", doc)
+	}
+	nested := doc.Definitions["aDef"].(*xfield.ObjectField[Params]).Properties
+	if len(nested) != 2 || nested["z"] == nil || nested["a"] == nil {
+		t.Fatal("nested property array was not converted")
+	}
+	if _, err := xfield.CompileDocument(doc); err != nil {
+		t.Fatal(err)
+	}
+	after, err := json.Marshal(wire)
+	if err != nil || string(before) != string(after) {
+		t.Fatalf("conversion or compilation changed the frontend arrays: %s, %v", after, err)
+	}
+	restored := roundTrip(t, wire)
+	if restored.Definitions[0].Name != "zDef" ||
+		restored.Definitions[1].Name != "aDef" ||
+		restored.Fields[0].Value().FieldKey() != "z" ||
+		restored.Fields[1].Value().FieldKey() != "a" ||
+		restored.Definitions[1].Field.Value().(*ObjectJSON).Properties[0].Value().FieldKey() != "z" {
+		t.Fatal("saving changed definition, field or property array order")
 	}
 }

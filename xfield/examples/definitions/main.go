@@ -19,7 +19,7 @@ func run() error {
 	// 前端配置经过应用层反序列化后，得到这样的声明。
 	doc := xfield.SchemaDocument[Params]{
 		Definitions: map[string]xfield.Field[Params]{
-			"user:dialog": &xfield.ObjectField[Params]{
+			"dialog": &xfield.ObjectField[Params]{
 				Properties: xfield.Schema[Params]{
 					"speaker": &xfield.StringField[Params]{Meta: xfield.Meta{Required: true}},
 					"start":   &xfield.NumberField[Params]{Meta: xfield.Meta{Required: true}},
@@ -31,21 +31,18 @@ func run() error {
 		Fields: xfield.Schema[Params]{
 			"start": &xfield.NumberField[Params]{Meta: xfield.Meta{Required: true}},
 			"end":   &xfield.NumberField[Params]{Meta: xfield.Meta{Required: true}},
-
 			"tags": &xfield.ArrayField[Params]{
 				Meta: xfield.Meta{Required: true},
 				Items: &xfield.StringField[Params]{
 					Enum: []string{"text", "role", "hallucination", "missing"},
 				},
 			},
-
 			"dialog": &xfield.RefField[Params]{
-				Meta: xfield.Meta{Required: true}, Ref: "user:dialog",
+				Meta: xfield.Meta{Required: true}, Ref: "dialog",
 			},
-
 			"mappedDialogs": &xfield.ArrayField[Params]{
 				Meta:  xfield.Meta{Required: true},
-				Items: &xfield.RefField[Params]{Ref: "user:dialog"},
+				Items: &xfield.RefField[Params]{Ref: "dialog"},
 			},
 		},
 	}

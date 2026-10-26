@@ -14,7 +14,7 @@ import (
 func dialogDocument() xfield.SchemaDocument[struct{}] {
 	return xfield.SchemaDocument[struct{}]{
 		Definitions: map[string]xfield.Field[struct{}]{
-			"user:dialog": &xfield.ObjectField[struct{}]{
+			"dialog": &xfield.ObjectField[struct{}]{
 				Properties: xfield.Schema[struct{}]{
 					"speaker": &xfield.StringField[struct{}]{Meta: xfield.Meta{Required: true}},
 					"start":   &xfield.NumberField[struct{}]{Meta: xfield.Meta{Required: true}},
@@ -26,22 +26,19 @@ func dialogDocument() xfield.SchemaDocument[struct{}] {
 		Fields: xfield.Schema[struct{}]{
 			"start": &xfield.NumberField[struct{}]{Meta: xfield.Meta{Required: true}},
 			"end":   &xfield.NumberField[struct{}]{Meta: xfield.Meta{Required: true}},
-
 			"tags": &xfield.ArrayField[struct{}]{
 				Meta: xfield.Meta{Required: true},
 				Items: &xfield.StringField[struct{}]{
 					Enum: []string{"text", "role", "hallucination", "missing"},
 				},
 			},
-
 			"dialog": &xfield.RefField[struct{}]{
 				Meta: xfield.Meta{Label: "模型台词", Required: true},
-				Ref:  "user:dialog",
+				Ref:  "dialog",
 			},
-
 			"mappedDialogs": &xfield.ArrayField[struct{}]{
 				Meta:  xfield.Meta{Required: true},
-				Items: &xfield.RefField[struct{}]{Ref: "user:dialog"},
+				Items: &xfield.RefField[struct{}]{Ref: "dialog"},
 			},
 		},
 	}
@@ -104,7 +101,7 @@ func TestCompileDialogDocument(t *testing.T) {
 	if _, ok := doc.Fields["mappedDialogs"].(*xfield.ArrayField[struct{}]).Items.(*xfield.RefField[struct{}]); !ok {
 		t.Fatal("source array item reference was replaced")
 	}
-	if doc.Definitions["user:dialog"].(xfield.MetaProvider).FieldMeta().Label != "" {
+	if doc.Definitions["dialog"].(xfield.MetaProvider).FieldMeta().Label != "" {
 		t.Fatal("use-site metadata leaked into definition")
 	}
 	second, err := xfield.CompileDocument(doc)
@@ -116,15 +113,15 @@ func TestCompileDialogDocument(t *testing.T) {
 func TestReferencesPreserveCustomParsePresentAndMappings(t *testing.T) {
 	doc := xfield.SchemaDocument[*dependencies]{
 		Definitions: map[string]xfield.Field[*dependencies]{
-			"user:resource": &resourceField{Meta: xfield.Meta{Required: true}},
-			"user:images": &xfield.ArrayField[*dependencies]{
-				Items: &xfield.RefField[*dependencies]{Ref: "user:resource"},
+			"resource": &resourceField{Meta: xfield.Meta{Required: true}},
+			"imagesDef": &xfield.ArrayField[*dependencies]{
+				Items: &xfield.RefField[*dependencies]{Ref: "resource"},
 			},
-			"user:alias": &xfield.RefField[*dependencies]{Ref: "user:images"},
+			"alias": &xfield.RefField[*dependencies]{Ref: "imagesDef"},
 		},
 		Fields: xfield.Schema[*dependencies]{
-			"optional": &xfield.RefField[*dependencies]{Meta: xfield.Meta{}, Ref: "user:resource"},
-			"images":   &xfield.RefField[*dependencies]{Meta: xfield.Meta{Required: true}, Ref: "user:alias"},
+			"optional": &xfield.RefField[*dependencies]{Ref: "resource"},
+			"images":   &xfield.RefField[*dependencies]{Meta: xfield.Meta{Required: true}, Ref: "alias"},
 		},
 	}
 	schema, err := xfield.CompileDocument(doc)
@@ -168,41 +165,39 @@ func TestCompileDocumentRejectsInvalidDeclarations(t *testing.T) {
 	type field = xfield.Field[struct{}]
 	type ref = xfield.RefField[struct{}]
 	tests := map[string]xfield.SchemaDocument[struct{}]{
-		"unqualified definition": {Definitions: map[string]field{"dialog": &xfield.StringField[struct{}]{}}},
-		"reserved namespace":     {Definitions: map[string]field{"sys:dialog": &xfield.StringField[struct{}]{}}},
-		"empty definition name":  {Definitions: map[string]field{"user:": &xfield.StringField[struct{}]{}}},
-		"whitespace name":        {Definitions: map[string]field{"user: dialog": &xfield.StringField[struct{}]{}}},
-		"nil definition":         {Definitions: map[string]field{"user:bad": (*xfield.StringField[struct{}])(nil)}},
-		"missing reference":      {Fields: xfield.Schema[struct{}]{"dialog": &ref{Meta: xfield.Meta{}, Ref: "user:missing"}}},
-		"empty reference":        {Fields: xfield.Schema[struct{}]{"dialog": &ref{Meta: xfield.Meta{}}}},
-		"self reference":         {Definitions: map[string]field{"user:a": &ref{Ref: "user:a"}}},
+		"empty definition name": {Definitions: map[string]field{"": &xfield.StringField[struct{}]{}}},
+		"whitespace name":       {Definitions: map[string]field{"bad name": &xfield.StringField[struct{}]{}}},
+		"nil definition":        {Definitions: map[string]field{"bad": (*xfield.StringField[struct{}])(nil)}},
+		"missing reference":     {Fields: xfield.Schema[struct{}]{"dialog": &ref{Ref: "missing"}}},
+		"empty reference":       {Fields: xfield.Schema[struct{}]{"dialog": &ref{}}},
+		"self reference":        {Definitions: map[string]field{"aDef": &ref{Ref: "aDef"}}},
 		"indirect reference": {Definitions: map[string]field{
-			"user:a": &ref{Ref: "user:b"},
-			"user:b": &xfield.ArrayField[struct{}]{Items: &ref{Ref: "user:a"}},
+			"aDef": &ref{Ref: "bDef"},
+			"bDef": &xfield.ArrayField[struct{}]{Items: &ref{Ref: "aDef"}},
 		}},
 		"unused invalid definition": {Definitions: map[string]field{
-			"user:bad": &xfield.ObjectField[struct{}]{Properties: xfield.Schema[struct{}]{"": &xfield.StringField[struct{}]{}}},
+			"bad": &xfield.ObjectField[struct{}]{Properties: xfield.Schema[struct{}]{"": &xfield.StringField[struct{}]{}}},
 		}},
 		"empty property name": {Fields: xfield.Schema[struct{}]{"": &xfield.StringField[struct{}]{}}},
-		"missing array items": {Fields: xfield.Schema[struct{}]{"items": &xfield.ArrayField[struct{}]{Meta: xfield.Meta{}}}},
+		"missing array items": {Fields: xfield.Schema[struct{}]{"items": &xfield.ArrayField[struct{}]{}}},
 	}
-	cycle := &xfield.ArrayField[struct{}]{Meta: xfield.Meta{}}
+	cycle := &xfield.ArrayField[struct{}]{}
 	cycle.Items = cycle
 	tests["pointer cycle"] = xfield.SchemaDocument[struct{}]{Fields: xfield.Schema[struct{}]{"cycle": cycle}}
 	var deep field = &xfield.StringField[struct{}]{}
 	for range xfield.MaxSchemaDepth {
 		deep = &xfield.ArrayField[struct{}]{Items: deep}
 	}
-	tests["deep definition"] = xfield.SchemaDocument[struct{}]{Definitions: map[string]field{"user:deep": deep}}
+	tests["deep definition"] = xfield.SchemaDocument[struct{}]{Definitions: map[string]field{"deep": deep}}
 	aliases := make(map[string]field)
 	for i := range xfield.MaxSchemaDepth + 1 {
-		aliases[fmt.Sprintf("user:%03d", i)] = &ref{Ref: fmt.Sprintf("user:%03d", i+1)}
+		aliases[fmt.Sprintf("%03d", i)] = &ref{Ref: fmt.Sprintf("%03d", i+1)}
 	}
-	aliases[fmt.Sprintf("user:%03d", xfield.MaxSchemaDepth+1)] = &xfield.StringField[struct{}]{}
+	aliases[fmt.Sprintf("%03d", xfield.MaxSchemaDepth+1)] = &xfield.StringField[struct{}]{}
 	tests["deep aliases"] = xfield.SchemaDocument[struct{}]{Definitions: aliases}
-	cachedAliases := map[string]field{"user:000": &xfield.StringField[struct{}]{}}
+	cachedAliases := map[string]field{"000": &xfield.StringField[struct{}]{}}
 	for i := 1; i <= xfield.MaxSchemaDepth; i++ {
-		cachedAliases[fmt.Sprintf("user:%03d", i)] = &ref{Ref: fmt.Sprintf("user:%03d", i-1)}
+		cachedAliases[fmt.Sprintf("%03d", i)] = &ref{Ref: fmt.Sprintf("%03d", i-1)}
 	}
 	tests["deep cached aliases"] = xfield.SchemaDocument[struct{}]{Definitions: cachedAliases}
 	for name, doc := range tests {
@@ -212,7 +207,7 @@ func TestCompileDocumentRejectsInvalidDeclarations(t *testing.T) {
 			}
 		})
 	}
-	refField := &ref{Meta: xfield.Meta{}, Ref: "user:dialog"}
+	refField := &ref{Ref: "dialog"}
 	if err := xfield.ValidateSchema(xfield.Schema[struct{}]{"refField": refField}); !errors.Is(err, xfield.ErrInvalidSchema) {
 		t.Fatalf("uncompiled schema: %v", err)
 	}
@@ -251,18 +246,18 @@ func TestCustomContainerCompiler(t *testing.T) {
 	container := &customReferenceObject{
 		ObjectField: xfield.ObjectField[*dependencies]{
 			Properties: xfield.Schema[*dependencies]{
-				"image": &xfield.RefField[*dependencies]{Meta: xfield.Meta{}, Ref: "user:resource"},
+				"image": &xfield.RefField[*dependencies]{Ref: "resource"},
 			},
 		},
 		Marker: "preserved",
 	}
 	doc := xfield.SchemaDocument[*dependencies]{
 		Definitions: map[string]xfield.Field[*dependencies]{
-			"user:resource": &resourceField{},
-			"user:asset":    container,
+			"resource": &resourceField{},
+			"assetDef": container,
 		},
 		Fields: xfield.Schema[*dependencies]{
-			"asset": &xfield.RefField[*dependencies]{Meta: xfield.Meta{}, Ref: "user:asset"},
+			"asset": &xfield.RefField[*dependencies]{Ref: "assetDef"},
 		},
 	}
 	schema, err := xfield.CompileDocument(doc)
