@@ -8,6 +8,7 @@ import (
 
 	"github.com/k0923/go/dflow"
 	"github.com/k0923/go/dflow/driver"
+	"github.com/k0923/go/dflow/examples/nodes"
 )
 
 type inputCounter struct {
@@ -37,10 +38,10 @@ func TestResumeNodeTargetsOneBranchAndReadsInputOnDemand(t *testing.T) {
 		})
 		graph := compile(t, dflow.Definition{
 			Nodes: []dflow.NodeSpec{
-				{ID: "start", Node: &dflow.StartNode{}},
+				{ID: "start", Node: &nodes.StartNode{}, Inputs: dflow.Parameters{"input": dflow.Input()}},
 				{ID: "a", Node: namedNode("custom"), Inputs: dflow.Parameters{"saved": dflow.Input("value")}},
 				{ID: "b", Node: namedNode("custom"), Inputs: dflow.Parameters{"saved": dflow.Input("value")}},
-				{ID: "after", Node: &dflow.EndNode{}, Inputs: dflow.Parameters{
+				{ID: "after", Node: &nodes.EndNode{}, Inputs: dflow.Parameters{
 					"text": dflow.PlainTemplate(`{{$input.value}} {{a.value}}`),
 				}},
 			},

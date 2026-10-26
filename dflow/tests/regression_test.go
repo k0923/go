@@ -10,6 +10,7 @@ import (
 
 	"github.com/k0923/go/dflow"
 	"github.com/k0923/go/dflow/driver"
+	"github.com/k0923/go/dflow/examples/nodes"
 	"github.com/k0923/go/dflow/memory"
 	"github.com/k0923/go/lease"
 )
@@ -18,7 +19,7 @@ func TestRegressionMissingInputFailsDurably(t *testing.T) {
 	backends(t, func(t *testing.T, infra dflow.Infrastructure) {
 		ctx := context.Background()
 		graph := compile(t, dflow.Definition{Nodes: []dflow.NodeSpec{
-			{ID: "out", Node: &dflow.EndNode{}, Inputs: dflow.Parameters{"required": dflow.Input("absent")}},
+			{ID: "out", Node: &nodes.EndNode{}, Inputs: dflow.Parameters{"required": dflow.Input("absent")}},
 		}}, nil)
 		e, err := dflow.NewEngine(graph, infra, dflow.Options{})
 		if err != nil {
@@ -254,14 +255,14 @@ func TestRegressionInputStorageFailureStaysRetryable(t *testing.T) {
 	backends(t, func(t *testing.T, infra dflow.Infrastructure) {
 		failure := errors.New("database unavailable")
 		e := engine(t, dflow.Definition{Nodes: []dflow.NodeSpec{{
-			ID: "node", Node: &dflow.EndNode{}, Inputs: dflow.Parameters{"x": dflow.Input("x")},
+			ID: "node", Node: &nodes.EndNode{}, Inputs: dflow.Parameters{"x": dflow.Input("x")},
 		}}}, nil, infra, dflow.Options{}).Engine
 		id, err := e.Start(context.Background(), map[string]any{"x": "ok"})
 		if err != nil {
 			t.Fatal(err)
 		}
 		graph := compile(t, dflow.Definition{Nodes: []dflow.NodeSpec{{
-			ID: "node", Node: &dflow.EndNode{}, Inputs: dflow.Parameters{"x": dflow.Input("x")},
+			ID: "node", Node: &nodes.EndNode{}, Inputs: dflow.Parameters{"x": dflow.Input("x")},
 		}}}, nil)
 		e, err = dflow.NewEngine(graph, unavailableInput{infra, failure}, dflow.Options{})
 		if err != nil {

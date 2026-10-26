@@ -10,6 +10,7 @@ import (
 	"encoding/gob"
 
 	"github.com/k0923/go/dflow"
+	"github.com/k0923/go/dflow/examples/nodes"
 )
 
 type Codec struct{}
@@ -32,7 +33,7 @@ func (Codec) Decode(raw []byte, target any) error {
 func init() {
 	gob.Register(map[string]any{})
 	gob.Register([]any{})
-	gob.Register(&dflow.EndNode{})
+	gob.Register(&nodes.EndNode{})
 	gob.Register(dflow.ConstantParameter{})
 	gob.Register(dflow.ReferenceParameter{})
 	gob.Register(dflow.TemplateParameter{})

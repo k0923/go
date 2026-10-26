@@ -18,7 +18,10 @@ graph, err := dflow.Compile(dflow.Definition{
             }),
             Inputs: dflow.Parameters{"price": dflow.Input("price")},
         },
-        {ID: "out", Node: &dflow.EndNode{},
+        {ID: "out", Node: dflow.NodeFunc(
+            func(ctx context.Context, input map[string]any) (dflow.Result, error) {
+                return dflow.Result{Output: input}, nil
+            }),
             Inputs: dflow.Parameters{"total": dflow.Ref("calculate", "total")}},
     },
     Edges: []dflow.Edge{{SourceNodeID: "calculate", TargetNodeID: "out"}},
@@ -56,20 +59,9 @@ type ResumableNode interface {
 
 `Result.Output` 是 `map[string]any`，与节点输入同为对象形态；map 内字段值支持存储实现接受的 Go 值，不做 JSON 规范化。`Ports == nil` 激活所有出边；非 nil 空数组不激活出边；非空数组选择对应端口。未激活节点标记为 skipped，继续传播依赖到达；对 skipped 节点输出的引用返回 `ErrMissingValue`。同一前驱的多条端口边只计一次依赖到达。
 
-默认实现：
+节点由业务实现，核心通过 `Node`／`ResumableNode` 契约调用它们。HTTP、JS、条件、JSON 解析、起始和结束节点的参考实现放在 [examples/nodes](examples/nodes/README.md)，业务可以复制或替换；使用 dflow 核心不会引入 JS VM 或 HTTP 节点依赖。
 
-| 实现 | 功能 |
-| --- | --- |
-| `StartNode` | 无显式 Inputs 时返回完整工作流输入 |
-| `EndNode` / `PassthroughNode` | 返回节点输入 |
-| `ConditionNode` | 根据布尔输入 condition 选择 true/false 端口 |
-| `JSONParseNode` | 解析顶层为对象的 json 字符串输入 |
-| `CodeNode` | 通过 `NewCodeNode(CodeConfig)` 编译 JS，每次执行创建独立 VM，脚本必须返回对象 |
-| `HTTPNode` | 请求 HTTP 服务，返回 body、headers、statusCode |
-
-JS 定义 `main({params})`（也支持 `run(params)`）；没有文件、网络或事件循环。脚本执行和输出转换均受超时约束，不支持 pending Promise。HTTP 默认 GET、30 秒、8 MiB 响应上限；重试要求幂等方法、Idempotency-Key 或显式 RetryNonIdempotent。HTTP 非 2xx 仍返回响应供业务判断；默认使用 `http.DefaultClient`，可直接设置 Client。
-
-JSONParse、HTTP、JS 和 JSON 模板内部的编码是节点功能，不是框架的定义或状态存储协议。
+图中的唯一 root 就是起始节点，无需指定节点类型。所有输入都通过 `Parameters` 声明，空 Inputs 对所有节点都解析为空对象；不会自动注入完整工作流输入。需要完整输入时使用 `dflow.Input()`，例如参考 `nodes.StartNode` 的 `Inputs: dflow.Parameters{"input": dflow.Input()}`。原 `dflow.StartNode` 等类型已移至示例包，迁移时应调整 import 并显式绑定输入。
 
 ## 参数
 
@@ -168,7 +160,9 @@ type Codec interface {
 }
 ```
 
-Codec 必须恢复 Suspension、回调数据，以及发布记录中的 Node/Parameter 的具体类型；节点中的服务客户端或函数由业务重建。可使用包含 `xjson.G[dflow.Node]`、`xjson.G[dflow.Parameter]`、`xjson.G[dflow.Suspension]` 的业务 DTO。dflow 不依赖 xjson，不提供默认编码协议。更换协议时由业务迁移存量记录或使用新数据库。
+Codec 必须恢复 Suspension、回调数据，以及发布记录中的 Node/Parameter 的具体类型；节点中的服务客户端或函数由业务重建。dflow 的定义、状态、结果和节点配置不声明 JSON tags，也不提供类型注册或默认编码协议；业务 DTO 决定字段名、布局和具体类型。
+
+完整实现见 [examples/xjson](examples/xjson/README.md)：业务通过 `xjson.G[NodeConfig]` 保存节点配置，显式构造可执行 Node 并注入服务；通过 `xjson.G[dflow.Parameter]`、`xjson.G[dflow.Suspension]` 和业务回调接口恢复具体类型。示例用 SQLite 演示定义发布、关闭数据库后重建依赖、挂起和回调恢复。dflow 不依赖 xjson。更换协议时由业务迁移存量记录或使用新数据库；直接序列化 dflow 类型的业务应先定义自己的 DTO。
 
 ## 业务组合
 

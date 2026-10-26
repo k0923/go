@@ -54,12 +54,12 @@ func (f NodeFunc) Run(ctx context.Context, input map[string]any) (Result, error)
 // Result 输出值必须被应用的 Infrastructure 支持。Ports 选择出边源端口：
 // nil 会激活所有边；非 nil 的空切片不会激活任何边。
 type Result struct {
-	Output map[string]any `json:"output"`
-	Ports  []string       `json:"ports"`
+	Output map[string]any
+	Ports  []string
 	// Suspend is mutually exclusive with Output and Ports.
 	//
 	// Suspend 与 Output 和 Ports 互斥。
-	Suspend Suspension `json:"-"`
+	Suspend Suspension
 }
 
 // NodeID returns the current node's stable ID, useful for business idempotency.

@@ -1,15 +1,17 @@
-package dflow
+package nodes
 
 import (
 	"context"
 	"fmt"
+
+	"github.com/k0923/go/dflow"
 )
 
 // FuncNode adapts a handler into a node.
 //
 // FuncNode 将处理函数适配为节点。
 type FuncNode struct {
-	Handler NodeFunc
+	Handler dflow.NodeFunc
 }
 
 func (n *FuncNode) Validate() error {
@@ -19,9 +21,9 @@ func (n *FuncNode) Validate() error {
 	return nil
 }
 
-func (n *FuncNode) Run(ctx context.Context, input map[string]any) (Result, error) {
+func (n *FuncNode) Run(ctx context.Context, input map[string]any) (dflow.Result, error) {
 	if err := n.Validate(); err != nil {
-		return Result{}, err
+		return dflow.Result{}, err
 	}
 	return n.Handler(ctx, input)
 }

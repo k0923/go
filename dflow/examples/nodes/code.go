@@ -1,4 +1,4 @@
-package dflow
+package nodes
 
 import (
 	"context"
@@ -10,16 +10,17 @@ import (
 	"time"
 
 	"github.com/dop251/goja"
+	"github.com/k0923/go/dflow"
 )
 
 type Script struct {
-	Language string `json:"language,omitempty"`
-	Content  string `json:"content"`
+	Language string
+	Content  string
 }
 
 type CodeConfig struct {
-	Script    Script `json:"script"`
-	TimeoutMS int64  `json:"timeoutMs,omitempty"`
+	Script    Script
+	TimeoutMS int64
 }
 
 type CodeNode struct {
@@ -67,14 +68,14 @@ func (n *CodeNode) Validate() error {
 	return nil
 }
 
-func (n *CodeNode) Run(parent context.Context, input map[string]any) (Result, error) {
+func (n *CodeNode) Run(parent context.Context, input map[string]any) (dflow.Result, error) {
 	if err := n.Validate(); err != nil {
-		return Result{}, err
+		return dflow.Result{}, err
 	}
 	ctx, cancel := context.WithTimeout(parent, n.timeout)
 	defer cancel()
 	if err := ctx.Err(); err != nil {
-		return Result{}, err
+		return dflow.Result{}, err
 	}
 	vm := goja.New()
 	vm.SetMaxCallStackSize(1000)
@@ -87,7 +88,7 @@ func (n *CodeNode) Run(parent context.Context, input map[string]any) (Result, er
 		return function(value) { return stringify(value); };
 	})(JSON.stringify)`)
 	if err != nil {
-		return Result{}, err
+		return dflow.Result{}, err
 	}
 	stringify, _ := goja.AssertFunction(stringifier)
 	parse, _ := goja.AssertFunction(vm.Get("JSON").ToObject(vm).Get("parse"))
@@ -115,13 +116,13 @@ func (n *CodeNode) Run(parent context.Context, input map[string]any) (Result, er
 		}
 		return goja.Undefined()
 	}); err != nil {
-		return Result{}, err
+		return dflow.Result{}, err
 	}
-	failure := func(err error) (Result, error) {
+	failure := func(err error) (dflow.Result, error) {
 		if ctx.Err() != nil {
 			err = ctx.Err()
 		}
-		return Result{}, err
+		return dflow.Result{}, err
 	}
 	entry, err := vm.RunProgram(n.program)
 	if err != nil {
@@ -188,5 +189,5 @@ func (n *CodeNode) Run(parent context.Context, input map[string]any) (Result, er
 	if ctx.Err() != nil {
 		return failure(ctx.Err())
 	}
-	return Result{Output: output}, nil
+	return dflow.Result{Output: output}, nil
 }

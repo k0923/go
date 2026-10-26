@@ -32,20 +32,20 @@ type SuspensionState struct {
 }
 
 type NodeState struct {
-	Version int64          `json:"version"`
-	Status  Status         `json:"status"`
-	Input   map[string]any `json:"input,omitempty"`
-	Output  map[string]any `json:"output"`
-	Ports   []string       `json:"ports"`
-	Error   string         `json:"error,omitempty"`
+	Version int64
+	Status  Status
+	Input   map[string]any
+	Output  map[string]any
+	Ports   []string
+	Error   string
 	// Retained during Resume execution/failure so recovery retries Resume.
 	//
 	// 在 Resume 执行或失败期间保留，以便恢复时重试 Resume。
-	Suspension *SuspensionState `json:"suspension,omitempty"`
-	Incoming   map[string]bool  `json:"incoming,omitempty"`
-	Ready      bool             `json:"ready"`
-	Enabled    bool             `json:"enabled"`
-	Generation int64            `json:"generation"`
+	Suspension *SuspensionState
+	Incoming   map[string]bool
+	Ready      bool
+	Enabled    bool
+	Generation int64
 }
 
 // State is a snapshot of node states and immutable execution inputs. It has no
@@ -55,10 +55,10 @@ type NodeState struct {
 // State 是节点状态和不可变执行输入的快照。它没有工作流生命周期或整体状态。
 // 调用方自行决定这些节点状态在业务中代表什么（已完成、等待审批、部分成功等）。
 type State struct {
-	Version        int64                `json:"version"`
-	DefinitionHash string               `json:"definitionHash"`
-	Input          map[string]any       `json:"input"`
-	Nodes          map[string]NodeState `json:"nodes"`
+	Version        int64
+	DefinitionHash string
+	Input          map[string]any
+	Nodes          map[string]NodeState
 }
 
 // Infrastructure is scoped by the business to one execution (RunID/TenantID are
@@ -212,10 +212,10 @@ const (
 )
 
 type Notification struct {
-	ID     int64            `json:"id"`
-	Kind   NotificationKind `json:"kind"`
-	NodeID string           `json:"nodeID"`
-	Token  string           `json:"token"`
+	ID     int64
+	Kind   NotificationKind
+	NodeID string
+	Token  string
 	// Request is captured at registration so later node state cannot alter it.
 	//
 	// Request 在注册时捕获，因此之后的节点状态无法改变它。

@@ -11,6 +11,7 @@ import (
 	"github.com/k0923/go/dflow"
 	"github.com/k0923/go/dflow/driver"
 	"github.com/k0923/go/dflow/examples/internal/appcodec"
+	"github.com/k0923/go/dflow/examples/nodes"
 	"github.com/k0923/go/dflow/sqlite"
 )
 
@@ -55,7 +56,7 @@ func main() {
 			Version: "1",
 			Nodes: []dflow.NodeSpec{
 				{ID: "task", Node: taskNode{}},
-				{ID: "end", Node: &dflow.EndNode{}, Inputs: dflow.Parameters{"result": dflow.Ref("task")}},
+				{ID: "end", Node: &nodes.EndNode{}, Inputs: dflow.Parameters{"result": dflow.Ref("task")}},
 			},
 			Edges: []dflow.Edge{{SourceNodeID: "task", TargetNodeID: "end"}},
 		})

@@ -1,4 +1,4 @@
-package dflow
+package nodes
 
 import (
 	"bytes"
@@ -10,6 +10,8 @@ import (
 	"net/url"
 	"strings"
 	"time"
+
+	"github.com/k0923/go/dflow"
 )
 
 // HTTPNode receives url, headers, params, body and auth as resolved node inputs.
@@ -18,19 +20,19 @@ import (
 // HTTPNode 接收已经解析的 url、headers、params、body 和 auth 节点输入。
 // 非 2xx 响应会作为输出返回，供下游业务决策。
 type HTTPNode struct {
-	Method string `json:"method,omitempty"`
+	Method string
 	// BodyType accepts none, JSON or raw-text.
 	//
 	// BodyType 接受 none、JSON 或 raw-text。
-	BodyType           string `json:"bodyType,omitempty"`
-	TimeoutMS          int64  `json:"timeoutMs,omitempty"`
-	RetryTimes         int    `json:"retryTimes,omitempty"`
-	RetryNonIdempotent bool   `json:"retryNonIdempotent,omitempty"`
-	MaxResponseBytes   int64  `json:"maxResponseBytes,omitempty"`
-	// Inject a client through the factory for custom transport/redirect policy.
+	BodyType           string
+	TimeoutMS          int64
+	RetryTimes         int
+	RetryNonIdempotent bool
+	MaxResponseBytes   int64
+	// Inject a client for custom transport/redirect policy.
 	//
-	// 通过工厂注入 client，以自定义 transport 或 redirect 策略。
-	Client *http.Client `json:"-"`
+	// 注入 client，以自定义 transport 或 redirect 策略。
+	Client *http.Client
 }
 
 func (n *HTTPNode) Validate() error {
@@ -53,9 +55,9 @@ func (n *HTTPNode) Validate() error {
 	return err
 }
 
-func (n *HTTPNode) Run(parent context.Context, input map[string]any) (Result, error) {
+func (n *HTTPNode) Run(parent context.Context, input map[string]any) (dflow.Result, error) {
 	if err := n.Validate(); err != nil {
-		return Result{}, err
+		return dflow.Result{}, err
 	}
 	timeout := n.TimeoutMS
 	if timeout == 0 {
@@ -65,15 +67,15 @@ func (n *HTTPNode) Run(parent context.Context, input map[string]any) (Result, er
 	defer cancel()
 	address, ok := input["url"].(string)
 	if !ok || address == "" {
-		return Result{}, fmt.Errorf("http: url input must be a nonempty string")
+		return dflow.Result{}, fmt.Errorf("http: url input must be a nonempty string")
 	}
 	target, err := url.Parse(address)
 	if err != nil || (target.Scheme != "http" && target.Scheme != "https") || target.Host == "" {
-		return Result{}, fmt.Errorf("http: url must be an absolute HTTP(S) URL")
+		return dflow.Result{}, fmt.Errorf("http: url must be an absolute HTTP(S) URL")
 	}
 	params, err := httpValues(input["params"], "params")
 	if err != nil {
-		return Result{}, err
+		return dflow.Result{}, err
 	}
 	query := target.Query()
 	for key, values := range params {
@@ -82,7 +84,7 @@ func (n *HTTPNode) Run(parent context.Context, input map[string]any) (Result, er
 	target.RawQuery = query.Encode()
 	headers, err := httpValues(input["headers"], "headers")
 	if err != nil {
-		return Result{}, err
+		return dflow.Result{}, err
 	}
 	header := make(http.Header)
 	for key, values := range headers {
@@ -90,13 +92,13 @@ func (n *HTTPNode) Run(parent context.Context, input map[string]any) (Result, er
 	}
 	body, contentType, err := n.body(input["body"])
 	if err != nil {
-		return Result{}, err
+		return dflow.Result{}, err
 	}
 	if header.Get("Content-Type") == "" && contentType != "" {
 		header.Set("Content-Type", contentType)
 	}
 	if err := httpAuth(header, input["auth"]); err != nil {
-		return Result{}, err
+		return dflow.Result{}, err
 	}
 	method := n.Method
 	if method == "" {
@@ -108,7 +110,7 @@ func (n *HTTPNode) Run(parent context.Context, input map[string]any) (Result, er
 		retrySafe = true
 	}
 	if n.RetryTimes > 0 && !retrySafe {
-		return Result{}, fmt.Errorf("http: retry requires an idempotent method, Idempotency-Key or retryNonIdempotent")
+		return dflow.Result{}, fmt.Errorf("http: retry requires an idempotent method, Idempotency-Key or retryNonIdempotent")
 	}
 	client := n.Client
 	if client == nil {
@@ -120,32 +122,32 @@ func (n *HTTPNode) Run(parent context.Context, input map[string]any) (Result, er
 	}
 	for attempt := 0; ; attempt++ {
 		if err := ctx.Err(); err != nil {
-			return Result{}, err
+			return dflow.Result{}, err
 		}
 		req, err := http.NewRequestWithContext(ctx, method, target.String(), bytes.NewReader(body))
 		if err != nil {
-			return Result{}, err
+			return dflow.Result{}, err
 		}
 		req.Header = header.Clone()
 		resp, requestErr := client.Do(req)
 		if requestErr != nil {
 			if ctx.Err() != nil {
-				return Result{}, ctx.Err()
+				return dflow.Result{}, ctx.Err()
 			}
 			if attempt == n.RetryTimes {
-				return Result{}, fmt.Errorf("http request: %w", requestErr)
+				return dflow.Result{}, fmt.Errorf("http request: %w", requestErr)
 			}
 		} else {
 			data, readErr := io.ReadAll(io.LimitReader(resp.Body, limit+1))
 			closeErr := resp.Body.Close()
 			if readErr != nil {
-				return Result{}, fmt.Errorf("http response: %w", readErr)
+				return dflow.Result{}, fmt.Errorf("http response: %w", readErr)
 			}
 			if closeErr != nil {
-				return Result{}, fmt.Errorf("http response close: %w", closeErr)
+				return dflow.Result{}, fmt.Errorf("http response close: %w", closeErr)
 			}
 			if int64(len(data)) > limit {
-				return Result{}, fmt.Errorf("http response exceeds %d bytes", limit)
+				return dflow.Result{}, fmt.Errorf("http response exceeds %d bytes", limit)
 			}
 			if (resp.StatusCode >= 200 && resp.StatusCode < 300) || attempt == n.RetryTimes {
 				outHeaders := make(map[string]any, len(resp.Header))
@@ -156,7 +158,7 @@ func (n *HTTPNode) Run(parent context.Context, input map[string]any) (Result, er
 						outHeaders[key] = append([]string(nil), values...)
 					}
 				}
-				return Result{Output: map[string]any{
+				return dflow.Result{Output: map[string]any{
 					"body": string(data), "headers": outHeaders, "statusCode": resp.StatusCode,
 				}}, nil
 			}
@@ -165,7 +167,7 @@ func (n *HTTPNode) Run(parent context.Context, input map[string]any) (Result, er
 		select {
 		case <-ctx.Done():
 			timer.Stop()
-			return Result{}, ctx.Err()
+			return dflow.Result{}, ctx.Err()
 		case <-timer.C:
 		}
 	}
@@ -261,7 +263,12 @@ func httpAuth(header http.Header, value any) error {
 	if err != nil {
 		return err
 	}
-	if err := decodeConfig(raw, &auth); err != nil {
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.DisallowUnknownFields()
+	if bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+		return fmt.Errorf("http auth: must be an object")
+	}
+	if err := decoder.Decode(&auth); err != nil {
 		return fmt.Errorf("http auth: %w", err)
 	}
 	switch auth.Type {

@@ -7,12 +7,13 @@ import (
 
 	"github.com/k0923/go/dflow"
 	"github.com/k0923/go/dflow/driver"
+	"github.com/k0923/go/dflow/examples/nodes"
 	"github.com/k0923/go/dflow/memory"
 )
 
 func main() {
-	code, err := dflow.NewCodeNode(dflow.CodeConfig{
-		Script: dflow.Script{Content: `function main({params}) { return {total: params.price * 2}; }`},
+	code, err := nodes.NewCodeNode(nodes.CodeConfig{
+		Script: nodes.Script{Content: `function main({params}) { return {total: params.price * 2}; }`},
 	})
 	if err != nil {
 		log.Fatal(err)
@@ -20,9 +21,9 @@ func main() {
 	graph, err := dflow.Compile(dflow.Definition{
 		Version: "basic-v1",
 		Nodes: []dflow.NodeSpec{
-			{ID: "start", Node: &dflow.StartNode{}},
+			{ID: "start", Node: &nodes.StartNode{}, Inputs: dflow.Parameters{"input": dflow.Input()}},
 			{ID: "calculate", Node: code, Inputs: dflow.Parameters{"price": dflow.Ref("start", "price")}},
-			{ID: "end", Node: &dflow.EndNode{}, Inputs: dflow.Parameters{"total": dflow.Ref("calculate", "total")}},
+			{ID: "end", Node: &nodes.EndNode{}, Inputs: dflow.Parameters{"total": dflow.Ref("calculate", "total")}},
 		},
 		Edges: []dflow.Edge{
 			{SourceNodeID: "start", TargetNodeID: "calculate"},

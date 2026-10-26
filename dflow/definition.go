@@ -15,9 +15,9 @@ type NodeSpec struct {
 }
 
 type Edge struct {
-	SourceNodeID string `json:"sourceNodeID"`
-	TargetNodeID string `json:"targetNodeID"`
-	SourcePortID string `json:"sourcePortID,omitempty"`
+	SourceNodeID string
+	TargetNodeID string
+	SourcePortID string
 }
 
 // Definition has exactly one root/start node and may have multiple sinks. All
@@ -27,9 +27,9 @@ type Edge struct {
 // Definition 恰好有一个 root/start 节点，并且可以有多个 sink。所有节点都会
 // 参与执行。当应用提供的节点实现发生变化时，Version 必须随之变化。
 type Definition struct {
-	Version string     `json:"version,omitempty"`
-	Nodes   []NodeSpec `json:"nodes"`
-	Edges   []Edge     `json:"edges"`
+	Version string
+	Nodes   []NodeSpec
+	Edges   []Edge
 }
 
 // Graph is compiled, immutable and reusable across run-scoped infrastructures.
@@ -164,8 +164,8 @@ func Compile(definition Definition) (*Graph, error) {
 //
 // Manifest 是启动或恢复执行所需的小型不可变头信息。
 type Manifest struct {
-	Hash  string `json:"hash"`
-	Start string `json:"start"`
+	Hash  string
+	Start string
 }
 
 // PublishedNode contains an executable node plus validated topology. Incoming
@@ -174,9 +174,9 @@ type Manifest struct {
 // PublishedNode 包含可执行节点和已校验的拓扑。Incoming 保存唯一的前驱节点
 // ID，而不是入端口数量。
 type PublishedNode struct {
-	Spec     NodeSpec `json:"spec"`
-	Incoming []string `json:"incoming"`
-	Outgoing []Edge   `json:"outgoing"`
+	Spec     NodeSpec
+	Incoming []string
+	Outgoing []Edge
 }
 
 // DefinitionProvider binds to ONE immutable, already validated publication.

@@ -4,12 +4,14 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"reflect"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/k0923/go/dflow"
 	"github.com/k0923/go/dflow/driver"
+	"github.com/k0923/go/dflow/examples/nodes"
 	"github.com/k0923/go/dflow/memory"
 	"github.com/k0923/go/lease"
 )
@@ -64,7 +66,7 @@ func TestCompileRejectsInvalidGraphsAndReferences(t *testing.T) {
 	base := func() dflow.Definition {
 		return dflow.Definition{
 			Version: "v1",
-			Nodes:   []dflow.NodeSpec{{ID: "a", Node: &dflow.PassthroughNode{}}, {ID: "b", Node: &dflow.PassthroughNode{}}},
+			Nodes:   []dflow.NodeSpec{{ID: "a", Node: &nodes.PassthroughNode{}}, {ID: "b", Node: &nodes.PassthroughNode{}}},
 			Edges:   []dflow.Edge{edge("a", "b")},
 		}
 	}
@@ -84,7 +86,7 @@ func TestCompileRejectsInvalidGraphsAndReferences(t *testing.T) {
 			d.Nodes[0].Inputs = dflow.Parameters{"x": dflow.Ref("b")}
 		}, dflow.ErrInvalidReference},
 		{"sibling reference", func(d *dflow.Definition) {
-			d.Nodes = append(d.Nodes, dflow.NodeSpec{ID: "c", Node: &dflow.PassthroughNode{}})
+			d.Nodes = append(d.Nodes, dflow.NodeSpec{ID: "c", Node: &nodes.PassthroughNode{}})
 			d.Edges = append(d.Edges, edge("a", "c"))
 			d.Nodes[1].Inputs = dflow.Parameters{"x": dflow.Ref("c")}
 		}, dflow.ErrInvalidReference},
@@ -92,7 +94,7 @@ func TestCompileRejectsInvalidGraphsAndReferences(t *testing.T) {
 			d.Nodes[0].Inputs = dflow.Parameters{"x": dflow.Template("{{ b.secret }}")}
 		}, dflow.ErrInvalidReference},
 		{"nil node", func(d *dflow.Definition) { d.Nodes[1].Node = nil }, dflow.ErrInvalidDefinition},
-		{"typed nil node", func(d *dflow.Definition) { d.Nodes[1].Node = (*dflow.EndNode)(nil) }, dflow.ErrInvalidDefinition},
+		{"typed nil node", func(d *dflow.Definition) { d.Nodes[1].Node = (*nodes.EndNode)(nil) }, dflow.ErrInvalidDefinition},
 		{"missing version", func(d *dflow.Definition) { d.Version = "" }, dflow.ErrInvalidDefinition},
 	}
 	for _, tc := range cases {
@@ -112,9 +114,9 @@ func TestDAGReferencesAndSnapshotIsolation(t *testing.T) {
 	infra := memory.New()
 	def := dflow.Definition{
 		Nodes: []dflow.NodeSpec{
-			{ID: "start", Node: &dflow.StartNode{}},
-			{ID: "middle", Node: &dflow.PassthroughNode{}},
-			{ID: "end", Node: &dflow.EndNode{}, Inputs: dflow.Parameters{
+			{ID: "start", Node: &nodes.StartNode{}, Inputs: dflow.Parameters{"input": dflow.Input()}},
+			{ID: "middle", Node: &nodes.PassthroughNode{}},
+			{ID: "end", Node: &nodes.EndNode{}, Inputs: dflow.Parameters{
 				"value": dflow.Ref("start", "items", "0", "name"),
 				"null":  dflow.Ref("start", "null"),
 				"json":  dflow.Template(`{"name": {{start.items.0.name}}}`),
@@ -144,6 +146,51 @@ func TestDAGReferencesAndSnapshotIsolation(t *testing.T) {
 	_, err = e.Run(context.Background(), map[string]any{"different": true})
 	if !errors.Is(err, dflow.ErrRunMismatch) {
 		t.Fatalf("expected run mismatch, got %v", err)
+	}
+}
+
+func TestRootReceivesOnlyDeclaredInputs(t *testing.T) {
+	input := map[string]any{"price": 21, "private": "business value"}
+	for _, tc := range []struct {
+		name     string
+		inputs   dflow.Parameters
+		expected map[string]any
+	}{
+		{name: "empty", expected: map[string]any{}},
+		{name: "field", inputs: dflow.Parameters{"price": dflow.Input("price")},
+			expected: map[string]any{"price": 21}},
+		{name: "whole input", inputs: dflow.Parameters{"body": dflow.Input()},
+			expected: map[string]any{"body": input}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			graph, err := dflow.Compile(dflow.Definition{
+				Version: "root-input-v1",
+				Nodes: []dflow.NodeSpec{{
+					ID: "root", Inputs: tc.inputs,
+					Node: dflow.NodeFunc(func(_ context.Context, resolved map[string]any) (dflow.Result, error) {
+						return dflow.Result{Output: resolved}, nil
+					}),
+				}},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			store := memory.New()
+			e, err := dflow.NewEngine(graph, store, dflow.Options{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := driver.Run(context.Background(), e, input); err != nil {
+				t.Fatal(err)
+			}
+			state, err := store.GetNode(context.Background(), "root")
+			if err != nil || state == nil {
+				t.Fatal(state, err)
+			}
+			if !reflect.DeepEqual(state.Output, tc.expected) {
+				t.Fatalf("unexpected resolved root input: %#v", state.Output)
+			}
+		})
 	}
 }
 
@@ -192,11 +239,11 @@ func TestResumeRetriesOnlyUnfinishedNodes(t *testing.T) {
 func TestBranchSkipAndMerge(t *testing.T) {
 	def := dflow.Definition{
 		Nodes: []dflow.NodeSpec{
-			{ID: "branch", Node: &dflow.ConditionNode{}, Inputs: dflow.Parameters{"condition": dflow.Constant(true)}},
-			{ID: "yes", Node: &dflow.PassthroughNode{}},
-			{ID: "no", Node: &dflow.PassthroughNode{}},
-			{ID: "no-child", Node: &dflow.PassthroughNode{}},
-			{ID: "merge", Node: &dflow.EndNode{}, Inputs: dflow.Parameters{"value": dflow.Ref("branch", "matchedKey")}},
+			{ID: "branch", Node: &nodes.ConditionNode{}, Inputs: dflow.Parameters{"condition": dflow.Constant(true)}},
+			{ID: "yes", Node: &nodes.PassthroughNode{}},
+			{ID: "no", Node: &nodes.PassthroughNode{}},
+			{ID: "no-child", Node: &nodes.PassthroughNode{}},
+			{ID: "merge", Node: &nodes.EndNode{}, Inputs: dflow.Parameters{"value": dflow.Ref("branch", "matchedKey")}},
 		},
 		Edges: []dflow.Edge{
 			{SourceNodeID: "branch", TargetNodeID: "yes", SourcePortID: "true"},
@@ -231,10 +278,10 @@ func TestSerialFanoutWaitsForAllPredecessors(t *testing.T) {
 	})
 	def := dflow.Definition{
 		Nodes: []dflow.NodeSpec{
-			{ID: "start", Node: &dflow.StartNode{}},
+			{ID: "start", Node: &nodes.StartNode{}, Inputs: dflow.Parameters{"input": dflow.Input()}},
 			{ID: "a", Node: namedNode("mark")},
 			{ID: "b", Node: namedNode("mark")},
-			{ID: "join", Node: &dflow.EndNode{}, Inputs: dflow.Parameters{"a": dflow.Ref("a", "value"), "b": dflow.Ref("b", "value")}},
+			{ID: "join", Node: &nodes.EndNode{}, Inputs: dflow.Parameters{"a": dflow.Ref("a", "value"), "b": dflow.Ref("b", "value")}},
 		},
 		Edges: []dflow.Edge{edge("start", "a"), edge("start", "b"), edge("a", "join"), edge("b", "join")},
 	}
@@ -295,7 +342,7 @@ func TestPersistenceFailureDoesNotStartDownstream(t *testing.T) {
 	infra := &failingSave{Infrastructure: memory.New()}
 	infra.fail.Store(true)
 	def := dflow.Definition{
-		Nodes: []dflow.NodeSpec{{ID: "a", Node: &dflow.PassthroughNode{}}, {ID: "b", Node: namedNode("downstream")}},
+		Nodes: []dflow.NodeSpec{{ID: "a", Node: &nodes.PassthroughNode{}}, {ID: "b", Node: namedNode("downstream")}},
 		Edges: []dflow.Edge{edge("a", "b")},
 	}
 	e := engine(t, def, registry, infra, dflow.Options{})

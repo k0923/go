@@ -10,6 +10,7 @@ import (
 
 	"github.com/k0923/go/dflow"
 	"github.com/k0923/go/dflow/driver"
+	"github.com/k0923/go/dflow/examples/nodes"
 	"github.com/k0923/go/dflow/memory"
 )
 
@@ -22,12 +23,12 @@ func main() {
 	graph, err := dflow.Compile(dflow.Definition{
 		Version: "http-v1",
 		Nodes: []dflow.NodeSpec{
-			{ID: "request", Node: &dflow.HTTPNode{Method: "GET", TimeoutMS: 5000},
+			{ID: "request", Node: &nodes.HTTPNode{Method: "GET", TimeoutMS: 5000},
 				Inputs: dflow.Parameters{
 					"url": dflow.Constant(server.URL), "params": dflow.Input("query"),
 				}},
-			{ID: "parse", Node: &dflow.JSONParseNode{}, Inputs: dflow.Parameters{"json": dflow.Ref("request", "body")}},
-			{ID: "end", Node: &dflow.EndNode{}, Inputs: dflow.Parameters{"message": dflow.Ref("parse", "message")}},
+			{ID: "parse", Node: &nodes.JSONParseNode{}, Inputs: dflow.Parameters{"json": dflow.Ref("request", "body")}},
+			{ID: "end", Node: &nodes.EndNode{}, Inputs: dflow.Parameters{"message": dflow.Ref("parse", "message")}},
 		},
 		Edges: []dflow.Edge{
 			{SourceNodeID: "request", TargetNodeID: "parse"},

@@ -1,0 +1,37 @@
+{
+  "version": "review-v1",
+  "nodes": [
+    {
+      "id": "calculate",
+      "node": {
+        "type": "script",
+        "content": "function main({params}) { return {total: params.number * params.factor}; }"
+      },
+      "inputs": {
+        "number": {"type": "reference", "path": ["$input", "number"]},
+        "factor": {"type": "constant", "value": 2}
+      }
+    },
+    {
+      "id": "review",
+      "node": {"type": "review", "approver": "财务"},
+      "inputs": {
+        "total": {"type": "reference", "path": ["calculate", "total"]}
+      }
+    },
+    {
+      "id": "end",
+      "node": {"type": "end"},
+      "inputs": {
+        "approved": {"type": "reference", "path": ["review", "approved"]},
+        "total": {"type": "reference", "path": ["review", "total"]},
+        "summary": {"type": "template", "text": "结果：{{review.summary}}"},
+        "json": {"type": "template", "text": "{\"approved\": {{review.approved}}}", "json": true}
+      }
+    }
+  ],
+  "edges": [
+    {"source": "calculate", "target": "review"},
+    {"source": "review", "target": "end"}
+  ]
+}

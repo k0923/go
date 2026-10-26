@@ -399,17 +399,6 @@ func (e *Engine) execute(parent context.Context, task *NodeTask) (published *Pub
 		if err != nil {
 			return published, result, err
 		}
-		if _, start := node.(*StartNode); start && len(published.Spec.Inputs) == 0 {
-			value, readErr := e.infra.GetInput(ctx)
-			if readErr != nil {
-				return published, result, &InfrastructureError{"GetInput", readErr}
-			}
-			var ok bool
-			nodeInput, ok = value.(map[string]any)
-			if !ok {
-				return published, result, ErrInvalidDefinition
-			}
-		}
 		task.State.Input = nodeInput
 	}
 	if suspension := task.State.Suspension; suspension != nil {

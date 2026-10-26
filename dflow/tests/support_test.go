@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/gob"
-	"encoding/json"
 	"fmt"
 	"sync"
 	"sync/atomic"
@@ -22,28 +21,6 @@ type namedNode string
 
 func (n namedNode) Run(context.Context, map[string]any) (dflow.Result, error) {
 	return dflow.Result{}, fmt.Errorf("unbound fixture node %q", n)
-}
-
-func configuredFixture(kind string, raw json.RawMessage) dflow.Node {
-	var node dflow.Node
-	switch kind {
-	case "http":
-		node = &dflow.HTTPNode{}
-	case "code":
-		var config dflow.CodeConfig
-		if err := json.Unmarshal(raw, &config); err != nil {
-			panic(err)
-		}
-		code, err := dflow.NewCodeNode(config)
-		if err != nil {
-			panic(err)
-		}
-		return code
-	}
-	if err := json.Unmarshal(raw, node); err != nil {
-		panic(err)
-	}
-	return node
 }
 
 func compile(t *testing.T, def dflow.Definition, registry testRegistry) *dflow.Graph {

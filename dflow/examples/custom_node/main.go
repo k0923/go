@@ -8,6 +8,7 @@ import (
 
 	"github.com/k0923/go/dflow"
 	"github.com/k0923/go/dflow/driver"
+	"github.com/k0923/go/dflow/examples/nodes"
 	"github.com/k0923/go/dflow/memory"
 )
 
@@ -44,7 +45,7 @@ func main() {
 		Nodes: []dflow.NodeSpec{
 			{ID: "greeting", Node: &greetingNode{Suffix: "！", service: service},
 				Inputs: dflow.Parameters{"name": dflow.Input("name")}},
-			{ID: "end", Node: &dflow.EndNode{}, Inputs: dflow.Parameters{"text": dflow.Ref("greeting", "message")}},
+			{ID: "end", Node: &nodes.EndNode{}, Inputs: dflow.Parameters{"text": dflow.Ref("greeting", "message")}},
 		},
 		Edges: []dflow.Edge{{SourceNodeID: "greeting", TargetNodeID: "end"}},
 	})

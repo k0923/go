@@ -7,6 +7,7 @@ import (
 
 	"github.com/k0923/go/dflow"
 	"github.com/k0923/go/dflow/driver"
+	"github.com/k0923/go/dflow/examples/nodes"
 	"github.com/k0923/go/dflow/memory"
 )
 
@@ -34,7 +35,7 @@ func TestCustomParameterAndConcreteGoValues(t *testing.T) {
 			{ID: "source", Node: dflow.NodeFunc(func(context.Context, map[string]any) (dflow.Result, error) {
 				return dflow.Result{Output: map[string]any{"order": value}}, nil
 			})},
-			{ID: "out", Node: &dflow.EndNode{}, Inputs: dflow.Parameters{
+			{ID: "out", Node: &nodes.EndNode{}, Inputs: dflow.Parameters{
 				"amount": doubledParameter{Path: []string{"source", "order", "Amount"}},
 				"bytes":  dflow.Constant([]byte{1, 2}),
 				"cycle":  dflow.Constant(cyclic),
@@ -87,7 +88,7 @@ func TestParameterDependencyValidation(t *testing.T) {
 		_, err := dflow.Compile(dflow.Definition{
 			Version: "v1",
 			Nodes: []dflow.NodeSpec{
-				{ID: "source", Node: &dflow.EndNode{}, Inputs: dflow.Parameters{"bad": parameter}},
+				{ID: "source", Node: &nodes.EndNode{}, Inputs: dflow.Parameters{"bad": parameter}},
 			},
 		})
 		if !errors.Is(err, dflow.ErrInvalidReference) {
@@ -99,7 +100,7 @@ func TestParameterDependencyValidation(t *testing.T) {
 func TestImmutableParameterRenderingAndInputPaths(t *testing.T) {
 	graph, err := dflow.Compile(dflow.Definition{
 		Version: "v1",
-		Nodes: []dflow.NodeSpec{{ID: "out", Node: &dflow.EndNode{}, Inputs: dflow.Parameters{
+		Nodes: []dflow.NodeSpec{{ID: "out", Node: &nodes.EndNode{}, Inputs: dflow.Parameters{
 			"text": dflow.PlainTemplate("hello {{$input.name}}"),
 			"json": dflow.Template(`{"name": {{$input.name}}}`),
 		}}},

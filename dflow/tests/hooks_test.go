@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/k0923/go/dflow"
+	"github.com/k0923/go/dflow/examples/nodes"
 	"github.com/k0923/go/dflow/memory"
 )
 
@@ -61,7 +62,7 @@ func TestHooksObserveNodeLifecycle(t *testing.T) {
 	def := dflow.Definition{
 		Nodes: []dflow.NodeSpec{
 			{ID: "a", Node: namedNode("value")},
-			{ID: "b", Node: &dflow.EndNode{}, Inputs: dflow.Parameters{"v": dflow.Ref("a")}},
+			{ID: "b", Node: &nodes.EndNode{}, Inputs: dflow.Parameters{"v": dflow.Ref("a")}},
 		},
 		Edges: []dflow.Edge{edge("a", "b")},
 	}

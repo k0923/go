@@ -8,10 +8,13 @@
 | [custom_node](custom_node/main.go) | `go run ./dflow/examples/custom_node` | 直接注入自定义节点和服务、工作流输入引用，输出 `你好，DAG！` |
 | [http](http/main.go) | `go run ./dflow/examples/http` | 本地 HTTP 服务、查询参数、响应 JSON 解析，输出 `你好，HTTP` |
 | [suspend](suspend/main.go) | 见下方命令 | 节点返回挂起结果、SQLite 自动保存、跨进程调用 Resume |
+| [xjson](xjson/README.md) | `go run ./dflow/examples/xjson` | 业务 JSON DTO、类型绑定、节点依赖重建、SQLite 挂起与回调恢复 |
 
 引擎本身每次 `Drive` 只推进一个节点；这些示例通过参考驱动包 [driver](../driver/driver.go) 把整张 DAG 串行驱动到静止（`driver.Run`/`Drain`/`Resume`）。生产系统可改为把每个就绪节点 ID 入队，由多个 worker 各自调用 `engine.Drive`。子流程与循环由业务使用相同的 Suspension/Wakeup/Resume 协议组合。
 
-basic、custom_node 和 http 示例使用 `memory.New()`。SQLite 示例的编码器位于 [internal/appcodec](internal/appcodec/codec.go)，演示业务侧使用 gob 保存接口类型。业务也可使用 xjson.G DTO 并在解码时重建服务依赖。挂起示例依次执行：
+HTTP、JS、条件、起始、结束等参考节点集中在 [nodes](nodes/README.md)，这些实现使用公开的 `dflow.Node` 契约，业务可以复制或自行替换。核心不包含这些节点，也不对起始节点类型做特殊处理；需要完整工作流输入时显式绑定 `dflow.Input()`。
+
+basic、custom_node 和 http 示例使用 `memory.New()`。suspend 的编码器位于 [internal/appcodec](internal/appcodec/codec.go)，演示业务侧使用 gob 保存接口类型；[xjson](xjson/README.md) 则使用业务 JSON DTO 保存定义、挂起数据和具体回调类型，在解码时重新编译 JS 并注入服务依赖。suspend 示例依次执行：
 
 ```sh
 go run ./dflow/examples/suspend -db /tmp/dflow-lazy-suspend.db -run demo -publish

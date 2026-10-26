@@ -11,6 +11,7 @@ import (
 
 	"github.com/k0923/go/dflow"
 	"github.com/k0923/go/dflow/driver"
+	"github.com/k0923/go/dflow/examples/nodes"
 	"github.com/k0923/go/dflow/sqlite"
 )
 
@@ -43,7 +44,7 @@ func TestPersistedPublicationLazyResume(t *testing.T) {
 		},
 	})
 	def := waitDefinition()
-	def.Nodes = append([]dflow.NodeSpec{{ID: "before", Node: &dflow.PassthroughNode{}}}, def.Nodes...)
+	def.Nodes = append([]dflow.NodeSpec{{ID: "before", Node: &nodes.PassthroughNode{}}}, def.Nodes...)
 	def.Edges = append([]dflow.Edge{edge("start", "before"), edge("before", "wait")}, def.Edges[1:]...)
 	graph, err := dflow.Compile(fixtureDefinition(def, registry))
 	if err != nil {
@@ -225,7 +226,7 @@ func TestParallelPortsFromOnePredecessor(t *testing.T) {
 		return dflow.Result{Output: map[string]any{"value": "ok"}, Ports: []string{"true"}}, nil
 	})
 	def := dflow.Definition{
-		Nodes: []dflow.NodeSpec{{ID: "a", Node: namedNode("select")}, {ID: "b", Node: &dflow.EndNode{}}},
+		Nodes: []dflow.NodeSpec{{ID: "a", Node: namedNode("select")}, {ID: "b", Node: &nodes.EndNode{}}},
 		Edges: []dflow.Edge{
 			{SourceNodeID: "a", TargetNodeID: "b", SourcePortID: "true"},
 			{SourceNodeID: "a", TargetNodeID: "b", SourcePortID: "false"},

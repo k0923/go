@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/k0923/go/dflow"
+	"github.com/k0923/go/dflow/examples/nodes"
 	"github.com/k0923/go/dflow/memory"
 	"github.com/k0923/go/dflow/sqlite"
 	"github.com/k0923/go/lease"
@@ -47,10 +48,10 @@ func instances(t *testing.T, test func(*testing.T, [2]dflow.Infrastructure)) {
 func fanInDefinition() dflow.Definition {
 	return dflow.Definition{
 		Nodes: []dflow.NodeSpec{
-			{ID: "start", Node: &dflow.StartNode{}},
+			{ID: "start", Node: &nodes.StartNode{}, Inputs: dflow.Parameters{"input": dflow.Input()}},
 			{ID: "a", Node: namedNode("barrier")},
 			{ID: "b", Node: namedNode("barrier")},
-			{ID: "join", Node: &dflow.EndNode{}, Inputs: dflow.Parameters{"a": dflow.Ref("a", "value"), "b": dflow.Ref("b", "value")}},
+			{ID: "join", Node: &nodes.EndNode{}, Inputs: dflow.Parameters{"a": dflow.Ref("a", "value"), "b": dflow.Ref("b", "value")}},
 		},
 		Edges: []dflow.Edge{edge("start", "a"), edge("start", "b"), edge("a", "join"), edge("b", "join")},
 	}

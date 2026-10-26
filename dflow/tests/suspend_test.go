@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/k0923/go/dflow"
+	"github.com/k0923/go/dflow/examples/nodes"
 	"github.com/k0923/go/dflow/memory"
 	"github.com/k0923/go/dflow/sqlite"
 	"github.com/k0923/go/lease"
@@ -36,9 +37,9 @@ func asyncRegistry(t *testing.T, node asyncNode) testRegistry {
 func waitDefinition() dflow.Definition {
 	return dflow.Definition{
 		Nodes: []dflow.NodeSpec{
-			{ID: "start", Node: &dflow.StartNode{}},
+			{ID: "start", Node: &nodes.StartNode{}, Inputs: dflow.Parameters{"input": dflow.Input()}},
 			{ID: "wait", Node: namedNode("custom"), Inputs: dflow.Parameters{"original": dflow.Constant("input")}},
-			{ID: "end", Node: &dflow.EndNode{}, Inputs: dflow.Parameters{"value": dflow.Ref("wait", "value")}},
+			{ID: "end", Node: &nodes.EndNode{}, Inputs: dflow.Parameters{"value": dflow.Ref("wait", "value")}},
 		},
 		Edges: []dflow.Edge{edge("start", "wait"), edge("wait", "end")},
 	}
@@ -210,7 +211,7 @@ func TestEarlyResponseAndIndependentBranch(t *testing.T) {
 		},
 	}
 	def := waitDefinition()
-	def.Nodes = append(def.Nodes, dflow.NodeSpec{ID: "independent", Node: &dflow.PassthroughNode{}})
+	def.Nodes = append(def.Nodes, dflow.NodeSpec{ID: "independent", Node: &nodes.PassthroughNode{}})
 	def.Edges = append(def.Edges, edge("start", "independent"))
 	for _, early := range []bool{false, true} {
 		var infra dflow.Infrastructure = memory.New()
