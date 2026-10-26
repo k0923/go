@@ -3,6 +3,7 @@ package dflow
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"reflect"
 	"regexp"
@@ -126,6 +127,9 @@ func (r inputResolver) Resolve(ctx context.Context, path ...string) (any, error)
 	if path[0] == InputSource {
 		value, err := r.infra.GetInput(ctx, path[1:]...)
 		if err != nil {
+			if errors.Is(err, ErrMissingValue) {
+				return nil, err
+			}
 			return nil, &InfrastructureError{"GetInput", err}
 		}
 		return value, nil

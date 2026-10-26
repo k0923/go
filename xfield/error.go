@@ -7,7 +7,6 @@ import (
 
 var (
 	ErrInvalidSchema = errors.New("invalid schema")
-	ErrUnknownType   = errors.New("unknown field type")
 	ErrInvalidValue  = errors.New("invalid field value")
 )
 

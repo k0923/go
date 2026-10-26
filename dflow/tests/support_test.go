@@ -8,9 +8,9 @@ import (
 	"fmt"
 	"sync"
 	"sync/atomic"
+	"testing"
 
 	"github.com/k0923/go/dflow"
-	"github.com/k0923/go/dflow/childflow"
 )
 
 // These helpers adapt old fixture descriptions at the application boundary.
@@ -27,10 +27,6 @@ func configuredFixture(kind string, raw json.RawMessage) dflow.Node {
 	switch kind {
 	case "http":
 		node = &dflow.HTTPNode{}
-	case "loop":
-		node = &childflow.LoopNode{}
-	case "subflow":
-		node = &childflow.SubflowNode{}
 	case "code":
 		var config dflow.CodeConfig
 		if err := json.Unmarshal(raw, &config); err != nil {
@@ -48,13 +44,27 @@ func configuredFixture(kind string, raw json.RawMessage) dflow.Node {
 	return node
 }
 
-// configuredLoop builds a childflow.LoopNode fixture from its JSON configuration.
-func configuredLoop(raw json.RawMessage) dflow.Node {
-	node := &childflow.LoopNode{}
-	if err := json.Unmarshal(raw, node); err != nil {
-		panic(err)
+func compile(t *testing.T, def dflow.Definition, registry testRegistry) *dflow.Graph {
+	t.Helper()
+	graph, err := dflow.Compile(fixtureDefinition(def, registry))
+	if err != nil {
+		t.Fatal(err)
 	}
-	return node
+	return graph
+}
+
+type testOutbox interface {
+	Pending(context.Context) ([]dflow.Notification, error)
+	Ack(context.Context, int64) error
+}
+
+func pendingNotifications(t *testing.T, store testOutbox) []dflow.Notification {
+	t.Helper()
+	messages, err := store.Pending(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	return messages
 }
 
 func fixtureDefinition(def dflow.Definition, nodes testRegistry) dflow.Definition {
@@ -125,8 +135,5 @@ func init() {
 	gob.Register(dflow.ReferenceParameter{})
 	gob.Register(dflow.TemplateParameter{})
 	gob.Register(&dflow.ValueSuspension{})
-	gob.Register(&childflow.ChildSuspension{})
-	gob.Register(&childflow.LoopSuspension{})
-	gob.Register(childflow.ChildResponse{})
 	gob.Register(&approvalSuspension{})
 }

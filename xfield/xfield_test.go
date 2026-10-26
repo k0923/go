@@ -8,7 +8,6 @@ import (
 	"math"
 	"reflect"
 	"strings"
-	"sync"
 	"testing"
 
 	"github.com/k0923/go/xfield"
@@ -59,23 +58,17 @@ type dependencies struct {
 	presentCalls  int
 }
 
-func registerResource(t *testing.T, registry *xfield.Registry[*dependencies]) {
-	t.Helper()
-	err := registry.Register(func() xfield.Field[*dependencies] {
-		return &resourceField{}
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-}
+func TestExternalFieldNested(t *testing.T) {
+	schema := xfield.Schema[*dependencies]{
 
-func TestExternalFieldNestedRoundTrip(t *testing.T) {
-	registry := xfield.DefaultRegistry[*dependencies]()
-	registerResource(t, registry)
-	raw := []byte(`[{"key":"assets","type":"array","items":{"type":"object","properties":[{"key":"image","type":"resource","required":true}]}}]`)
-	schema, err := registry.DecodeSchema(raw)
-	if err != nil {
-		t.Fatal(err)
+		"assets": &xfield.ArrayField[*dependencies]{
+			Meta: xfield.Meta{},
+			Items: &xfield.ObjectField[*dependencies]{
+				Properties: xfield.Schema[*dependencies]{
+					"image": &resourceField{Meta: xfield.Meta{Required: true}},
+				},
+			},
+		},
 	}
 	if err := xfield.ValidateSchema(schema); err != nil {
 		t.Fatal(err)
@@ -106,24 +99,19 @@ func TestExternalFieldNestedRoundTrip(t *testing.T) {
 		xfield.GetData(out, []string{"assets", "0", "image"}) != "stored:url" {
 		t.Fatal("parse or present mutated input")
 	}
-	encoded, err := json.Marshal(schema)
-	if err != nil {
-		t.Fatal(err)
-	}
-	decoded, err := registry.DecodeSchema(encoded)
-	if err != nil || !xfield.FieldEqual(schema[0].Value(), decoded[0].Value()) {
-		t.Fatalf("round trip: %s, %v", encoded, err)
-	}
-	if _, err := xfield.DefaultRegistry[*dependencies]().DecodeSchema(raw); !errors.Is(err, xfield.ErrUnknownType) {
-		t.Fatalf("registry leaked registration: %v", err)
-	}
 }
 
-func TestBuiltinsJSONAndRules(t *testing.T) {
-	var schema xfield.Schema[struct{}]
-	raw := `[{"key":"name","type":"string","minLength":2,"maxLength":4,"pattern":"^[一二三]+$","enum":["一二"]},{"key":"n","type":"number","min":0,"max":100,"enum":[10]},{"key":"ok","type":"boolean"}]`
-	if err := json.Unmarshal([]byte(raw), &schema); err != nil {
-		t.Fatal(err)
+func TestBuiltinsRules(t *testing.T) {
+	minLength, maxLength, pattern := 2, 4, "^[一二三]+$"
+	min, max := 0.0, 100.0
+	schema := xfield.Schema[struct{}]{
+
+		"name": &xfield.StringField[struct{}]{
+			Meta: xfield.Meta{}, MinLength: &minLength, MaxLength: &maxLength,
+			Pattern: &pattern, Enum: []string{"一二"},
+		},
+		"n":  &xfield.NumberField[struct{}]{Meta: xfield.Meta{}, Min: &min, Max: &max, Enum: []any{10}},
+		"ok": &xfield.BooleanField[struct{}]{Meta: xfield.Meta{}},
 	}
 	out, err := xfield.ValidateModel(map[string]any{"name": "一二", "n": uint8(10), "ok": true}, schema, struct{}{})
 	if err != nil || out["n"] != uint8(10) {
@@ -137,14 +125,10 @@ func TestBuiltinsJSONAndRules(t *testing.T) {
 			t.Fatalf("input %v: %v", input, err)
 		}
 	}
-	encoded, err := json.Marshal(schema)
-	if err != nil || !strings.Contains(string(encoded), `"type":"string"`) {
-		t.Fatalf("flat encoding %s: %v", encoded, err)
-	}
 }
 
 func TestRequiredPartialAndSchemaErrors(t *testing.T) {
-	schema := xfield.Schema[struct{}]{xfield.Wrap(&xfield.StringField[struct{}]{Meta: xfield.Meta{Key: "name", Required: true}})}
+	schema := xfield.Schema[struct{}]{"name": &xfield.StringField[struct{}]{Meta: xfield.Meta{Required: true}}}
 	if _, err := xfield.ValidateModel(map[string]any{}, schema, struct{}{}); !errors.Is(err, xfield.ErrInvalidValue) {
 		t.Fatal(err)
 	}
@@ -157,21 +141,20 @@ func TestRequiredPartialAndSchemaErrors(t *testing.T) {
 	minusOne, min, max := -1, 5, 2
 	badPattern := "["
 	cases := []xfield.Schema[struct{}]{
-		{xfield.Wrap(&xfield.StringField[struct{}]{})},
-		{schema[0], schema[0]},
-		{xfield.Wrap(&xfield.ArrayField[struct{}]{Meta: xfield.Meta{Key: "a"}})},
-		{xfield.Wrap(&xfield.StringField[struct{}]{Meta: xfield.Meta{Key: "s"}, MinLength: &minusOne})},
-		{xfield.Wrap(&xfield.StringField[struct{}]{Meta: xfield.Meta{Key: "s"}, MinLength: &min, MaxLength: &max})},
-		{xfield.Wrap(&xfield.StringField[struct{}]{Meta: xfield.Meta{Key: "s"}, Pattern: &badPattern})},
-		{xfield.Wrap((*xfield.StringField[struct{}])(nil))},
+		{"": &xfield.StringField[struct{}]{}},
+		{"a": &xfield.ArrayField[struct{}]{}},
+		{"s": &xfield.StringField[struct{}]{MinLength: &minusOne}},
+		{"s": &xfield.StringField[struct{}]{MinLength: &min, MaxLength: &max}},
+		{"s": &xfield.StringField[struct{}]{Pattern: &badPattern}},
+		{"s": (*xfield.StringField[struct{}])(nil)},
 	}
 	for _, bad := range cases {
 		if _, err := xfield.ValidateModel(nil, bad, struct{}{}); !errors.Is(err, xfield.ErrInvalidSchema) {
 			t.Fatalf("bad schema %v: %v", bad, err)
 		}
 	}
-	cycle := &xfield.ArrayField[struct{}]{Meta: xfield.Meta{Key: "cycle"}}
-	cycle.Items = xfield.Wrap(cycle)
+	cycle := &xfield.ArrayField[struct{}]{Meta: xfield.Meta{}}
+	cycle.Items = cycle
 	if err := xfield.ValidateField(cycle); !errors.Is(err, xfield.ErrInvalidSchema) {
 		t.Fatalf("cycle: %v", err)
 	}
@@ -180,12 +163,13 @@ func TestRequiredPartialAndSchemaErrors(t *testing.T) {
 func TestNestedPathPreservesExternalError(t *testing.T) {
 	sentinel := errors.New("upload unavailable")
 	deps := &dependencies{ctx: context.Background(), err: sentinel}
-	schema := xfield.Schema[*dependencies]{xfield.Wrap(&xfield.ArrayField[*dependencies]{
-		Meta: xfield.Meta{Key: "assets"},
-		Items: xfield.Wrap(&xfield.ObjectField[*dependencies]{Properties: xfield.Schema[*dependencies]{
-			xfield.Wrap(&resourceField{Meta: xfield.Meta{Key: "image"}}),
-		}}),
-	})}
+	schema := xfield.Schema[*dependencies]{
+		"assets": &xfield.ArrayField[*dependencies]{
+			Meta: xfield.Meta{},
+			Items: &xfield.ObjectField[*dependencies]{Properties: xfield.Schema[*dependencies]{
+				"image": &resourceField{Meta: xfield.Meta{}},
+			}},
+		}}
 	_, err := xfield.ValidateModel(
 		map[string]any{"assets": []any{map[string]any{"image": "url"}}},
 		schema, deps,
@@ -197,22 +181,12 @@ func TestNestedPathPreservesExternalError(t *testing.T) {
 }
 
 func TestLargeNumberPrecision(t *testing.T) {
-	registry := xfield.DefaultRegistry[struct{}]()
-	schema, err := registry.DecodeSchema([]byte(`[{"type":"number","key":"id","enum":[9007199254740993]}]`))
-	if err != nil {
-		t.Fatal(err)
-	}
-	field := schema[0].Value()
+	field := &xfield.NumberField[struct{}]{Enum: []any{json.Number("9007199254740993")}}
 	if _, err := field.Parse(uint64(9007199254740993), struct{}{}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := field.Parse(uint64(9007199254740992), struct{}{}); !errors.Is(err, xfield.ErrInvalidValue) {
 		t.Fatalf("rounded integer accepted: %v", err)
-	}
-	a := &xfield.NumberField[struct{}]{Enum: []any{int64(9007199254740993)}}
-	b := &xfield.NumberField[struct{}]{Enum: []any{int64(9007199254740992)}}
-	if xfield.FieldEqual(a, b) {
-		t.Fatal("different large integers compare equal")
 	}
 	for _, invalid := range []json.Number{"1e999999999", "NaN", "true", "1 2"} {
 		if _, err := (&xfield.NumberField[struct{}]{}).Parse(invalid, struct{}{}); err == nil {
@@ -221,54 +195,21 @@ func TestLargeNumberPrecision(t *testing.T) {
 	}
 }
 
-func TestRegistryConcurrencyAndLimits(t *testing.T) {
-	registry := xfield.DefaultRegistry[*dependencies]()
-	registerResource(t, registry)
-	if err := registry.Register(func() xfield.Field[*dependencies] {
-		return &resourceField{}
-	}); !errors.Is(err, xfield.ErrInvalidSchema) {
-		t.Fatalf("duplicate registration: %v", err)
-	}
-	var wg sync.WaitGroup
-	for i := range 20 {
-		wg.Go(func() {
-			name := fmt.Sprintf("resource%d", i)
-			err := registry.Register(func() xfield.Field[*dependencies] {
-				return &namedResource{typeName: name}
-			})
-			if err != nil {
-				t.Error(err)
-			}
-			if _, err := registry.DecodeField(json.RawMessage(`{"type":"resource"}`)); err != nil {
-				t.Error(err)
-			}
-		})
-	}
-	wg.Wait()
-	raw := `{"type":"string"}`
+func TestSchemaDepthLimit(t *testing.T) {
+	var field xfield.Field[struct{}] = &xfield.StringField[struct{}]{}
 	for range xfield.MaxSchemaDepth {
-		raw = `{"type":"array","items":` + raw + `}`
+		field = &xfield.ArrayField[struct{}]{Items: field}
 	}
-	if _, err := registry.DecodeField(json.RawMessage(raw)); !errors.Is(err, xfield.ErrInvalidSchema) {
+	if err := xfield.ValidateField(field); !errors.Is(err, xfield.ErrInvalidSchema) {
 		t.Fatalf("depth limit: %v", err)
 	}
-	if field, err := registry.DecodeField(json.RawMessage(`{"type":"resource0"}`)); err != nil || field.Type() != "resource0" {
-		t.Fatalf("concurrent registration: %v, %v", field, err)
-	}
 }
-
-type namedResource struct {
-	resourceField
-	typeName string
-}
-
-func (f *namedResource) Type() string { return f.typeName }
 
 func TestNamedContainers(t *testing.T) {
 	type namedMap map[string]any
 	type namedSlice []any
 	field := &xfield.ObjectField[struct{}]{Properties: xfield.Schema[struct{}]{
-		xfield.Wrap(&xfield.ArrayField[struct{}]{Meta: xfield.Meta{Key: "items"}, Items: xfield.Wrap(&xfield.NumberField[struct{}]{})}),
+		"items": &xfield.ArrayField[struct{}]{Meta: xfield.Meta{}, Items: &xfield.NumberField[struct{}]{}},
 	}}
 	got, err := field.Parse(namedMap{"items": namedSlice{int8(1), uint16(2)}, "extra": true}, struct{}{})
 	want := map[string]any{"items": []any{int8(1), uint16(2)}}

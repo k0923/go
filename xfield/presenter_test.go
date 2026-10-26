@@ -10,16 +10,18 @@ import (
 func TestPresentModel(t *testing.T) {
 	t.Run("nested params and unchanged fields", func(t *testing.T) {
 		schema := xfield.Schema[*dependencies]{
-			xfield.Wrap(&xfield.ObjectField[*dependencies]{
-				Meta: xfield.Meta{Key: "profile"},
+
+			"profile": &xfield.ObjectField[*dependencies]{
+				Meta: xfield.Meta{},
 				Properties: xfield.Schema[*dependencies]{
-					xfield.Wrap(&xfield.ArrayField[*dependencies]{
-						Meta:  xfield.Meta{Key: "images"},
-						Items: xfield.Wrap(&resourceField{}),
-					}),
-					xfield.Wrap(&xfield.StringField[*dependencies]{Meta: xfield.Meta{Key: "name"}}),
+
+					"images": &xfield.ArrayField[*dependencies]{
+						Meta:  xfield.Meta{},
+						Items: &resourceField{},
+					},
+					"name": &xfield.StringField[*dependencies]{Meta: xfield.Meta{}},
 				},
-			}),
+			},
 		}
 		input := map[string]any{
 			"profile": map[string]any{
@@ -49,7 +51,7 @@ func TestPresentModel(t *testing.T) {
 
 	t.Run("nil and empty params", func(t *testing.T) {
 		schema := xfield.Schema[struct{}]{
-			xfield.Wrap(&xfield.BooleanField[struct{}]{Meta: xfield.Meta{Key: "active"}}),
+			"active": &xfield.BooleanField[struct{}]{Meta: xfield.Meta{}},
 		}
 		if result := xfield.PresentModel(nil, schema, struct{}{}); result != nil {
 			t.Fatalf("nil input became %v", result)

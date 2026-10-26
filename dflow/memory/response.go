@@ -7,7 +7,14 @@ import (
 	"github.com/k0923/go/dflow"
 )
 
-var _ dflow.Outbox = (*Infrastructure)(nil)
+// Outbox is the delivery capability provided by the memory implementation.
+// Consumers deduplicate by their business run scope plus NodeID and Token.
+type Outbox interface {
+	Pending(context.Context) ([]dflow.Notification, error)
+	Ack(context.Context, int64) error
+}
+
+var _ Outbox = (*Infrastructure)(nil)
 
 func (i *Infrastructure) GetResponse(ctx context.Context, nodeID, token string) (*dflow.Response, error) {
 	i.mu.Lock()

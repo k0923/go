@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"maps"
 	"slices"
-	"sync/atomic"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -117,6 +117,10 @@ func (e *Engine) Recover(ctx context.Context) ([]string, error) {
 // the error (fail-fast): no downstream node becomes ready. Infrastructure/lease
 // errors are uncertain and should be retried by driving the same node again.
 func (e *Engine) Drive(ctx context.Context, nodeID string) (executed Executed, err error) {
+	return e.drive(ctx, nodeID, "")
+}
+
+func (e *Engine) drive(ctx context.Context, nodeID, expectedToken string) (executed Executed, err error) {
 	if nodeID == "" {
 		return Executed{}, ErrInvalidDefinition
 	}
@@ -127,6 +131,12 @@ func (e *Engine) Drive(ctx context.Context, nodeID string) (executed Executed, e
 	}
 	err = runner.Run(ctx, nodeID, func(ctx context.Context, token lease.Token) error {
 		task := owner.task
+		// ClaimNode's returned snapshot is protected by this lease. A stale
+		// resume may briefly claim and release the current node, but it can never
+		// invoke Resume for a different suspension round.
+		if expectedToken != "" && (task.State.Suspension == nil || task.State.Suspension.Token != expectedToken) {
+			return nil
+		}
 		executed.NodeID = nodeID
 		e.options.Hooks.claim(ctx, NodeEvent{NodeID: nodeID, Attempt: task.State.Generation})
 		node, result, execErr := e.execute(ctx, task)
@@ -158,13 +168,10 @@ func (e *Engine) Drive(ctx context.Context, nodeID string) (executed Executed, e
 			}
 		}
 		next.Ready = false
-		owner.ending.Store(true)
-		ready, commitErr := e.infra.Commit(ctx, token, NodeCommit{nodeID, task.State.Version, next, arrivals})
+		ready, commitErr := owner.commit(ctx, token, NodeCommit{nodeID, task.State.Version, next, arrivals})
 		if commitErr != nil {
-			owner.ending.Store(false)
-			return &InfrastructureError{"Commit", commitErr}
+			return commitErr
 		}
-		owner.committed.Store(true)
 		executed.Status = next.Status
 		executed.Output = next.Output
 		executed.Ready = ready
@@ -190,13 +197,16 @@ var errNotDrivable = errors.New("dflow: node not drivable")
 
 // nodeLease adapts one Drive's node claim to lease.Runner, reusing its renewal,
 // cancellation-on-loss and bounded release. Commit validates the lease and ends
-// ownership in storage, so renewal pauses while Commit is in flight (a renewal
-// racing the commit would otherwise report a spurious loss) and a committed
-// lease is not released.
+// ownership in storage. Renew and Commit serialize on this Drive's local mutex;
+// a renewal already in flight completes before Commit can release the lease.
+// This is never a run/global lock. A committed lease is not released again.
 type nodeLease struct {
-	infra             Infrastructure
-	task              *NodeTask
-	ending, committed atomic.Bool
+	infra     Infrastructure
+	task      *NodeTask
+	mu        sync.Mutex
+	ending    bool
+	committed bool
+	renewErr  error
 }
 
 func (l *nodeLease) Claim(ctx context.Context, nodeID string, ttl time.Duration) (*lease.Token, error) {
@@ -213,14 +223,45 @@ func (l *nodeLease) Claim(ctx context.Context, nodeID string, ttl time.Duration)
 }
 
 func (l *nodeLease) Renew(ctx context.Context, token lease.Token, ttl time.Duration) (*lease.Token, error) {
-	if l.ending.Load() {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.ending {
 		return &token, nil
 	}
-	return l.infra.RenewNode(ctx, token, ttl)
+	// Bound the in-flight request so Commit cannot wait indefinitely for a
+	// storage renewal that has already outlived this ownership interval.
+	ctx, cancel := context.WithTimeout(ctx, ttl)
+	defer cancel()
+	renewed, err := l.infra.RenewNode(ctx, token, ttl)
+	if err == nil && (renewed == nil || renewed.Key != token.Key || renewed.Generation != token.Generation) {
+		err = lease.ErrConflict
+	}
+	l.renewErr = err
+	return renewed, err
+}
+
+func (l *nodeLease) commit(ctx context.Context, token lease.Token, c NodeCommit) ([]string, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.ending = true
+	// Runner may not yet have canceled ctx after Renew returned its error.
+	// Check the error under the same mutex before accepting any outcome.
+	if l.renewErr != nil {
+		return nil, &InfrastructureError{"RenewNode", l.renewErr}
+	}
+	ready, err := l.infra.Commit(ctx, token, c)
+	if err != nil {
+		return nil, &InfrastructureError{"Commit", err}
+	}
+	l.committed = true
+	return ready, nil
 }
 
 func (l *nodeLease) Release(ctx context.Context, token lease.Token) error {
-	if l.committed.Load() {
+	l.mu.Lock()
+	committed := l.committed
+	l.mu.Unlock()
+	if committed {
 		return nil
 	}
 	return l.infra.ReleaseNode(ctx, token)
@@ -229,9 +270,20 @@ func (l *nodeLease) Release(ctx context.Context, token lease.Token) error {
 func (e *Engine) execute(parent context.Context, task *NodeTask) (published *PublishedNode, result Result, err error) {
 	ctx, cancel := context.WithTimeout(context.WithValue(parent, nodeIDKey{}, task.NodeID), e.options.NodeTimeout)
 	defer cancel()
+	var started time.Time
+	var duration time.Duration
 	defer func() {
 		if value := recover(); value != nil {
 			err = fmt.Errorf("panic: %v", value)
+		}
+		if !started.IsZero() {
+			if ctx.Err() != nil {
+				result, err = Result{}, ctx.Err()
+			}
+			if duration == 0 {
+				duration = time.Since(started) // includes a panicking call
+			}
+			e.finish(ctx, task, duration, result, err)
 		}
 	}()
 	published, err = e.definitions.LoadNode(ctx, task.NodeID)
@@ -308,15 +360,14 @@ func (e *Engine) execute(parent context.Context, task *NodeTask) (published *Pub
 			return published, result, ErrInvalidSuspension
 		}
 		e.options.Hooks.start(ctx, NodeEvent{NodeID: task.NodeID, Attempt: task.State.Generation, IsResume: true, Token: suspension.Token})
-		started := time.Now()
+		started = time.Now()
 		result, err = resumable.Resume(ctx, maps.Clone(nodeInput), ResumeInput{Token: suspension.Token, Suspension: suspension.Payload, Response: response.Value})
-		e.finish(ctx, task, started, result, err)
 	} else {
 		e.options.Hooks.start(ctx, NodeEvent{NodeID: task.NodeID, Attempt: task.State.Generation})
-		started := time.Now()
+		started = time.Now()
 		result, err = node.Run(ctx, maps.Clone(nodeInput))
-		e.finish(ctx, task, started, result, err)
 	}
+	duration = time.Since(started)
 	if ctx.Err() != nil {
 		return published, Result{}, ctx.Err()
 	}
@@ -342,7 +393,7 @@ func (e *Engine) execute(parent context.Context, task *NodeTask) (published *Pub
 	return published, result, err
 }
 
-func (e *Engine) finish(ctx context.Context, task *NodeTask, started time.Time, result Result, err error) {
+func (e *Engine) finish(ctx context.Context, task *NodeTask, duration time.Duration, result Result, err error) {
 	if e.options.Hooks.OnFinish == nil {
 		return
 	}
@@ -350,7 +401,7 @@ func (e *Engine) finish(ctx context.Context, task *NodeTask, started time.Time, 
 		NodeID:   task.NodeID,
 		Attempt:  task.State.Generation,
 		IsResume: task.State.Suspension != nil,
-		Duration: time.Since(started),
+		Duration: duration,
 	}
 	if task.State.Suspension != nil {
 		event.Token = task.State.Suspension.Token

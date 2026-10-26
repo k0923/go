@@ -8,9 +8,8 @@
 | [custom_node](custom_node/main.go) | `go run ./dflow/examples/custom_node` | 直接注入自定义节点和服务、工作流输入引用，输出 `你好，DAG！` |
 | [http](http/main.go) | `go run ./dflow/examples/http` | 本地 HTTP 服务、查询参数、响应 JSON 解析，输出 `你好，HTTP` |
 | [suspend](suspend/main.go) | 见下方命令 | 节点返回挂起结果、SQLite 自动保存、跨进程调用 Resume |
-| [subflow](subflow/main.go) | 见下方命令 | 基于 childflow 的子流程调用协议、foreach Loop、逐轮持久化 |
 
-引擎本身每次 `Drive` 只推进一个节点；这些示例通过参考驱动包 [driver](../driver/driver.go) 把整张 DAG 串行驱动到静止（`driver.Run`/`Drain`/`Resume`）。生产系统可改为把每个就绪节点 ID 入队，由多个 worker 各自调用 `engine.Drive`。子流程与 Loop 是业务组合，位于 [childflow](../childflow)，不是引擎内置能力。
+引擎本身每次 `Drive` 只推进一个节点；这些示例通过参考驱动包 [driver](../driver/driver.go) 把整张 DAG 串行驱动到静止（`driver.Run`/`Drain`/`Resume`）。生产系统可改为把每个就绪节点 ID 入队，由多个 worker 各自调用 `engine.Drive`。子流程与循环由业务使用相同的 Suspension/Wakeup/Resume 协议组合。
 
 basic、custom_node 和 http 示例使用 `memory.New()`。SQLite 示例的编码器位于 [internal/appcodec](internal/appcodec/codec.go)，演示业务侧使用 gob 保存接口类型。业务也可使用 xjson.G DTO 并在解码时重建服务依赖。挂起示例依次执行：
 
@@ -24,12 +23,3 @@ go run ./dflow/examples/suspend -db /tmp/dflow-lazy-suspend.db -run demo -token 
 框架返回本次驱动触及的节点；示例显式调用 Load 观察持久化节点记录，通过 end 节点判断是否展示输出，没有工作流整体状态。
 
 实际业务实现 `dflow.Infrastructure` 和 outbox 消费即可接入自己的存储与外部服务，契约见 [包说明](../README.md#infrastructure-和恢复)。
-
-子流程与 Loop 示例：
-
-```sh
-go run ./dflow/examples/subflow -db /tmp/dflow-child-demo.db -run demo -publish
-go run ./dflow/examples/subflow -db /tmp/dflow-child-demo.db -run demo
-```
-
-首次发布父图和循环体，依次驱动三个子执行，输出包含 alpha/beta/gamma 的结果数组。重启后按发布 ID 加载，成功节点不重跑。每轮独立 scope 由 `childflow.ChildExecution.ScopeKey` 生成；示例在前台处理持久化 Request/Wake，生产环境可接入自己的调度器。

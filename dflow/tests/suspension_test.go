@@ -35,7 +35,7 @@ func TestSuspensionCustomTypeRoundTripAndRecovery(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		messages := childRequests(t, infra.(dflow.Outbox))
+		messages := pendingNotifications(t, infra.(testOutbox))
 		decoded := messages[0].Request
 		if decoded.(*approvalSuspension).Document != "doc-1" {
 			t.Fatal(decoded)

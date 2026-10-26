@@ -68,14 +68,10 @@ func main() {
 }
 
 func run() error {
-	registry := xfield.DefaultRegistry[struct{}]()
-	schema, err := registry.DecodeSchema([]byte(`[
-		{"type":"string","key":"name","required":true},
-		{"type":"string","key":"nickname"},
-		{"type":"string","key":"missing"}
-	]`))
-	if err != nil {
-		return err
+	schema := xfield.Schema[struct{}]{
+		"name":     &xfield.StringField[struct{}]{Meta: xfield.Meta{Required: true}},
+		"nickname": &xfield.StringField[struct{}]{Meta: xfield.Meta{}},
+		"missing":  &xfield.StringField[struct{}]{Meta: xfield.Meta{}},
 	}
 	out, err := xfield.ApplyMappings(
 		`{"profile":{"display/name":"张三","nickname":null}}`,

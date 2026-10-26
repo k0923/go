@@ -16,7 +16,16 @@ import (
 )
 
 var _ dflow.Infrastructure = (*Infrastructure)(nil)
-var _ dflow.Outbox = (*Infrastructure)(nil)
+
+// Outbox is the durable delivery capability provided by the SQLite
+// implementation. Ack Request after external acceptance; Ack Wake after the
+// token-specific Resume call is safely handled.
+type Outbox interface {
+	Pending(context.Context) ([]dflow.Notification, error)
+	Ack(context.Context, int64) error
+}
+
+var _ Outbox = (*Infrastructure)(nil)
 
 type Infrastructure struct {
 	db    *sql.DB

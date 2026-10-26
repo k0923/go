@@ -15,7 +15,7 @@ type Params struct {
 	URL       func(string) string
 }
 
-// ResourceField 演示应用自定义字段，无需为普通叶子字段写解码方法。
+// ResourceField 直接实现 Field 和 Presenter，无需注册。
 type ResourceField struct {
 	xfield.Meta
 }
@@ -67,15 +67,11 @@ func main() {
 }
 
 func run() error {
-	registry := xfield.DefaultRegistry[Params]()
-	if err := registry.Register(func() xfield.Field[Params] { return &ResourceField{} }); err != nil {
-		return err
-	}
-	schema, err := registry.DecodeSchema([]byte(`[
-		{"type":"array","key":"images","items":{"type":"resource"}}
-	]`))
-	if err != nil {
-		return err
+	schema := xfield.Schema[Params]{
+
+		"images": &xfield.ArrayField[Params]{
+			Meta: xfield.Meta{}, Items: &ResourceField{},
+		},
 	}
 	clean, err := xfield.ValidateModel(map[string]any{"images": []any{" asset-1 "}}, schema, Params{
 		Normalize: strings.ToUpper,
@@ -97,14 +93,8 @@ func run() error {
 		fmt.Println(result.label+":", string(raw))
 	}
 
-	selective := xfield.NewRegistry[Params]()
-	if err := selective.Register(func() xfield.Field[Params] { return &StringField{} }); err != nil {
-		return err
-	}
-	field, err := selective.DecodeField(json.RawMessage(`{"type":"string","minLength":1}`))
-	if err != nil {
-		return err
-	}
+	minLength := 1
+	field := &StringField{StringField: xfield.StringField[Params]{MinLength: &minLength}}
 	value, err := field.Parse(" Alice ", Params{})
 	if err != nil {
 		return err

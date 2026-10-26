@@ -34,7 +34,7 @@ func Drain(ctx context.Context, e *dflow.Engine) (*dflow.State, error) {
 // consumes a persisted Wake. A stale token or terminal node drives nothing. It
 // is deliberately targeted: it does not sweep unrelated ready nodes.
 func Resume(ctx context.Context, e *dflow.Engine, nodeID, token string, response ...any) (*dflow.State, error) {
-	if len(response) > 1 {
+	if nodeID == "" || token == "" || len(response) > 1 {
 		return nil, dflow.ErrWaitNotFound
 	}
 	if len(response) == 1 {
@@ -43,7 +43,14 @@ func Resume(ctx context.Context, e *dflow.Engine, nodeID, token string, response
 		}
 	}
 	state := &dflow.State{Nodes: map[string]dflow.NodeState{}}
-	return state, drive(ctx, e, state, []string{nodeID})
+	executed, err := e.Resume(ctx, nodeID, token)
+	if executed.Status != "" {
+		state.Nodes[executed.NodeID] = nodeState(executed)
+	}
+	if err != nil {
+		return state, err
+	}
+	return state, drive(ctx, e, state, executed.Ready)
 }
 
 // driveToQuiescence drains the given ready set, then repeatedly asks the engine

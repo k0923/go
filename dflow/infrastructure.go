@@ -131,7 +131,7 @@ type NodeCommit struct {
 }
 
 // SnapshotReader is optional observation for business status determination.
-// Engine.Run returns only nodes touched during THAT drive; it never calls this.
+// Engine.Drive never calls this; it reports only the node it executed.
 type SnapshotReader interface {
 	Load(context.Context) (*State, error)
 }
@@ -153,13 +153,4 @@ type Notification struct {
 	Token  string           `json:"token"`
 	// Request is captured at registration so later node state cannot alter it.
 	Request Suspension
-}
-
-// Outbox delivers at least once. Providers deduplicate by business run scope +
-// NodeID + Token. Ack Request after provider acceptance; Ack Wake after ResumeNode
-// returns nil error, which ONLY means this drive stopped without an error.
-// The external application decides workflow status. Retry lease/storage errors.
-type Outbox interface {
-	Pending(context.Context) ([]Notification, error)
-	Ack(context.Context, int64) error
 }

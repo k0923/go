@@ -1,0 +1,79 @@
+{
+  "definitions": [
+    {
+      "name": "user:dialog",
+      "field": {
+        "type": "object",
+        "properties": [
+          {
+            "type": "string",
+            "key": "speaker",
+            "label": "角色 ID",
+            "required": true
+          },
+          {
+            "type": "number",
+            "key": "start",
+            "label": "开始时间（毫秒）",
+            "required": true
+          },
+          {
+            "type": "number",
+            "key": "end",
+            "label": "结束时间（毫秒）",
+            "required": true
+          },
+          {
+            "type": "string",
+            "key": "content",
+            "label": "台词文本",
+            "required": true
+          }
+        ]
+      }
+    }
+  ],
+  "fields": [
+    {
+      "type": "number",
+      "key": "start",
+      "required": true
+    },
+    {
+      "type": "number",
+      "key": "end",
+      "required": true
+    },
+    {
+      "type": "array",
+      "key": "tags",
+      "required": true,
+      "items": {
+        "type": "string",
+        "enum": [
+          "text",
+          "role",
+          "hallucination",
+          "missing"
+        ]
+      }
+    },
+    {
+      "type": "ref",
+      "ref": "user:dialog",
+      "key": "dialog",
+      "label": "模型台词",
+      "required": true
+    },
+    {
+      "type": "array",
+      "key": "mappedDialogs",
+      "label": "匹配到的人工台词",
+      "required": true,
+      "items": {
+        "type": "ref",
+        "ref": "user:dialog"
+      }
+    }
+  ]
+}

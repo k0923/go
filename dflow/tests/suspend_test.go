@@ -89,7 +89,7 @@ func TestNodeSuspensionAndResume(t *testing.T) {
 			t.Fatalf("not suspended: %+v %v", state, err)
 		}
 		token := state.Nodes["wait"].Suspension.Token
-		outbox := infra.(dflow.Outbox)
+		outbox := infra.(testOutbox)
 		requests, err := outbox.Pending(ctx)
 		if err != nil || len(requests) != 1 || requests[0].Token != token || requests[0].Request.Type() != "external" {
 			t.Fatal(requests, err)

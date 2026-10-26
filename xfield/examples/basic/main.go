@@ -15,15 +15,21 @@ func main() {
 }
 
 func run() error {
-	registry := xfield.DefaultRegistry[struct{}]()
-	schema, err := registry.DecodeSchema([]byte(`[
-		{"type":"string","key":"name","required":true,"minLength":1},
-		{"type":"number","key":"age","min":0,"max":150},
-		{"type":"boolean","key":"active"},
-		{"type":"array","key":"tags","items":{"type":"string"}}
-	]`))
-	if err != nil {
-		return err
+	minLength, minAge, maxAge := 1, 0.0, 150.0
+	schema := xfield.Schema[struct{}]{
+
+		"name": &xfield.StringField[struct{}]{
+			Meta: xfield.Meta{Required: true}, MinLength: &minLength,
+		},
+
+		"age": &xfield.NumberField[struct{}]{
+			Meta: xfield.Meta{}, Min: &minAge, Max: &maxAge,
+		},
+		"active": &xfield.BooleanField[struct{}]{Meta: xfield.Meta{}},
+
+		"tags": &xfield.ArrayField[struct{}]{
+			Meta: xfield.Meta{}, Items: &xfield.StringField[struct{}]{},
+		},
 	}
 	clean, err := xfield.ValidateModel(map[string]any{
 		"name": "张三", "age": 18, "active": true,

@@ -15,18 +15,16 @@ func main() {
 }
 
 func run() error {
-	registry := xfield.DefaultRegistry[struct{}]()
-	schema, err := registry.DecodeSchema([]byte(`[
-		{"type":"string","key":"title","required":true},
-		{"type":"array","key":"members","items":{
-			"type":"object","properties":[
-				{"type":"string","key":"name","required":true},
-				{"type":"number","key":"score"}
-			]
-		}}
-	]`))
-	if err != nil {
-		return err
+	schema := xfield.Schema[struct{}]{
+		"title": &xfield.StringField[struct{}]{Meta: xfield.Meta{Required: true}},
+
+		"members": &xfield.ArrayField[struct{}]{
+			Meta: xfield.Meta{},
+			Items: &xfield.ObjectField[struct{}]{Properties: xfield.Schema[struct{}]{
+				"name":  &xfield.StringField[struct{}]{Meta: xfield.Meta{Required: true}},
+				"score": &xfield.NumberField[struct{}]{Meta: xfield.Meta{}},
+			}},
+		},
 	}
 	input := map[string]any{
 		"group": "一组",

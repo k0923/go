@@ -20,8 +20,11 @@ type Hooks struct {
 	// OnStart fires immediately before Run or Resume is invoked. Resume reports
 	// IsResume true and carries the suspension token.
 	OnStart func(context.Context, NodeEvent)
-	// OnFinish fires after the node returns, before Commit. Outcome classifies
-	// the result; Err is set for Failed. Duration measures Run/Resume only.
+	// OnFinish fires once per invoked Run/Resume, after panic recovery, timeout
+	// and result validation, before Commit. Outcome classifies the validated
+	// result; Err is set for Failed. Duration measures Run/Resume only. This is
+	// not a durable-commit event. Skipped/input-resolution failures don't invoke
+	// Run/Resume and therefore produce no OnStart/OnFinish pair.
 	OnFinish func(context.Context, NodeEvent)
 }
 

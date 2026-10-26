@@ -11,9 +11,8 @@ func PresentModel[P any](data map[string]any, model Schema[P], params P) map[str
 	for key, value := range data {
 		result[key] = value
 	}
-	for _, ref := range model {
-		field := ref.Value()
-		key := KeyOf(field)
+	for _, key := range schemaKeys(model) {
+		field := model[key]
 		if value, exists := data[key]; exists && !isNil(field) {
 			result[key] = presentFieldValue(field, value, params)
 		}

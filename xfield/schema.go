@@ -1,8 +1,11 @@
 package xfield
 
-import "fmt"
+import (
+	"fmt"
+	"sort"
+)
 
-// ValidateSchema checks keys, duplicates, nested items and rule configuration.
+// ValidateSchema checks keys, nested items and rule configuration.
 // Invalid declarations are rejected even when corresponding data is absent.
 func ValidateSchema[P any](schema Schema[P]) error { return validateSchema(schema, 0) }
 
@@ -12,17 +15,11 @@ func validateSchema[P any](schema Schema[P], depth int) error {
 	if depth >= MaxSchemaDepth {
 		return invalidSchema("maximum schema depth exceeded")
 	}
-	keys := make(map[string]bool, len(schema))
-	for i, ref := range schema {
-		field := ref.Value()
-		key := KeyOf(field)
+	for _, key := range schemaKeys(schema) {
+		field := schema[key]
 		if key == "" {
-			return wrapPathError(joinIndexPath("", i), invalidSchema("property missing 'key'"))
+			return invalidSchema("property name is empty")
 		}
-		if keys[key] {
-			return wrapPathError(key, invalidSchema("duplicate property key"))
-		}
-		keys[key] = true
 		if err := validateField(field, depth); err != nil {
 			return wrapPathError(key, err)
 		}
@@ -36,6 +33,17 @@ func validateField[P any](field Field[P], depth int) error {
 	}
 	if isNil(field) || field.Type() == "" {
 		return invalidSchema("field is nil or missing type")
+	}
+	if ref, ok := field.(ReferenceProvider); ok {
+		return invalidSchema("unresolved reference %q; compile the document first", ref.ReferenceName())
+	}
+	if ref, ok := field.(interface{ referenceHeight() int }); ok {
+		// CompileDocument already validated the immutable target. Reusing that
+		// result prevents repeated references from expanding validation work.
+		if depth+ref.referenceHeight() > MaxSchemaDepth {
+			return invalidSchema("maximum schema depth exceeded")
+		}
+		return nil
 	}
 	if validator, ok := field.(SchemaValidator); ok {
 		if err := validator.ValidateSchema(); err != nil {
@@ -75,10 +83,9 @@ func parseModel[P any](data map[string]any, model Schema[P], partial bool, param
 
 func parseProperties[P any](data map[string]any, model Schema[P], partial bool, params P) (map[string]any, error) {
 	result := make(map[string]any, len(data))
-	// Schema order makes the first error deterministic.
-	for _, ref := range model {
-		field := ref.Value()
-		key := KeyOf(field)
+	// Property-name order makes parsing and the first error deterministic.
+	for _, key := range schemaKeys(model) {
+		field := model[key]
 		value, exists := data[key]
 		if !exists {
 			if !partial && RequiredOf(field) {
@@ -93,4 +100,13 @@ func parseProperties[P any](data map[string]any, model Schema[P], partial bool, 
 		result[key] = parsed
 	}
 	return result, nil
+}
+
+func schemaKeys[P any](schema Schema[P]) []string {
+	keys := make([]string, 0, len(schema))
+	for key := range schema {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	return keys
 }
