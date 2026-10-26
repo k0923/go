@@ -1,5 +1,8 @@
-// Package appcodec demonstrates an application-owned storage format.
-// Production applications may instead use DTOs containing xjson.G interfaces.
+// Package appcodec demonstrates an application-owned storage format. Production
+// applications may instead use DTOs containing xjson.G interfaces.
+//
+// Package appcodec 演示由应用拥有的存储格式。生产应用也可以改用包含 xjson.G
+// 接口的 DTO。
 package appcodec
 
 import (

@@ -13,8 +13,10 @@ import (
 	"github.com/k0923/go/dflow"
 )
 
-// These helpers adapt old fixture descriptions at the application boundary.
-// No registration or encoding is used by the engine.
+// These helpers adapt old fixture descriptions at the application boundary. No
+// registration or encoding is used by the engine.
+//
+// 这些 helper 在应用边界适配旧 fixture 描述。引擎本身不使用注册或编码。
 type testRegistry map[string]dflow.Node
 type namedNode string
 
@@ -85,6 +87,9 @@ var fixtureSequence atomic.Uint64
 
 // fixtureCodec stores application values using gob. Published fixture handlers
 // are rebound by the test application; they are not serializable Go functions.
+//
+// fixtureCodec 使用 gob 存储应用值。已发布的 fixture handler 会由测试应用重新绑定；
+// 它们不是可序列化的 Go 函数。
 type fixtureCodec struct{}
 
 type fixturePublication struct {

@@ -28,8 +28,12 @@ type CodeNode struct {
 }
 
 // NewCodeNode compiles JavaScript without executing it. Each Run gets a fresh VM.
-// Scripts define main({params}); legacy run(params) is also accepted.
-// No filesystem, network, require, or event loop is installed.
+// Scripts define main({params}); legacy run(params) is also accepted. No
+// filesystem, network, require, or event loop is installed.
+//
+// NewCodeNode 编译 JavaScript，但不会执行它。每次 Run 都会获得一个全新的 VM。
+// 脚本定义 main({params})；也接受旧形式 run(params)。不会安装文件系统、网络、
+// require 或事件循环。
 func NewCodeNode(config CodeConfig) (*CodeNode, error) {
 	if config.Script.Language != "" && config.Script.Language != "javascript" {
 		return nil, fmt.Errorf("unsupported script language %q", config.Script.Language)
@@ -77,6 +81,8 @@ func (n *CodeNode) Run(parent context.Context, input map[string]any) (Result, er
 	stop := context.AfterFunc(ctx, func() { vm.Interrupt(ctx.Err()) })
 	defer stop()
 	// Capture the intrinsic before user code can replace JSON.stringify.
+	//
+	// 在用户代码替换 JSON.stringify 前捕获内建函数。
 	stringifier, err := vm.RunString(`(function(stringify) {
 		return function(value) { return stringify(value); };
 	})(JSON.stringify)`)
@@ -126,6 +132,8 @@ func (n *CodeNode) Run(parent context.Context, input map[string]any) (Result, er
 		return failure(fmt.Errorf("script must define main({ params })"))
 	}
 	// Marshal into a native JS object rather than exposing mutable Go maps.
+	//
+	// 序列化为原生 JS 对象，而不是暴露可变的 Go map。
 	rawInput, err := json.Marshal(input)
 	if err != nil {
 		return failure(err)
@@ -149,6 +157,8 @@ func (n *CodeNode) Run(parent context.Context, input map[string]any) (Result, er
 			value = promise.Result()
 		case goja.PromiseStateRejected:
 			// ToString may invoke user code, so keep it under the same VM deadline.
+			//
+			// ToString 可能调用用户代码，因此仍然放在同一个 VM deadline 下。
 			reason, reasonErr := toString(goja.Undefined(), promise.Result())
 			if reasonErr != nil {
 				return failure(reasonErr)
@@ -159,6 +169,8 @@ func (n *CodeNode) Run(parent context.Context, input map[string]any) (Result, er
 		}
 	}
 	// Stringification stays inside the interruptible VM (including custom toJSON).
+	//
+	// 字符串化保持在可中断的 VM 内部完成（包括自定义 toJSON）。
 	serialized, err := stringify(goja.Undefined(), value)
 	if err != nil {
 		return failure(fmt.Errorf("script output must be JSON: %w", err))
@@ -166,9 +178,12 @@ func (n *CodeNode) Run(parent context.Context, input map[string]any) (Result, er
 	if goja.IsUndefined(serialized) {
 		return failure(fmt.Errorf("script output must be JSON, got undefined"))
 	}
-	var output any
+	var output map[string]any
 	if err := json.Unmarshal([]byte(serialized.String()), &output); err != nil {
 		return failure(err)
+	}
+	if output == nil {
+		return failure(fmt.Errorf("script output must be a JSON object"))
 	}
 	if ctx.Err() != nil {
 		return failure(ctx.Err())

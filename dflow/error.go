@@ -16,6 +16,8 @@ var (
 )
 
 // ValidationError identifies a definition error before any node is executed.
+//
+// ValidationError 标识任何节点执行前发现的定义错误。
 type ValidationError struct {
 	NodeID string
 	Detail string
@@ -28,6 +30,8 @@ func (e *ValidationError) Error() string {
 func (e *ValidationError) Unwrap() error { return e.Cause }
 
 // NodeError preserves the node and stage, including the underlying context error.
+//
+// NodeError 保留节点和阶段信息，包括底层 context 错误。
 type NodeError struct {
 	NodeID string
 	Stage  string
@@ -39,7 +43,10 @@ func (e *NodeError) Error() string {
 }
 func (e *NodeError) Unwrap() error { return e.Cause }
 
-// InfrastructureError means execution/persistence is uncertain, not a business failure.
+// InfrastructureError means execution/persistence is uncertain, not a business
+// failure.
+//
+// InfrastructureError 表示执行或持久化结果不确定，而不是业务失败。
 type InfrastructureError struct {
 	Op    string
 	Cause error

@@ -38,7 +38,7 @@ func waitDefinition() dflow.Definition {
 		Nodes: []dflow.NodeSpec{
 			{ID: "start", Node: &dflow.StartNode{}},
 			{ID: "wait", Node: namedNode("custom"), Inputs: dflow.Parameters{"original": dflow.Constant("input")}},
-			{ID: "end", Node: &dflow.EndNode{}, Inputs: dflow.Parameters{"value": dflow.Ref("wait")}},
+			{ID: "end", Node: &dflow.EndNode{}, Inputs: dflow.Parameters{"value": dflow.Ref("wait", "value")}},
 		},
 		Edges: []dflow.Edge{edge("start", "wait"), edge("wait", "end")},
 	}
@@ -78,7 +78,7 @@ func TestNodeSuspensionAndResume(t *testing.T) {
 				if input["original"] != "input" || resume.Suspension.(*dflow.ValueSuspension).Data.(map[string]any)["job"] != "job-123" || resume.Token == "" {
 					return dflow.Result{}, errors.New("missing saved input or continuation state")
 				}
-				return dflow.Result{Output: resume.Response}, nil
+				return dflow.Result{Output: map[string]any{"value": resume.Response}}, nil
 			},
 		}
 		registry := asyncRegistry(t, node)
@@ -112,9 +112,11 @@ func TestNodeSuspensionAndResume(t *testing.T) {
 			t.Fatal("request ack consumed wake", messages, err)
 		}
 		// A fresh engine must call Resume, not re-enter Run.
+		//
+		// 新 engine 必须调用 Resume，而不是重新进入 Run。
 		e = engine(t, waitDefinition(), registry, infra, dflow.Options{})
 		state, err = e.Drain(ctx)
-		if err != nil || state.Nodes["end"].Status != dflow.Succeeded || state.Nodes["wait"].Output != nil ||
+		if err != nil || state.Nodes["end"].Status != dflow.Succeeded || state.Nodes["wait"].Output["value"] != nil ||
 			state.Nodes["wait"].Suspension != nil || runs.Load() != 1 || resumes.Load() != 1 {
 			t.Fatal(state, err, runs.Load(), resumes.Load())
 		}
@@ -122,6 +124,8 @@ func TestNodeSuspensionAndResume(t *testing.T) {
 			t.Fatal("terminal node reran", err)
 		}
 		// Framework state intentionally exposes no aggregate workflow lifecycle.
+		//
+		// 框架状态刻意不暴露聚合的工作流生命周期。
 		if _, exists := reflect.TypeFor[dflow.State]().FieldByName("Status"); exists {
 			t.Fatal("workflow status must be external")
 		}
@@ -144,7 +148,7 @@ func TestRepeatedSuspensionAndResumeFailure(t *testing.T) {
 				if count == 2 {
 					return dflow.Result{}, errors.New("temporary resume error")
 				}
-				return dflow.Result{Output: resume.Response}, nil
+				return dflow.Result{Output: map[string]any{"value": resume.Response}}, nil
 			},
 		}
 		e := engine(t, waitDefinition(), asyncRegistry(t, node), infra, dflow.Options{})
@@ -176,7 +180,7 @@ func TestRepeatedSuspensionAndResumeFailure(t *testing.T) {
 			t.Fatal("failed Resume lost continuation", state, err)
 		}
 		state, err = e.Drain(ctx)
-		if err != nil || state.Nodes["wait"].Output != "two" || runs.Load() != 1 || resumes.Load() != 3 {
+		if err != nil || state.Nodes["wait"].Output["value"] != "two" || runs.Load() != 1 || resumes.Load() != 3 {
 			t.Fatal(state, err, runs.Load(), resumes.Load())
 		}
 	})
@@ -202,7 +206,7 @@ func TestEarlyResponseAndIndependentBranch(t *testing.T) {
 			return dflow.Result{Suspend: &dflow.ValueSuspension{Kind: "external", Data: "submit"}}, nil
 		},
 		resume: func(_ context.Context, _ map[string]any, input dflow.ResumeInput) (dflow.Result, error) {
-			return dflow.Result{Output: input.Response}, nil
+			return dflow.Result{Output: map[string]any{"value": input.Response}}, nil
 		},
 	}
 	def := waitDefinition()
@@ -217,7 +221,7 @@ func TestEarlyResponseAndIndependentBranch(t *testing.T) {
 		if err != nil || state.Nodes["independent"].Status != dflow.Succeeded {
 			t.Fatal("suspension occupied execution slot", state, err)
 		}
-		if early && (state.Nodes["wait"].Output != "early" || state.Nodes["end"].Status != dflow.Succeeded) {
+		if early && (state.Nodes["wait"].Output["value"] != "early" || state.Nodes["end"].Status != dflow.Succeeded) {
 			t.Fatal("early response was lost", state)
 		}
 		if !early && state.Nodes["wait"].Status != dflow.Suspended {
@@ -236,7 +240,7 @@ func TestInvalidSuspension(t *testing.T) {
 			registry = asyncRegistry(t, asyncNode{
 				run: func(ctx context.Context, input map[string]any) (dflow.Result, error) {
 					result, _ := run(ctx, input)
-					result.Output = "ambiguous outcome"
+					result.Output = map[string]any{"value": "ambiguous outcome"}
 					return result, nil
 				},
 			})

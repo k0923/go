@@ -12,6 +12,9 @@ import (
 
 // recordingHooks captures lifecycle events for assertions. It is safe for the
 // concurrent OnFinish calls the engine makes from node goroutines.
+//
+// recordingHooks 捕获生命周期事件用于断言。它可以安全处理引擎从节点 goroutine 中
+// 并发发起的 OnFinish 调用。
 type recordingHooks struct {
 	mu      sync.Mutex
 	claims  []dflow.NodeEvent
@@ -53,7 +56,7 @@ func (h *recordingHooks) outcome(nodeID string) (dflow.Status, bool) {
 func TestHooksObserveNodeLifecycle(t *testing.T) {
 	registry := testRegistry{}
 	register(t, registry, "value", func(context.Context, map[string]any) (dflow.Result, error) {
-		return dflow.Result{Output: 7}, nil
+		return dflow.Result{Output: map[string]any{"value": 7}}, nil
 	})
 	def := dflow.Definition{
 		Nodes: []dflow.NodeSpec{
@@ -108,10 +111,12 @@ func TestHooksReportFailureOutcome(t *testing.T) {
 }
 
 // A panicking hook must never corrupt execution.
+//
+// 发生 panic 的 hook 绝不能破坏执行。
 func TestHooksPanicIsContained(t *testing.T) {
 	registry := testRegistry{}
 	register(t, registry, "value", func(context.Context, map[string]any) (dflow.Result, error) {
-		return dflow.Result{Output: 1}, nil
+		return dflow.Result{Output: map[string]any{"value": 1}}, nil
 	})
 	def := dflow.Definition{Nodes: []dflow.NodeSpec{{ID: "a", Node: namedNode("value")}}}
 	hooks := dflow.Hooks{OnStart: func(context.Context, dflow.NodeEvent) { panic("hook blew up") }}

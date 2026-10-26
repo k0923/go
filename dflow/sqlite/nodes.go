@@ -36,7 +36,10 @@ func (i *Infrastructure) LoadMetadata(ctx context.Context) (*dflow.State, error)
 	}
 	if state.Nodes != nil {
 		return nil, dflow.ErrRunMismatch
-	} // old snapshot format needs explicit migration
+	}
+	// The old snapshot format needs explicit migration.
+	//
+	// 旧快照格式需要显式迁移。
 	return &state, nil
 }
 func (i *Infrastructure) Initialize(ctx context.Context, m dflow.Manifest, input map[string]any) error {
@@ -104,6 +107,10 @@ ON CONFLICT(scope,node) DO UPDATE SET state=excluded.state,ready=excluded.ready,
 // nodes, nodes left Running by a lost attempt, and Failed nodes that a new run
 // may retry. The driver stops the current sweep on the first failure
 // (fail-fast); retrying is a deliberate new Run/Drain by the business.
+//
+// ReadyNodes 列出未被有效租约持有的可驱动节点 ID：新变为 ready 的节点、因丢失
+// attempt 而停留在 Running 的节点，以及新 run 可以重试的 Failed 节点。driver 会在
+// 第一个失败处停止当前扫描（fail-fast）；重试是业务有意发起的新 Run/Drain。
 func (i *Infrastructure) ReadyNodes(ctx context.Context) ([]string, error) {
 	rows, err := i.db.QueryContext(ctx, `SELECT node FROM dflow_nodes WHERE scope=?
 AND (ready=1 OR status IN ('running','failed')) AND lease_expires<=? ORDER BY node`, i.scope, time.Now().UnixNano())
@@ -173,13 +180,19 @@ func (i *Infrastructure) Commit(ctx context.Context, token lease.Token, c dflow.
 			return err
 		}
 		if current == nil || current.Generation != token.Generation {
-			return lease.ErrConflict // fenced: a newer attempt claimed the node
+			// The writer is fenced because a newer attempt claimed the node.
+			//
+			// writer 被 fencing，因为更新的 attempt 已经 claim 了该节点。
+			return lease.ErrConflict
 		}
 		if err := dflow.ValidateCommit(*current, c, token.Generation); err != nil {
 			return err
 		}
 		if err := i.checkNodeLease(ctx, tx, token); err != nil {
-			return err // lease expired or released
+			// The lease has expired or has already been released.
+			//
+			// 租约已经过期或已被释放。
+			return err
 		}
 		next := c.State
 		next.Version = current.Version + 1
@@ -191,6 +204,8 @@ func (i *Infrastructure) Commit(ctx context.Context, token lease.Token, c dflow.
 			return err
 		}
 		// The outcome ends this attempt's ownership.
+		//
+		// 该结果结束本次 attempt 的所有权。
 		if err := i.setLease(ctx, tx, c.NodeID, 0); err != nil {
 			return err
 		}

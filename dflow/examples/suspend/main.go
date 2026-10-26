@@ -67,6 +67,8 @@ func main() {
 		}
 	}
 	// On restart only the publication ID is needed; nodes are decoded on demand.
+	//
+	// 重启时只需要 publication ID；节点会按需解码。
 	engine, err := dflow.NewEngineWithProvider(store.Provider("transcode-v1"), store, dflow.Options{})
 	if err != nil {
 		log.Fatal(err)
@@ -82,12 +84,17 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	state, err := store.Load(ctx) // optional business observation, not engine scheduling
+	// Loading state is optional business observation, not engine scheduling.
+	//
+	// 加载状态是可选的业务观测，而不是引擎调度。
+	state, err := store.Load(ctx)
 	if err != nil {
 		log.Fatal(err)
 	}
 	fmt.Println("task 节点状态:", state.Nodes["task"].Status)
 	// This application's own completion rule; the engine has no workflow status.
+	//
+	// 这是本应用自己的完成规则；引擎没有工作流整体状态。
 	if state.Nodes["end"].Status == dflow.Succeeded {
 		data, _ := json.Marshal(state.Nodes["end"].Output)
 		fmt.Println(string(data))
@@ -99,6 +106,9 @@ func main() {
 	for _, message := range messages {
 		// Production: REQUEST goes to a business provider using run+node+token as an
 		// idempotency key; WAKE retries Resume until it returns without error.
+		//
+		// 生产环境中，REQUEST 会发送给业务 provider，并使用 run+node+token 作为幂等键；
+		// WAKE 会重试 Resume，直到它无错误返回。
 		fmt.Printf("通知 %d: %s node=%s token=%s request=%+v\n", message.ID, message.Kind, message.NodeID, message.Token, message.Request)
 		if state.Nodes["end"].Status == dflow.Succeeded {
 			if err := store.Ack(ctx, message.ID); err != nil {

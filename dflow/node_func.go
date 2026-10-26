@@ -6,6 +6,8 @@ import (
 )
 
 // FuncNode adapts a handler into a node.
+//
+// FuncNode 将处理函数适配为节点。
 type FuncNode struct {
 	Handler NodeFunc
 }

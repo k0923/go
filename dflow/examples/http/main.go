@@ -45,5 +45,5 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	fmt.Println(state.Nodes["end"].Output.(map[string]any)["message"])
+	fmt.Println(state.Nodes["end"].Output["message"])
 }

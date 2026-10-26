@@ -12,6 +12,8 @@ import (
 )
 
 // A business dependency belongs in a node, not in the framework's Infrastructure.
+//
+// 业务依赖应属于节点，而不是框架的 Infrastructure。
 type greetingService struct{}
 
 func (greetingService) Greet(ctx context.Context, name string) (string, error) {
@@ -57,5 +59,5 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	fmt.Println(state.Nodes["end"].Output.(map[string]any)["text"])
+	fmt.Println(state.Nodes["end"].Output["text"])
 }

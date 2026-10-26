@@ -4,6 +4,9 @@ import "reflect"
 
 // clone preserves concrete Go types, aliases and cycles without a wire format.
 // Unexported struct fields and functions are shared and must be immutable.
+//
+// clone 在不使用线格式的情况下保留具体 Go 类型、别名和循环引用。未导出的 struct
+// 字段和函数会被共享，并且必须是不可变的。
 func clone[T any](value T) (T, error) {
 	v := copyValue(reflect.ValueOf(value), map[copyKey]reflect.Value{})
 	if !v.IsValid() {

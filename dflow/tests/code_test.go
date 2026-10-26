@@ -29,7 +29,7 @@ func TestCodeNode(t *testing.T) {
 				Edges: []dflow.Edge{edge("js", "end")},
 			}
 			state, err := engine(t, def, nil, memory.New(), dflow.Options{}).Run(context.Background(), map[string]any{"number": 21})
-			if err != nil || state.Nodes["end"].Output.(map[string]any)["result"] != float64(42) {
+			if err != nil || state.Nodes["end"].Output["result"] != float64(42) {
 				t.Fatalf("unexpected JS result: %+v %v", state, err)
 			}
 		})
@@ -45,6 +45,8 @@ func TestCodeTimeoutIncludesTopLevelAndSerialization(t *testing.T) {
 	} {
 		t.Run(script, func(t *testing.T) {
 			// Compile must never execute the top-level infinite loop.
+			//
+			// Compile 绝不能执行顶层无限循环。
 			node, err := dflow.NewCodeNode(dflow.CodeConfig{Script: dflow.Script{Content: script}, TimeoutMS: 20})
 			if err != nil {
 				t.Fatal(err)
@@ -64,6 +66,7 @@ func TestCodeRejectsInvalidResultsAndSupportsCancellation(t *testing.T) {
 		`function main() { return new Promise(() => {}); }`,
 		`function main() { const x = {}; x.x = x; return x; }`,
 		`function main() { return undefined; }`,
+		`function main() { return null; }`,
 		`const notMain = 1;`,
 	} {
 		node, err := dflow.NewCodeNode(dflow.CodeConfig{Script: dflow.Script{Content: script}})

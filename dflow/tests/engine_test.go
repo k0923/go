@@ -32,6 +32,9 @@ func (e *observedEngine) Drain(ctx context.Context) (*dflow.State, error) {
 
 // ResumeNode mirrors the old engine helper by driving through the reference
 // driver: the returned State contains only nodes this resume touched.
+//
+// ResumeNode 通过参考 driver 驱动，以模拟旧的 engine helper：返回的 State 只包含
+// 本次 resume 触碰到的节点。
 func (e *observedEngine) ResumeNode(ctx context.Context, nodeID, token string, response ...any) (*dflow.State, error) {
 	return driver.Resume(ctx, e.Engine, nodeID, token, response...)
 }
@@ -126,7 +129,7 @@ func TestDAGReferencesAndSnapshotIsolation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	out := state.Nodes["end"].Output.(map[string]any)
+	out := state.Nodes["end"].Output
 	if out["value"] != `a"b` || out["json"] != `{"name": "a\"b"}` || out["text"] != `hello a"b` {
 		t.Fatalf("unexpected output: %#v", out)
 	}
@@ -135,7 +138,7 @@ func TestDAGReferencesAndSnapshotIsolation(t *testing.T) {
 	}
 	out["value"] = "mutated"
 	again, err := e.Run(context.Background(), input)
-	if err != nil || again.Nodes["end"].Output.(map[string]any)["value"] != `a"b` {
+	if err != nil || again.Nodes["end"].Output["value"] != `a"b` {
 		t.Fatalf("durable state leaked: %#v %v", again, err)
 	}
 	_, err = e.Run(context.Background(), map[string]any{"different": true})
@@ -153,16 +156,16 @@ func TestResumeRetriesOnlyUnfinishedNodes(t *testing.T) {
 			return dflow.Result{}, fmt.Errorf("missing node context")
 		}
 		first.Add(1)
-		return dflow.Result{Output: 42}, nil
+		return dflow.Result{Output: map[string]any{"value": 42}}, nil
 	})
 	register(t, registry, "second", func(_ context.Context, input map[string]any) (dflow.Result, error) {
 		if second.Add(1) == 1 {
 			return dflow.Result{}, transient
 		}
-		return dflow.Result{Output: input["value"]}, nil
+		return dflow.Result{Output: map[string]any{"value": input["value"]}}, nil
 	})
 	def := dflow.Definition{
-		Nodes: []dflow.NodeSpec{{ID: "a", Node: namedNode("first")}, {ID: "b", Node: namedNode("second"), Inputs: dflow.Parameters{"value": dflow.Ref("a")}}},
+		Nodes: []dflow.NodeSpec{{ID: "a", Node: namedNode("first")}, {ID: "b", Node: namedNode("second"), Inputs: dflow.Parameters{"value": dflow.Ref("a", "value")}}},
 		Edges: []dflow.Edge{edge("a", "b")},
 	}
 	infra := memory.New()
@@ -171,10 +174,13 @@ func TestResumeRetriesOnlyUnfinishedNodes(t *testing.T) {
 	if !errors.Is(err, transient) || state.Nodes["b"].Status != dflow.Failed {
 		t.Fatalf("expected failed state, got %+v %v", state, err)
 	}
-	// A fresh engine resumes from infrastructure, not from the prior engine's memory.
+	// A fresh engine resumes from infrastructure, not from the prior engine's
+	// memory.
+	//
+	// 新 engine 会从 Infrastructure 恢复，而不是从前一个 engine 的内存恢复。
 	e = engine(t, def, registry, infra, dflow.Options{})
 	state, err = e.Run(context.Background(), nil)
-	if err != nil || state.Nodes["b"].Status != dflow.Succeeded || first.Load() != 1 || second.Load() != 2 || state.Nodes["b"].Output != 42 {
+	if err != nil || state.Nodes["b"].Status != dflow.Succeeded || first.Load() != 1 || second.Load() != 2 || state.Nodes["b"].Output["value"] != 42 {
 		t.Fatalf("resume failed: %+v %v calls=%d/%d", state, err, first.Load(), second.Load())
 	}
 	_, err = e.Run(context.Background(), nil)
@@ -203,10 +209,13 @@ func TestBranchSkipAndMerge(t *testing.T) {
 		t.Fatal(err)
 	}
 	if state.Nodes["no"].Status != dflow.Skipped || state.Nodes["no-child"].Status != dflow.Skipped ||
-		state.Nodes["merge"].Status != dflow.Succeeded || state.Nodes["merge"].Output.(map[string]any)["value"] != "true" {
+		state.Nodes["merge"].Status != dflow.Succeeded || state.Nodes["merge"].Output["value"] != "true" {
 		t.Fatalf("incorrect branch state: %+v", state)
 	}
-	// A topologically legal reference to an inactive branch must fail, not resolve as null.
+	// A topologically legal reference to an inactive branch must fail, not resolve
+	// as null.
+	//
+	// 对非活跃分支的拓扑合法引用必须失败，而不是解析为 null。
 	def.Nodes[4].Inputs = dflow.Parameters{"missing": dflow.Ref("no")}
 	_, err = engine(t, def, nil, memory.New(), dflow.Options{}).Run(context.Background(), nil)
 	if !errors.Is(err, dflow.ErrMissingValue) {
@@ -218,14 +227,14 @@ func TestSerialFanoutWaitsForAllPredecessors(t *testing.T) {
 	registry := testRegistry{}
 	var order atomic.Int32
 	register(t, registry, "mark", func(ctx context.Context, input map[string]any) (dflow.Result, error) {
-		return dflow.Result{Output: int(order.Add(1))}, nil
+		return dflow.Result{Output: map[string]any{"value": int(order.Add(1))}}, nil
 	})
 	def := dflow.Definition{
 		Nodes: []dflow.NodeSpec{
 			{ID: "start", Node: &dflow.StartNode{}},
 			{ID: "a", Node: namedNode("mark")},
 			{ID: "b", Node: namedNode("mark")},
-			{ID: "join", Node: &dflow.EndNode{}, Inputs: dflow.Parameters{"a": dflow.Ref("a"), "b": dflow.Ref("b")}},
+			{ID: "join", Node: &dflow.EndNode{}, Inputs: dflow.Parameters{"a": dflow.Ref("a", "value"), "b": dflow.Ref("b", "value")}},
 		},
 		Edges: []dflow.Edge{edge("start", "a"), edge("start", "b"), edge("a", "join"), edge("b", "join")},
 	}
@@ -237,7 +246,9 @@ func TestSerialFanoutWaitsForAllPredecessors(t *testing.T) {
 		t.Fatal(err)
 	}
 	// join runs only after both predecessors, and the driver never ran it twice.
-	out := state.Nodes["join"].Output.(map[string]any)
+	//
+	// join 只会在两个前驱都完成后运行，并且 driver 从未重复运行它。
+	out := state.Nodes["join"].Output
 	if state.Nodes["join"].Status != dflow.Succeeded || out["a"] == nil || out["b"] == nil {
 		t.Fatalf("join did not wait for both predecessors: %+v", state)
 	}
@@ -246,7 +257,7 @@ func TestSerialFanoutWaitsForAllPredecessors(t *testing.T) {
 func TestNodeLeaseEndsWithCommit(t *testing.T) {
 	registry := testRegistry{}
 	register(t, registry, "value", func(context.Context, map[string]any) (dflow.Result, error) {
-		return dflow.Result{Output: 1}, nil
+		return dflow.Result{Output: map[string]any{"value": 1}}, nil
 	})
 	infra := memory.New()
 	e := engine(t, dflow.Definition{Nodes: []dflow.NodeSpec{{ID: "a", Node: namedNode("value")}}}, registry, infra, dflow.Options{})
@@ -255,6 +266,8 @@ func TestNodeLeaseEndsWithCommit(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Commit ends the node lease; a terminal node is never claimable again.
+	//
+	// Commit 会结束节点租约；terminal 节点永远不会再次被 claim。
 	if task, err := infra.ClaimNode(ctx, "a", 30*time.Second); err != nil || task != nil {
 		t.Fatalf("terminal node claimed again: %+v %v", task, err)
 	}
@@ -277,7 +290,7 @@ func TestPersistenceFailureDoesNotStartDownstream(t *testing.T) {
 	var downstream atomic.Int32
 	register(t, registry, "downstream", func(context.Context, map[string]any) (dflow.Result, error) {
 		downstream.Add(1)
-		return dflow.Result{Output: true}, nil
+		return dflow.Result{Output: map[string]any{"value": true}}, nil
 	})
 	infra := &failingSave{Infrastructure: memory.New()}
 	infra.fail.Store(true)

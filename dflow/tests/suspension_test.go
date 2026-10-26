@@ -26,7 +26,7 @@ func TestSuspensionCustomTypeRoundTripAndRecovery(t *testing.T) {
 				if !ok || payload.Approver != "alice" || payload.Document != "doc-1" {
 					return dflow.Result{}, errors.New("typed suspension was not restored")
 				}
-				return dflow.Result{Output: resumed.Response}, nil
+				return dflow.Result{Output: map[string]any{"value": resumed.Response}}, nil
 			},
 		})
 		parent := engine(t, waitDefinition(), registry, infra, dflow.Options{})
@@ -46,7 +46,7 @@ func TestSuspensionCustomTypeRoundTripAndRecovery(t *testing.T) {
 		}
 		parent = engine(t, waitDefinition(), registry, infra, dflow.Options{})
 		state, err = parent.Drain(ctx)
-		if err != nil || state.Nodes["wait"].Output != true {
+		if err != nil || state.Nodes["wait"].Output["value"] != true {
 			t.Fatal(state, err)
 		}
 	})

@@ -32,7 +32,7 @@ func TestResumeNodeTargetsOneBranchAndReadsInputOnDemand(t *testing.T) {
 				if input["saved"] != "original" {
 					return dflow.Result{}, errors.New("saved node input missing")
 				}
-				return dflow.Result{Output: resume.Response}, nil
+				return dflow.Result{Output: map[string]any{"value": resume.Response}}, nil
 			},
 		})
 		graph := compile(t, dflow.Definition{
@@ -41,7 +41,7 @@ func TestResumeNodeTargetsOneBranchAndReadsInputOnDemand(t *testing.T) {
 				{ID: "a", Node: namedNode("custom"), Inputs: dflow.Parameters{"saved": dflow.Input("value")}},
 				{ID: "b", Node: namedNode("custom"), Inputs: dflow.Parameters{"saved": dflow.Input("value")}},
 				{ID: "after", Node: &dflow.EndNode{}, Inputs: dflow.Parameters{
-					"text": dflow.PlainTemplate(`{{$input.value}} {{a}}`),
+					"text": dflow.PlainTemplate(`{{$input.value}} {{a.value}}`),
 				}},
 			},
 			Edges: []dflow.Edge{edge("start", "a"), edge("start", "b"), edge("a", "after")},
@@ -65,7 +65,7 @@ func TestResumeNodeTargetsOneBranchAndReadsInputOnDemand(t *testing.T) {
 			t.Fatal(err)
 		}
 		if len(state.Nodes) != 2 || state.Nodes["a"].Status != dflow.Succeeded ||
-			state.Nodes["after"].Output.(map[string]any)["text"] != "original answer" {
+			state.Nodes["after"].Output["text"] != "original answer" {
 			t.Fatal(state)
 		}
 		b, _ = infra.GetNode(ctx, "b")
@@ -80,7 +80,7 @@ func TestResumeNodeTargetsOneBranchAndReadsInputOnDemand(t *testing.T) {
 		}
 		counter.reads = 0
 		state, err = driver.Resume(ctx, e, "b", b.Suspension.Token)
-		if err != nil || state.Nodes["b"].Output != "other" || counter.reads != 0 {
+		if err != nil || state.Nodes["b"].Output["value"] != "other" || counter.reads != 0 {
 			t.Fatal("persisted wake needs no input read", state, err, counter.reads)
 		}
 	})
@@ -149,6 +149,9 @@ func TestResumeNodeDoesNotAcceptOldLoopToken(t *testing.T) {
 		}
 		// A live node lease held by another instance blocks the targeted resume:
 		// it drives nothing instead of executing Resume twice.
+		//
+		// 由另一个实例持有的有效节点租约会阻塞定向 resume：它不会驱动任何内容，
+		// 也不会执行两次 Resume。
 		if accepted, err := e.Wakeup(ctx, "wait", current.Suspension.Token, "answer"); err != nil || !accepted {
 			t.Fatal(accepted, err)
 		}

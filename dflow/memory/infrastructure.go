@@ -1,4 +1,6 @@
 // Package memory implements run-scoped node scheduling with atomic transitions.
+//
+// Package memory 使用原子状态转换实现 run 作用域的节点调度。
 package memory
 
 import (
@@ -15,9 +17,12 @@ import (
 var _ dflow.Infrastructure = (*Infrastructure)(nil)
 
 type Infrastructure struct {
-	mu        sync.Mutex
-	state     *dflow.State
-	leases    map[string]time.Time // node ID -> current lease expiry
+	mu    sync.Mutex
+	state *dflow.State
+	// leases maps node IDs to current lease expiries.
+	//
+	// leases 将节点 ID 映射到当前租约过期时间。
+	leases    map[string]time.Time
 	responses map[[2]string]*dflow.Response
 	outbox    map[int64]dflow.Notification
 	sequence  int64
@@ -26,6 +31,8 @@ type Infrastructure struct {
 func New() *Infrastructure { return &Infrastructure{leases: map[string]time.Time{}} }
 
 // owned reports whether token is the node's live lease. Caller holds mu.
+//
+// owned 报告 token 是否为该节点的有效租约。调用方持有 mu。
 func (i *Infrastructure) owned(token lease.Token) bool {
 	if i.state == nil {
 		return false
@@ -36,6 +43,8 @@ func (i *Infrastructure) owned(token lease.Token) bool {
 }
 
 // leased reports whether a live lease currently owns the node. Caller holds mu.
+//
+// leased 报告当前是否有有效租约持有该节点。调用方持有 mu。
 func (i *Infrastructure) leased(id string) bool {
 	expires, held := i.leases[id]
 	return held && time.Now().Before(expires)
@@ -114,6 +123,10 @@ func (i *Infrastructure) GetNode(ctx context.Context, id string) (*dflow.NodeSta
 // nodes, nodes left Running by a lost attempt, and Failed nodes a new run may
 // retry. The driver stops the current sweep on the first failure (fail-fast);
 // retrying is a deliberate new Run/Drain by the business.
+//
+// ReadyNodes 列出未被有效租约持有的可驱动节点 ID：新变为 ready 的节点、因丢失
+// attempt 而停留在 Running 的节点，以及新 run 可以重试的 Failed 节点。driver 会在
+// 第一个失败处停止当前扫描（fail-fast）；重试是业务有意发起的新 Run/Drain。
 func (i *Infrastructure) ReadyNodes(ctx context.Context) ([]string, error) {
 	i.mu.Lock()
 	defer i.mu.Unlock()
@@ -203,13 +216,19 @@ func (i *Infrastructure) Commit(ctx context.Context, token lease.Token, c dflow.
 	}
 	current := i.state.Nodes[c.NodeID]
 	if current.Generation != token.Generation {
-		return nil, lease.ErrConflict // fenced: a newer attempt claimed the node
+		// The writer is fenced because a newer attempt claimed the node.
+		//
+		// writer 被 fencing，因为更新的 attempt 已经 claim 了该节点。
+		return nil, lease.ErrConflict
 	}
 	if err := dflow.ValidateCommit(current, c, token.Generation); err != nil {
 		return nil, err
 	}
 	if !i.owned(token) {
-		return nil, lease.ErrConflict // lease expired or released
+		// The lease has expired or has already been released.
+		//
+		// 租约已经过期或已被释放。
+		return nil, lease.ErrConflict
 	}
 	next, err := clone(c.State)
 	if err != nil {
@@ -247,7 +266,10 @@ func (i *Infrastructure) Commit(ctx context.Context, token lease.Token, c dflow.
 	next.Ready = false
 	next.Enabled = current.Enabled
 	i.state.Nodes[c.NodeID] = next
-	delete(i.leases, c.NodeID) // the outcome ends this attempt's ownership
+	// The outcome ends this attempt's ownership.
+	//
+	// 该结果结束本次 attempt 的所有权。
+	delete(i.leases, c.NodeID)
 	for id, target := range targets {
 		i.state.Nodes[id] = target
 	}

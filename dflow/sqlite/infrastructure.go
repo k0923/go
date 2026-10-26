@@ -1,4 +1,6 @@
 // Package sqlite provides durable, run-scoped dflow storage and an outbox.
+//
+// Package sqlite 提供持久化的 run 作用域 dflow 存储和 outbox。
 package sqlite
 
 import (
@@ -20,6 +22,9 @@ var _ dflow.Infrastructure = (*Infrastructure)(nil)
 // Outbox is the durable delivery capability provided by the SQLite
 // implementation. Ack Request after external acceptance; Ack Wake after the
 // token-specific Resume call is safely handled.
+//
+// Outbox 是 SQLite 实现提供的持久投递能力。Request 应在外部接受后 Ack；Wake 应在
+// token 特定的 Resume 调用被安全处理后 Ack。
 type Outbox interface {
 	Pending(context.Context) ([]dflow.Notification, error)
 	Ack(context.Context, int64) error
@@ -36,6 +41,9 @@ type Infrastructure struct {
 // Codec is supplied by the application. It must preserve concrete Node,
 // Parameter, Suspension and response types, and reject unsupported values.
 // SQLite owns transactions and indexes, not the application's wire format.
+//
+// Codec 由应用提供。它必须保留具体的 Node、Parameter、Suspension 和响应类型，
+// 并拒绝不支持的值。SQLite 负责事务和索引，而不负责应用的线格式。
 type Codec interface {
 	Encode(any) ([]byte, error)
 	Decode([]byte, any) error
@@ -44,6 +52,10 @@ type Codec interface {
 // Open creates the schema and binds this handle to scope (e.g. tenant/run ID).
 // Multiple handles/processes can share the file. The directory must exist.
 // WAL + synchronous FULL protects committed checkpoints across process crashes.
+//
+// Open 创建 schema，并将此 handle 绑定到 scope（例如 tenant/run ID）。多个 handle
+// 或进程可以共享同一文件。目录必须已经存在。WAL + synchronous FULL 保护已提交的
+// checkpoint，使其跨进程崩溃仍然可靠。
 func Open(ctx context.Context, path, scope string, codec Codec) (*Infrastructure, error) {
 	if path == "" || scope == "" || codec == nil {
 		return nil, fmt.Errorf("sqlite dflow: path, scope and application codec are required")
@@ -111,6 +123,9 @@ CREATE INDEX IF NOT EXISTS dflow_outbox_scope ON dflow_outbox(scope,id);
 
 // addNodeLeaseColumn upgrades databases created before per-node leases. The
 // former run-lease columns of dflow_runs are left in place and ignored.
+//
+// addNodeLeaseColumn 升级在引入按节点租约之前创建的数据库。dflow_runs 中原来的
+// run-lease 列会保留但被忽略。
 func addNodeLeaseColumn(ctx context.Context, db *sql.DB) error {
 	var present int
 	err := db.QueryRowContext(ctx, `SELECT count(*) FROM pragma_table_info('dflow_nodes') WHERE name='lease_expires'`).Scan(&present)
@@ -172,6 +187,9 @@ func affected(result sql.Result, err, conflict error) error {
 
 // checkNodeLease fences a writer inside tx: the node generation must match the
 // token and the stored lease must not have expired.
+//
+// checkNodeLease 在 tx 内对 writer 做 fencing：节点 generation 必须匹配 token，
+// 且存储中的租约不能已经过期。
 func (i *Infrastructure) checkNodeLease(ctx context.Context, tx *sql.Tx, token lease.Token) error {
 	var generation, expires int64
 	err := tx.QueryRowContext(ctx, `SELECT generation,lease_expires FROM dflow_nodes WHERE scope=? AND node=?`,

@@ -177,7 +177,7 @@ func TestRegressionRenewalFinishesBeforeCommit(t *testing.T) {
 					ID: "node", Node: dflow.NodeFunc(func(ctx context.Context, _ map[string]any) (dflow.Result, error) {
 						select {
 						case <-store.entered:
-							return dflow.Result{Output: "done"}, nil
+							return dflow.Result{Output: map[string]any{"value": "done"}}, nil
 						case <-ctx.Done():
 							return dflow.Result{}, ctx.Err()
 						}
@@ -208,6 +208,8 @@ func TestRegressionRenewalFinishesBeforeCommit(t *testing.T) {
 					t.Fatal("node did not return", ctx.Err())
 				}
 				// Keep the renewal in flight while Drive advances towards Commit.
+				//
+				// 在 Drive 向 Commit 推进时保持续租请求仍在途中。
 				select {
 				case <-store.commitEntered:
 				case <-time.After(20 * time.Millisecond):
@@ -279,6 +281,9 @@ func TestRegressionInputStorageFailureStaysRetryable(t *testing.T) {
 
 // This adapter intentionally exposes only the original Infrastructure methods.
 // A newer suspension becomes ready precisely before its ClaimNode is called.
+//
+// 这个适配器故意只暴露原始 Infrastructure 方法。一个更新的 suspension 会在它的
+// ClaimNode 被调用前精确变为 ready。
 type resumeClaimRace struct {
 	dflow.Infrastructure
 	before func()
@@ -322,6 +327,8 @@ func TestRegressionResumeChecksTheClaimedSnapshot(t *testing.T) {
 		wrapper := &resumeClaimRace{Infrastructure: infra}
 		wrapper.before = func() {
 			// Another worker consumes the old response and creates a fresh wait.
+			//
+			// 另一个 worker 消费旧响应并创建新的 wait。
 			executed, err := e.Resume(ctx, "wait", old)
 			if err != nil || executed.Status != dflow.Suspended {
 				t.Fatal(executed, err)

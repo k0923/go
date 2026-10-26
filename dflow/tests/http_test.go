@@ -58,10 +58,10 @@ func TestHTTPNodeDAG(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	output := state.Nodes["request"].Output.(map[string]any)
+	output := state.Nodes["request"].Output
 	headers := output["headers"].(map[string]any)
 	if output["statusCode"] != 201 || len(headers["X-Multi"].([]string)) != 2 ||
-		state.Nodes["parse"].Output.(map[string]any)["ok"] != true {
+		state.Nodes["parse"].Output["ok"] != true {
 		t.Fatal("unexpected HTTP output", output)
 	}
 }
@@ -95,7 +95,7 @@ func TestHTTPNodeBodiesAndBearer(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		out := result.Output.(map[string]any)
+		out := result.Output
 		if out["body"] != tc.expected || out["statusCode"] != 422 ||
 			out["headers"].(map[string]any)["X-Content-Type"] != tc.content {
 			t.Fatal("non-2xx must preserve HTTP response", out)
@@ -104,6 +104,9 @@ func TestHTTPNodeBodiesAndBearer(t *testing.T) {
 }
 
 func TestHTTPNodeValidationAndLimits(t *testing.T) {
+	if _, err := (&dflow.JSONParseNode{}).Run(context.Background(), map[string]any{"json": "null"}); err == nil {
+		t.Fatal("JSONParseNode accepted a non-object result")
+	}
 	for _, config := range []string{
 		`{"timeoutMs":-1}`, `{"timeoutMs":600001}`, `{"retryTimes":6}`, `{"retryTimes":-1}`,
 		`{"bodyType":"bad"}`, `{"method":"bad method"}`, `{"maxResponseBytes":-1}`,
@@ -146,7 +149,7 @@ func TestHTTPNodeRetryAndCancellation(t *testing.T) {
 	}))
 	defer server.Close()
 	result, err := (&dflow.HTTPNode{RetryTimes: 1}).Run(context.Background(), map[string]any{"url": server.URL})
-	if err != nil || calls.Load() != 2 || result.Output.(map[string]any)["body"] != "success" {
+	if err != nil || calls.Load() != 2 || result.Output["body"] != "success" {
 		t.Fatal("retry failed", result, err, calls.Load())
 	}
 	before := calls.Load()
@@ -188,7 +191,7 @@ func TestHTTPNodeClientInjection(t *testing.T) {
 		return http.ErrUseLastResponse
 	}}}
 	result, err := node.Run(context.Background(), map[string]any{"url": server.URL})
-	if err != nil || result.Output.(map[string]any)["statusCode"] != 302 {
+	if err != nil || result.Output["statusCode"] != 302 {
 		t.Fatal("injected client was not preserved", result, err)
 	}
 }

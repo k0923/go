@@ -14,14 +14,22 @@ import (
 
 // HTTPNode receives url, headers, params, body and auth as resolved node inputs.
 // Non-2xx responses are returned as output for downstream business decisions.
+//
+// HTTPNode 接收已经解析的 url、headers、params、body 和 auth 节点输入。
+// 非 2xx 响应会作为输出返回，供下游业务决策。
 type HTTPNode struct {
-	Method             string `json:"method,omitempty"`
-	BodyType           string `json:"bodyType,omitempty"` // none, JSON, raw-text
+	Method string `json:"method,omitempty"`
+	// BodyType accepts none, JSON or raw-text.
+	//
+	// BodyType 接受 none、JSON 或 raw-text。
+	BodyType           string `json:"bodyType,omitempty"`
 	TimeoutMS          int64  `json:"timeoutMs,omitempty"`
 	RetryTimes         int    `json:"retryTimes,omitempty"`
 	RetryNonIdempotent bool   `json:"retryNonIdempotent,omitempty"`
 	MaxResponseBytes   int64  `json:"maxResponseBytes,omitempty"`
 	// Inject a client through the factory for custom transport/redirect policy.
+	//
+	// 通过工厂注入 client，以自定义 transport 或 redirect 策略。
 	Client *http.Client `json:"-"`
 }
 
@@ -191,6 +199,8 @@ func (n *HTTPNode) body(value any) ([]byte, string, error) {
 }
 
 // Normalize JSON objects from direct Go calls as well as engine-resolved inputs.
+//
+// 同时规范化直接 Go 调用和引擎解析输入中的 JSON 对象。
 func httpValues(value any, field string) (url.Values, error) {
 	result := make(url.Values)
 	if value == nil {

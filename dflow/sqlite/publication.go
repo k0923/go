@@ -9,6 +9,8 @@ import (
 )
 
 // Provider binds to one immutable publication ID stored separately from runs.
+//
+// Provider 绑定到一个不可变的 publication ID，该 ID 与 run 分开存储。
 type Provider struct {
 	db    *sql.DB
 	id    string
@@ -17,6 +19,9 @@ type Provider struct {
 
 // Publish stores validated records atomically. Publication IDs are insert-only.
 // Same content may be published idempotently; changed content requires a new ID.
+//
+// Publish 原子存储已校验记录。Publication ID 只能插入。相同内容可以幂等发布；
+// 内容变化需要使用新的 ID。
 func (i *Infrastructure) Publish(ctx context.Context, id string, graph *dflow.Graph) (*Provider, error) {
 	if id == "" || graph == nil {
 		return nil, dflow.ErrInvalidDefinition
@@ -67,6 +72,8 @@ func (i *Infrastructure) Publish(ctx context.Context, id string, graph *dflow.Gr
 }
 
 // Provider needs no full definition JSON. Open the DB and bind its publication ID.
+//
+// Provider 不需要完整 definition JSON。打开数据库并绑定其 publication ID 即可。
 func (i *Infrastructure) Provider(id string) *Provider { return &Provider{i.db, id, i.codec} }
 func (p *Provider) Manifest(ctx context.Context) (dflow.Manifest, error) {
 	var raw []byte

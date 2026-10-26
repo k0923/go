@@ -19,6 +19,10 @@ import (
 // instances runs test against two Infrastructure handles bound to the same
 // execution: one shared memory store, or two SQLite connections to one file,
 // simulating independent HA instances driving nodes of one run.
+//
+// instances 使用绑定到同一执行的两个 Infrastructure handle 运行测试：一个共享的
+// memory store，或同一文件上的两个 SQLite 连接，用来模拟独立 HA 实例驱动同一
+// run 的节点。
 func instances(t *testing.T, test func(*testing.T, [2]dflow.Infrastructure)) {
 	t.Helper()
 	t.Run("memory", func(t *testing.T) {
@@ -46,7 +50,7 @@ func fanInDefinition() dflow.Definition {
 			{ID: "start", Node: &dflow.StartNode{}},
 			{ID: "a", Node: namedNode("barrier")},
 			{ID: "b", Node: namedNode("barrier")},
-			{ID: "join", Node: &dflow.EndNode{}, Inputs: dflow.Parameters{"a": dflow.Ref("a"), "b": dflow.Ref("b")}},
+			{ID: "join", Node: &dflow.EndNode{}, Inputs: dflow.Parameters{"a": dflow.Ref("a", "value"), "b": dflow.Ref("b", "value")}},
 		},
 		Edges: []dflow.Edge{edge("start", "a"), edge("start", "b"), edge("a", "join"), edge("b", "join")},
 	}
@@ -62,8 +66,11 @@ func TestNodesOfOneRunExecuteInParallelAcrossInstances(t *testing.T) {
 			done := make(chan struct{})
 			go func() { arrived.Wait(); close(done) }()
 			select {
-			case <-done: // both nodes are inside Run at the same time
-				return dflow.Result{Output: dflow.NodeID(ctx)}, nil
+			case <-done:
+				// Both nodes are inside Run at the same time.
+				//
+				// 两个节点同时位于 Run 内部。
+				return dflow.Result{Output: map[string]any{"value": dflow.NodeID(ctx)}}, nil
 			case <-time.After(2 * time.Second):
 				return dflow.Result{}, errors.New("sibling node did not run concurrently")
 			}
@@ -101,7 +108,7 @@ func TestNodesOfOneRunExecuteInParallelAcrossInstances(t *testing.T) {
 			t.Fatal("join must become ready exactly once", downstream)
 		}
 		executed, err := engines[1].Drive(ctx, "join")
-		output, _ := executed.Output.(map[string]any)
+		output := executed.Output
 		if err != nil || executed.Status != dflow.Succeeded || output["a"] != "a" || output["b"] != "b" {
 			t.Fatal(executed, err)
 		}
@@ -116,7 +123,7 @@ func TestDuplicateDriveExecutesNodeOnce(t *testing.T) {
 		register(t, registry, "slow", func(context.Context, map[string]any) (dflow.Result, error) {
 			runs.Add(1)
 			<-release
-			return dflow.Result{Output: "done"}, nil
+			return dflow.Result{Output: map[string]any{"value": "done"}}, nil
 		})
 		def := dflow.Definition{Nodes: []dflow.NodeSpec{{ID: "a", Node: namedNode("slow")}}}
 		ctx := context.Background()
@@ -140,6 +147,8 @@ func TestDuplicateDriveExecutesNodeOnce(t *testing.T) {
 			})
 		}
 		// Losers return immediately while the winner is still inside Run.
+		//
+		// winner 仍在 Run 内部时，loser 会立即返回。
 		deadline := time.After(2 * time.Second)
 		for losers := 0; losers < drivers-1; {
 			select {
@@ -176,7 +185,10 @@ func TestExpiredNodeLeaseIsReclaimedAndStaleOwnerFenced(t *testing.T) {
 		if ready, err := infra[1].ReadyNodes(ctx); err != nil || len(ready) != 0 {
 			t.Fatal("live lease listed as drivable", ready, err)
 		}
-		time.Sleep(80 * time.Millisecond) // the owner stopped renewing (crashed)
+		// The owner stopped renewing, as if it crashed.
+		//
+		// owner 停止续租，等同于已经崩溃。
+		time.Sleep(80 * time.Millisecond)
 		if _, err := infra[0].RenewNode(ctx, stale.Lease, time.Minute); !errors.Is(err, lease.ErrConflict) {
 			t.Fatal("expired lease renewed", err)
 		}
@@ -194,12 +206,12 @@ func TestExpiredNodeLeaseIsReclaimedAndStaleOwnerFenced(t *testing.T) {
 		if err := infra[0].ReleaseNode(ctx, stale.Lease); !errors.Is(err, lease.ErrConflict) {
 			t.Fatal("stale owner released the new lease", err)
 		}
-		commit := dflow.NodeCommit{NodeID: "a", ExpectedVersion: current.State.Version, State: dflow.NodeState{Status: dflow.Succeeded, Output: "new"}}
+		commit := dflow.NodeCommit{NodeID: "a", ExpectedVersion: current.State.Version, State: dflow.NodeState{Status: dflow.Succeeded, Output: map[string]any{"value": "new"}}}
 		if _, err := infra[1].Commit(ctx, current.Lease, commit); err != nil {
 			t.Fatal(err)
 		}
 		node, err := infra[0].GetNode(ctx, "a")
-		if err != nil || node.Status != dflow.Succeeded || node.Output != "new" {
+		if err != nil || node.Status != dflow.Succeeded || node.Output["value"] != "new" {
 			t.Fatal(node, err)
 		}
 	})
@@ -217,6 +229,8 @@ func TestCommitRejectsExpiredOwnLease(t *testing.T) {
 		}
 		time.Sleep(50 * time.Millisecond)
 		// Nobody reclaimed yet, but the stored expiry has passed: not owned anymore.
+		//
+		// 还没有人重新 claim，但存储中的过期时间已经过去：它已不再被持有。
 		commit := dflow.NodeCommit{NodeID: "a", ExpectedVersion: task.State.Version, State: dflow.NodeState{Status: dflow.Succeeded}}
 		if _, err := infra[1].Commit(ctx, task.Lease, commit); !errors.Is(err, lease.ErrConflict) {
 			t.Fatal("expired lease committed", err)
@@ -226,6 +240,9 @@ func TestCommitRejectsExpiredOwnLease(t *testing.T) {
 
 // lostRenewal makes every node lease renewal fail, as if another instance
 // fenced this owner while its node was still running.
+//
+// lostRenewal 让每次节点租约续租都失败，就像另一个实例在节点仍在运行时 fencing
+// 了当前 owner。
 type lostRenewal struct{ *memory.Infrastructure }
 
 func (s *lostRenewal) RenewNode(context.Context, lease.Token, time.Duration) (*lease.Token, error) {

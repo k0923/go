@@ -8,6 +8,10 @@ import (
 // Wakeup must have durably delivered its response first. A stale token or
 // undelivered response drives nothing. It never drives another suspension round.
 // Downstream Ready nodes are handled by the caller just as with Drive.
+//
+// Resume 针对指定的当前 suspension token 精确驱动一个节点。必须先由 Wakeup 持久
+// 投递响应。过期 token 或尚未投递的响应不会驱动任何内容。它绝不会驱动另一个
+// 挂起轮次。下游 Ready 节点仍由调用方像 Drive 一样处理。
 func (e *Engine) Resume(ctx context.Context, nodeID, token string) (Executed, error) {
 	if nodeID == "" || token == "" {
 		return Executed{}, ErrWaitNotFound
@@ -22,6 +26,13 @@ func (e *Engine) Resume(ctx context.Context, nodeID, token string) (Executed, er
 //
 // A duplicate or stale callback returns false; an unknown node/token returns
 // ErrWaitNotFound. Delivering a nil response is valid: pass a nil value.
+//
+// Wakeup 在不获取节点租约的情况下，原子持久化一个回调及其 wake 通知。token 由
+// 引擎生成，并随 Request 通知投递；它不是节点代码自行选择的名称。Wakeup 后节点
+// 会重新变为可驱动，因此调用方随后调用 Drive 来运行 Resume。
+//
+// 重复或过期回调返回 false；未知节点或 token 返回 ErrWaitNotFound。投递 nil 响应
+// 是有效的：传入 nil 值即可。
 func (e *Engine) Wakeup(ctx context.Context, nodeID, token string, response any) (bool, error) {
 	if nodeID == "" || token == "" {
 		return false, ErrWaitNotFound

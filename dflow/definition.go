@@ -23,6 +23,9 @@ type Edge struct {
 // Definition has exactly one root/start node and may have multiple sinks. All
 // nodes participate in the run. Version must change when application-provided
 // node implementations change.
+//
+// Definition 恰好有一个 root/start 节点，并且可以有多个 sink。所有节点都会
+// 参与执行。当应用提供的节点实现发生变化时，Version 必须随之变化。
 type Definition struct {
 	Version string     `json:"version,omitempty"`
 	Nodes   []NodeSpec `json:"nodes"`
@@ -30,6 +33,8 @@ type Definition struct {
 }
 
 // Graph is compiled, immutable and reusable across run-scoped infrastructures.
+//
+// Graph 是已编译、不可变的结构，可在多个 run 作用域的 Infrastructure 中复用。
 type Graph struct {
 	definition Definition
 	hash       string
@@ -39,7 +44,10 @@ type Graph struct {
 	outgoing   map[string][]Edge
 }
 
-// Compile validates topology, references and node configurations without running nodes.
+// Compile validates topology, references and node configurations without running
+// nodes.
+//
+// Compile 在不运行节点的情况下校验拓扑、引用和节点配置。
 func Compile(definition Definition) (*Graph, error) {
 	if definition.Version == "" {
 		return nil, fmt.Errorf("%w: immutable definition version required", ErrInvalidDefinition)
@@ -153,13 +161,18 @@ func Compile(definition Definition) (*Graph, error) {
 }
 
 // Manifest is the small immutable header needed to start or recover execution.
+//
+// Manifest 是启动或恢复执行所需的小型不可变头信息。
 type Manifest struct {
 	Hash  string `json:"hash"`
 	Start string `json:"start"`
 }
 
-// PublishedNode contains an executable node plus validated topology.
-// Incoming contains UNIQUE predecessor IDs, not the number of incoming ports.
+// PublishedNode contains an executable node plus validated topology. Incoming
+// contains UNIQUE predecessor IDs, not the number of incoming ports.
+//
+// PublishedNode 包含可执行节点和已校验的拓扑。Incoming 保存唯一的前驱节点
+// ID，而不是入端口数量。
 type PublishedNode struct {
 	Spec     NodeSpec `json:"spec"`
 	Incoming []string `json:"incoming"`
@@ -169,11 +182,18 @@ type PublishedNode struct {
 // DefinitionProvider binds to ONE immutable, already validated publication.
 // Implementations load individual database records, not the whole definition.
 // Return independent metadata copies with immutable nodes and parameters.
-// Manifest.Hash is an application-supplied version; change it when definitions change.
+// Manifest.Hash is an application-supplied version; change it when definitions
+// change.
+//
+// DefinitionProvider 绑定到一个不可变且已经校验过的发布版本。实现应加载单条
+// 数据库记录，而不是整份定义。返回的元数据副本应彼此独立，并包含不可变节点
+// 和参数。Manifest.Hash 是应用提供的版本；定义变化时应同步更新它。
 type DefinitionProvider interface {
 	Manifest(context.Context) (Manifest, error)
 	LoadNode(context.Context, string) (*PublishedNode, error)
 	// Incoming loads only a target's predecessor index, not its config.
+	//
+	// Incoming 只加载目标节点的前驱索引，而不加载它的配置。
 	Incoming(context.Context, string) ([]string, error)
 }
 
@@ -230,6 +250,8 @@ func (g *Graph) LoadNode(ctx context.Context, id string) (*PublishedNode, error)
 
 // Publication exports executable records. The application decides how to store
 // configuration and rebuild nodes and dependencies.
+//
+// Publication 导出可执行记录。应用自行决定如何存储配置，以及如何重建节点和依赖。
 func (g *Graph) Publication() (Manifest, []PublishedNode, error) {
 	m, err := g.Manifest(context.Background())
 	if err != nil {

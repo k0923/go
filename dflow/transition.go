@@ -7,8 +7,11 @@ import (
 )
 
 // ApplyArrival validates and folds one predecessor notification. Storage adapters
-// call this INSIDE their transaction/lock and persist the returned state atomically.
-// The ready latch never resets on duplicate delivery.
+// call this INSIDE their transaction/lock and persist the returned state
+// atomically. The ready latch never resets on duplicate delivery.
+//
+// ApplyArrival 校验并合并一个前驱通知。存储适配器会在自己的事务或锁内部调用它，
+// 并原子持久化返回的状态。重复投递时 ready latch 永远不会重置。
 func ApplyArrival(target NodeState, source string, arrival Arrival) (NodeState, error) {
 	expected := map[string]bool{}
 	for _, id := range arrival.Incoming {
@@ -54,6 +57,8 @@ func ApplyArrival(target NodeState, source string, arrival Arrival) (NodeState, 
 }
 
 // ValidateCommit protects the storage boundary against stale/terminal writers.
+//
+// ValidateCommit 保护存储边界，防止过期 writer 或 terminal writer 写入。
 func ValidateCommit(current NodeState, commit NodeCommit, generation int64) error {
 	if current.Status != Running || current.Version != commit.ExpectedVersion || current.Generation != generation {
 		return ErrConflict

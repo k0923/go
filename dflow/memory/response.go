@@ -9,6 +9,9 @@ import (
 
 // Outbox is the delivery capability provided by the memory implementation.
 // Consumers deduplicate by their business run scope plus NodeID and Token.
+//
+// Outbox 是 memory 实现提供的投递能力。消费者按业务 run 作用域加 NodeID 和
+// Token 去重。
 type Outbox interface {
 	Pending(context.Context) ([]dflow.Notification, error)
 	Ack(context.Context, int64) error

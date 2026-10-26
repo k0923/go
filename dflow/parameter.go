@@ -15,12 +15,17 @@ import (
 const InputSource = "$input"
 
 // ValueResolver reads a run input or an ancestor's output by path.
+//
+// ValueResolver 按路径读取执行输入或祖先节点的输出。
 type ValueResolver interface {
 	Resolve(context.Context, ...string) (any, error)
 }
 
 // Parameter declares every dependency before compilation and resolves a value
 // during execution. Implementations and returned values must be immutable.
+//
+// Parameter 在编译前声明所有依赖，并在执行期间解析出一个值。实现及其返回值
+// 都必须是不可变的。
 type Parameter interface {
 	References() ([][]string, error)
 	Resolve(context.Context, ValueResolver) (any, error)
@@ -33,6 +38,8 @@ type ReferenceParameter struct{ Path []string }
 type TemplateParameter struct {
 	Text string
 	// JSON inserts JSON literals; false inserts plain text.
+	//
+	// JSON 为 true 时插入 JSON 字面量；为 false 时插入纯文本。
 	JSON bool
 }
 
@@ -163,6 +170,9 @@ func (p Parameters) resolveWithInput(infra Infrastructure, ctx context.Context, 
 
 // InputValue traverses string-keyed maps, slices/arrays and exported struct
 // fields by Go field name. It preserves Go types and returns a read-only value.
+//
+// InputValue 按 Go 字段名遍历 string key 的 map、slice/array 以及导出的
+// struct 字段。它保留 Go 类型，并返回一个只读值。
 func InputValue(input any, path ...string) (any, error) {
 	value := reflect.ValueOf(input)
 	for _, part := range path {

@@ -89,6 +89,8 @@ func TestSQLiteConcurrentResolveAndFencing(t *testing.T) {
 		}
 	}
 	// An old snapshot saved after callback arrival must not overwrite it.
+	//
+	// 回调到达后保存的旧快照绝不能覆盖该回调。
 	if _, err := right.Commit(ctx, task.Lease, commit); !errors.Is(err, dflow.ErrConflict) {
 		t.Fatal(err)
 	}
@@ -172,6 +174,9 @@ BEGIN SELECT RAISE(ABORT, 'injected wake failure'); END`); err != nil {
 
 // Exit immediately after the suspension transaction commits, before Engine.Save
 // can return and before lease cleanup. Simulates uncertain commit on process loss.
+//
+// 在 suspension 事务提交后立即退出，早于 Engine.Save 返回和租约清理。这样模拟进程
+// 丢失时 commit 结果不确定的情况。
 type crashAfterSuspend struct{ *sqlite.Infrastructure }
 
 func (s *crashAfterSuspend) Commit(ctx context.Context, token lease.Token, commit dflow.NodeCommit) ([]string, error) {
@@ -205,12 +210,14 @@ func TestSQLiteCrashRecovery(t *testing.T) {
 			},
 			resume: func(context.Context, map[string]any, dflow.ResumeInput) (dflow.Result, error) {
 				// Simulate loss during Resume after its running state was committed.
+				//
+				// 模拟 Resume 期间 running 状态已提交后的进程丢失。
 				os.Exit(24)
 				return dflow.Result{}, nil
 			},
 		})
 		register(t, registry, "before", func(context.Context, map[string]any) (dflow.Result, error) {
-			return dflow.Result{Output: "upstream-saved"}, nil
+			return dflow.Result{Output: map[string]any{"value": "upstream-saved"}}, nil
 		})
 		var infra dflow.Infrastructure = store
 		if os.Getenv("DFLOW_CRASH_STAGE") == "suspend" {
@@ -238,7 +245,7 @@ func TestSQLiteCrashRecovery(t *testing.T) {
 		t.Fatal(err)
 	}
 	state, err := store.Load(ctx)
-	if err != nil || state.Nodes["wait"].Status != dflow.Suspended || state.Nodes["before"].Output != "upstream-saved" {
+	if err != nil || state.Nodes["wait"].Status != dflow.Suspended || state.Nodes["before"].Output["value"] != "upstream-saved" {
 		t.Fatal(state, err)
 	}
 	token := state.Nodes["wait"].Suspension.Token
@@ -270,7 +277,7 @@ func TestSQLiteCrashRecovery(t *testing.T) {
 			if input["original"] != "input" || resume.Suspension.(*dflow.ValueSuspension).Data != "saved" || resume.Token != token {
 				return dflow.Result{}, errors.New("missing continuation/input")
 			}
-			return dflow.Result{Output: resume.Response}, nil
+			return dflow.Result{Output: map[string]any{"value": resume.Response}}, nil
 		},
 	})
 	register(t, registry, "before", func(context.Context, map[string]any) (dflow.Result, error) {
@@ -278,13 +285,16 @@ func TestSQLiteCrashRecovery(t *testing.T) {
 	})
 	e := engine(t, crashDefinition(), registry, store, dflow.Options{})
 	state = driveAfterLeaseExpires(t, e)
-	if state.Nodes["end"].Status != dflow.Succeeded || state.Nodes["wait"].Output != "response" {
+	if state.Nodes["end"].Status != dflow.Succeeded || state.Nodes["wait"].Output["value"] != "response" {
 		t.Fatal(state)
 	}
 }
 
 // driveAfterLeaseExpires polls until the node lease left by a crashed attempt
 // expires: until then the node is owned by a live lease and drives nothing.
+//
+// driveAfterLeaseExpires 轮询直到崩溃 attempt 留下的节点租约过期：在那之前节点由
+// 有效租约持有，因此不会驱动任何内容。
 func driveAfterLeaseExpires(t *testing.T, e *observedEngine) *dflow.State {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)

@@ -39,7 +39,7 @@ func TestPersistedPublicationLazyResume(t *testing.T) {
 			return dflow.Result{Suspend: &dflow.ValueSuspension{Kind: "external", Data: "saved"}}, nil
 		},
 		resume: func(_ context.Context, _ map[string]any, input dflow.ResumeInput) (dflow.Result, error) {
-			return dflow.Result{Output: input.Response}, nil
+			return dflow.Result{Output: map[string]any{"value": input.Response}}, nil
 		},
 	})
 	def := waitDefinition()
@@ -73,6 +73,8 @@ func TestPersistedPublicationLazyResume(t *testing.T) {
 		t.Fatal(err)
 	}
 	// New process needs ONLY the publication ID, no original graph or definition.
+	//
+	// 新进程只需要 publication ID，不需要原始 graph 或 definition。
 	store, err = sqlite.Open(ctx, path, "run", fixtureCodec{})
 	if err != nil {
 		t.Fatal(err)
@@ -220,7 +222,7 @@ func TestArrivalDedupAndInactiveJoin(t *testing.T) {
 func TestParallelPortsFromOnePredecessor(t *testing.T) {
 	registry := testRegistry{}
 	register(t, registry, "select", func(context.Context, map[string]any) (dflow.Result, error) {
-		return dflow.Result{Output: "ok", Ports: []string{"true"}}, nil
+		return dflow.Result{Output: map[string]any{"value": "ok"}, Ports: []string{"true"}}, nil
 	})
 	def := dflow.Definition{
 		Nodes: []dflow.NodeSpec{{ID: "a", Node: namedNode("select")}, {ID: "b", Node: &dflow.EndNode{}}},

@@ -12,12 +12,14 @@ graph, err := dflow.Compile(dflow.Definition{
     Nodes: []dflow.NodeSpec{
         {ID: "calculate", Node: dflow.NodeFunc(
             func(ctx context.Context, input map[string]any) (dflow.Result, error) {
-                return dflow.Result{Output: input["price"].(int) * 2}, nil
+                return dflow.Result{Output: map[string]any{
+                    "total": input["price"].(int) * 2,
+                }}, nil
             }),
             Inputs: dflow.Parameters{"price": dflow.Input("price")},
         },
         {ID: "out", Node: &dflow.EndNode{},
-            Inputs: dflow.Parameters{"total": dflow.Ref("calculate")}},
+            Inputs: dflow.Parameters{"total": dflow.Ref("calculate", "total")}},
     },
     Edges: []dflow.Edge{{SourceNodeID: "calculate", TargetNodeID: "out"}},
 })
@@ -52,7 +54,7 @@ type ResumableNode interface {
 }
 ```
 
-`Result.Output` 支持存储实现接受的 Go 值，不做 JSON 规范化。`Ports == nil` 激活所有出边；非 nil 空数组不激活出边；非空数组选择对应端口。未激活节点标记为 skipped，继续传播依赖到达；对 skipped 节点输出的引用返回 `ErrMissingValue`。同一前驱的多条端口边只计一次依赖到达。
+`Result.Output` 是 `map[string]any`，与节点输入同为对象形态；map 内字段值支持存储实现接受的 Go 值，不做 JSON 规范化。`Ports == nil` 激活所有出边；非 nil 空数组不激活出边；非空数组选择对应端口。未激活节点标记为 skipped，继续传播依赖到达；对 skipped 节点输出的引用返回 `ErrMissingValue`。同一前驱的多条端口边只计一次依赖到达。
 
 默认实现：
 
@@ -61,8 +63,8 @@ type ResumableNode interface {
 | `StartNode` | 无显式 Inputs 时返回完整工作流输入 |
 | `EndNode` / `PassthroughNode` | 返回节点输入 |
 | `ConditionNode` | 根据布尔输入 condition 选择 true/false 端口 |
-| `JSONParseNode` | 解析 json 字符串输入 |
-| `CodeNode` | 通过 `NewCodeNode(CodeConfig)` 编译 JS，每次执行创建独立 VM |
+| `JSONParseNode` | 解析顶层为对象的 json 字符串输入 |
+| `CodeNode` | 通过 `NewCodeNode(CodeConfig)` 编译 JS，每次执行创建独立 VM，脚本必须返回对象 |
 | `HTTPNode` | 请求 HTTP 服务，返回 body、headers、statusCode |
 
 JS 定义 `main({params})`（也支持 `run(params)`）；没有文件、网络或事件循环。脚本执行和输出转换均受超时约束，不支持 pending Promise。HTTP 默认 GET、30 秒、8 MiB 响应上限；重试要求幂等方法、Idempotency-Key 或显式 RetryNonIdempotent。HTTP 非 2xx 仍返回响应供业务判断；默认使用 `http.DefaultClient`，可直接设置 Client。

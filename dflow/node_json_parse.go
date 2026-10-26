@@ -13,9 +13,12 @@ func (*JSONParseNode) Run(_ context.Context, input map[string]any) (Result, erro
 	if !ok {
 		return Result{}, fmt.Errorf("json input must be a string")
 	}
-	var output any
+	var output map[string]any
 	if err := json.Unmarshal([]byte(text), &output); err != nil {
 		return Result{}, err
+	}
+	if output == nil {
+		return Result{}, fmt.Errorf("json input must be an object")
 	}
 	return Result{Output: output}, nil
 }

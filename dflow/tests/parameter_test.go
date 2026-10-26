@@ -32,10 +32,10 @@ func TestCustomParameterAndConcreteGoValues(t *testing.T) {
 		Version: "typed-v1",
 		Nodes: []dflow.NodeSpec{
 			{ID: "source", Node: dflow.NodeFunc(func(context.Context, map[string]any) (dflow.Result, error) {
-				return dflow.Result{Output: value}, nil
+				return dflow.Result{Output: map[string]any{"order": value}}, nil
 			})},
 			{ID: "out", Node: &dflow.EndNode{}, Inputs: dflow.Parameters{
-				"amount": doubledParameter{Path: []string{"source", "Amount"}},
+				"amount": doubledParameter{Path: []string{"source", "order", "Amount"}},
 				"bytes":  dflow.Constant([]byte{1, 2}),
 				"cycle":  dflow.Constant(cyclic),
 			}},
@@ -54,7 +54,7 @@ func TestCustomParameterAndConcreteGoValues(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	output := state.Nodes["out"].Output.(map[string]any)
+	output := state.Nodes["out"].Output
 	if output["amount"] != int64(42) || output["bytes"].([]byte)[0] != 1 {
 		t.Fatal(output)
 	}
@@ -65,8 +65,8 @@ func TestCustomParameterAndConcreteGoValues(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	saved := snapshot.Nodes["out"].Output.(map[string]any)
-	if snapshot.Nodes["source"].Output.(*order).Amount != 21 || saved["bytes"].([]byte)[0] != 1 {
+	saved := snapshot.Nodes["out"].Output
+	if snapshot.Nodes["source"].Output["order"].(*order).Amount != 21 || saved["bytes"].([]byte)[0] != 1 {
 		t.Fatal("typed snapshot aliases caller values")
 	}
 	cycle := saved["cycle"].(map[string]any)
@@ -112,7 +112,7 @@ func TestImmutableParameterRenderingAndInputPaths(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	output := state.Nodes["out"].Output.(map[string]any)
+	output := state.Nodes["out"].Output
 	if output["text"] != "hello {{unknown.secret}}" || output["json"] != `{"name": "{{unknown.secret}}"}` {
 		t.Fatal("rendered user content was interpreted twice", output)
 	}
