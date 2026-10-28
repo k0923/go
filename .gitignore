@@ -14,3 +14,5 @@ reviews/
 *.out
 .trae/
 inner_docs/
+.archify/
+*.ua
