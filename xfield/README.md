@@ -30,7 +30,7 @@ clean, err := xfield.ValidateModel(map[string]any{
 ```go
 type Field[P any] interface {
 	Type() string
-	Parse(data any, params P) (any, error)
+	Parse(params P, data any) (any, error)
 }
 
 type Schema[P any] map[string]Field[P]
@@ -97,12 +97,12 @@ type ResourceField struct { xfield.Meta }
 
 func (*ResourceField) Type() string { return "resource" }
 
-func (*ResourceField) Parse(data any, params Params) (any, error) {
+func (*ResourceField) Parse(params Params, data any) (any, error) {
 	// 检查、清洗并返回内部值，不修改输入。
 	return data, nil
 }
 
-func (*ResourceField) Present(data any, params Params) any {
+func (*ResourceField) Present(params Params, data any) any {
 	// 例如将资源 ID 转换为访问 URL。
 	return data
 }

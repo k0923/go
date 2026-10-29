@@ -16,3 +16,5 @@ reviews/
 inner_docs/
 .archify/
 *.ua
+tflow/
+taskpool/

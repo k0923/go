@@ -7,6 +7,14 @@ type ArrayField[P any] struct {
 	MaxItems *int     `json:"maxItems,omitempty"`
 }
 
+var (
+	_ Field[any]         = (*ArrayField[any])(nil)
+	_ MetaProvider       = (*ArrayField[any])(nil)
+	_ ArrayProvider[any] = (*ArrayField[any])(nil)
+	_ SchemaValidator    = (*ArrayField[any])(nil)
+	_ Presenter[any]     = (*ArrayField[any])(nil)
+)
+
 func (*ArrayField[P]) Type() string          { return "array" }
 func (f *ArrayField[P]) ItemField() Field[P] { return f.Items }
 
@@ -17,7 +25,7 @@ func (f *ArrayField[P]) ValidateSchema() error {
 	return validateIntBounds(f.MinItems, f.MaxItems)
 }
 
-func (f *ArrayField[P]) Parse(data any, params P) (any, error) {
+func (f *ArrayField[P]) Parse(params P, data any) (any, error) {
 	if err := ValidateField(f); err != nil {
 		return nil, err
 	}
@@ -36,7 +44,7 @@ func (f *ArrayField[P]) Parse(data any, params P) (any, error) {
 	}
 	out := make([]any, len(arr))
 	for i, value := range arr {
-		parsed, err := f.Items.Parse(value, params)
+		parsed, err := f.Items.Parse(params, value)
 		if err != nil {
 			return nil, wrapPathError(joinIndexPath("", i), err)
 		}
@@ -45,7 +53,7 @@ func (f *ArrayField[P]) Parse(data any, params P) (any, error) {
 	return out, nil
 }
 
-func (f *ArrayField[P]) Present(data any, params P) any {
+func (f *ArrayField[P]) Present(params P, data any) any {
 	arr, ok := asAnySlice(data)
 	if !ok || isNil(f.Items) {
 		return data

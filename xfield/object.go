@@ -5,10 +5,17 @@ type ObjectField[P any] struct {
 	Properties Schema[P] `json:"properties,omitempty"`
 }
 
+var (
+	_ Field[any]          = (*ObjectField[any])(nil)
+	_ MetaProvider        = (*ObjectField[any])(nil)
+	_ ObjectProvider[any] = (*ObjectField[any])(nil)
+	_ Presenter[any]      = (*ObjectField[any])(nil)
+)
+
 func (*ObjectField[P]) Type() string              { return "object" }
 func (f *ObjectField[P]) ObjectFields() Schema[P] { return f.Properties }
 
-func (f *ObjectField[P]) Parse(data any, params P) (any, error) {
+func (f *ObjectField[P]) Parse(params P, data any) (any, error) {
 	if err := ValidateField(f); err != nil {
 		return nil, err
 	}
@@ -22,7 +29,7 @@ func (f *ObjectField[P]) Parse(data any, params P) (any, error) {
 	return parseProperties(object, f.Properties, false, params)
 }
 
-func (f *ObjectField[P]) Present(data any, params P) any {
+func (f *ObjectField[P]) Present(params P, data any) any {
 	object, ok := asStringMap(data)
 	if !ok {
 		return data

@@ -93,7 +93,7 @@ func parseProperties[P any](data map[string]any, model Schema[P], partial bool, 
 			}
 			continue
 		}
-		parsed, err := field.Parse(value, params)
+		parsed, err := field.Parse(params, value)
 		if err != nil {
 			return nil, wrapPathError(key, err)
 		}

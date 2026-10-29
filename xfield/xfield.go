@@ -7,7 +7,7 @@ package xfield
 // Parse must not modify its input. A nil value represents clearing a field.
 type Field[P any] interface {
 	Type() string
-	Parse(data any, params P) (any, error)
+	Parse(params P, data any) (any, error)
 }
 
 // Schema maps object property names to field declarations.
@@ -52,7 +52,7 @@ type SchemaValidator interface {
 // Presenter optionally converts stored values into application-facing values.
 // params uses the same application-defined type as Field.Parse.
 type Presenter[P any] interface {
-	Present(data any, params P) any
+	Present(params P, data any) any
 }
 
 func RequiredOf[P any](field Field[P]) bool {

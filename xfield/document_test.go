@@ -211,7 +211,7 @@ func TestCompileDocumentRejectsInvalidDeclarations(t *testing.T) {
 	if err := xfield.ValidateSchema(xfield.Schema[struct{}]{"refField": refField}); !errors.Is(err, xfield.ErrInvalidSchema) {
 		t.Fatalf("uncompiled schema: %v", err)
 	}
-	if _, err := refField.Parse(nil, struct{}{}); !errors.Is(err, xfield.ErrInvalidSchema) {
+	if _, err := refField.Parse(struct{}{}, nil); !errors.Is(err, xfield.ErrInvalidSchema) {
 		t.Fatalf("uncompiled reference parse: %v", err)
 	}
 }
@@ -222,8 +222,8 @@ type customReferenceObject struct {
 }
 
 func (*customReferenceObject) Type() string { return "custom_reference_object" }
-func (f *customReferenceObject) Parse(value any, params *dependencies) (any, error) {
-	parsed, err := f.ObjectField.Parse(value, params)
+func (f *customReferenceObject) Parse(params *dependencies, value any) (any, error) {
+	parsed, err := f.ObjectField.Parse(params, value)
 	if err == nil && parsed != nil {
 		parsed.(map[string]any)["marker"] = f.Marker
 	}

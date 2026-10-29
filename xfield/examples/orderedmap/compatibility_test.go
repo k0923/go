@@ -187,7 +187,7 @@ func TestXFieldRuntimeMapCompatibility(t *testing.T) {
 			"content": &xfield.StringField[Params]{Meta: xfield.Meta{Required: true}},
 		},
 	}
-	if _, err := field.Parse(m, Params{}); err == nil {
+	if _, err := field.Parse(Params{}, m); err == nil {
 		t.Fatal("ordered map unexpectedly accepted by xfield's native-map parser")
 	}
 	// OrderedMap is a struct containing a map and list, not a native Go map.
@@ -196,7 +196,7 @@ func TestXFieldRuntimeMapCompatibility(t *testing.T) {
 	for pair := m.Oldest(); pair != nil; pair = pair.Next() {
 		native[pair.Key] = pair.Value
 	}
-	if _, err := field.Parse(native, Params{}); err != nil {
+	if _, err := field.Parse(Params{}, native); err != nil {
 		t.Fatal(err)
 	}
 }

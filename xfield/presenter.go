@@ -22,7 +22,7 @@ func PresentModel[P any](data map[string]any, model Schema[P], params P) map[str
 
 func presentFieldValue[P any](field Field[P], data any, params P) any {
 	if presenter, ok := field.(Presenter[P]); ok && !isNil(field) {
-		return presenter.Present(data, params)
+		return presenter.Present(params, data)
 	}
 	return data
 }

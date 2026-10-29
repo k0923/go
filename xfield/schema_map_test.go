@@ -18,11 +18,11 @@ type orderedField struct {
 }
 
 func (*orderedField) Type() string { return "ordered_test" }
-func (f *orderedField) Parse(value any, params *executionOrder) (any, error) {
+func (f *orderedField) Parse(params *executionOrder, value any) (any, error) {
 	params.parsed = append(params.parsed, f.name)
 	return value, nil
 }
-func (f *orderedField) Present(value any, params *executionOrder) any {
+func (f *orderedField) Present(params *executionOrder, value any) any {
 	params.presented = append(params.presented, f.name)
 	return value
 }

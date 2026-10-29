@@ -24,10 +24,17 @@ type RefField[P any] struct {
 	Ref string
 }
 
+var (
+	_ Field[any]        = (*RefField[any])(nil)
+	_ MetaProvider      = (*RefField[any])(nil)
+	_ ReferenceProvider = (*RefField[any])(nil)
+	_ SchemaValidator   = (*RefField[any])(nil)
+)
+
 func (*RefField[P]) Type() string            { return "ref" }
 func (f *RefField[P]) ReferenceName() string { return f.Ref }
 func (f *RefField[P]) ValidateSchema() error { return f.unresolved() }
-func (f *RefField[P]) Parse(_ any, _ P) (any, error) {
+func (f *RefField[P]) Parse(_ P, _ any) (any, error) {
 	return nil, f.unresolved()
 }
 
@@ -216,12 +223,19 @@ type boundReference[P any] struct {
 	height int
 }
 
+var (
+	_ Field[any]      = (*boundReference[any])(nil)
+	_ MetaProvider    = (*boundReference[any])(nil)
+	_ Presenter[any]  = (*boundReference[any])(nil)
+	_ SchemaValidator = (*boundReference[any])(nil)
+)
+
 func (f *boundReference[P]) Type() string         { return f.target.Type() }
 func (f *boundReference[P]) referenceHeight() int { return f.height }
-func (f *boundReference[P]) Parse(value any, params P) (any, error) {
-	return f.target.Parse(value, params)
+func (f *boundReference[P]) Parse(params P, value any) (any, error) {
+	return f.target.Parse(params, value)
 }
-func (f *boundReference[P]) Present(value any, params P) any {
+func (f *boundReference[P]) Present(params P, value any) any {
 	return presentFieldValue(f.target, value, params)
 }
 func (f *boundReference[P]) ValidateSchema() error {
@@ -240,6 +254,20 @@ type boundArrayReference[P any] struct {
 	*boundReference[P]
 	ArrayProvider[P]
 }
+
+var (
+	_ Field[any]          = (*boundObjectReference[any])(nil)
+	_ MetaProvider        = (*boundObjectReference[any])(nil)
+	_ ObjectProvider[any] = (*boundObjectReference[any])(nil)
+	_ Presenter[any]      = (*boundObjectReference[any])(nil)
+	_ SchemaValidator     = (*boundObjectReference[any])(nil)
+
+	_ Field[any]         = (*boundArrayReference[any])(nil)
+	_ MetaProvider       = (*boundArrayReference[any])(nil)
+	_ ArrayProvider[any] = (*boundArrayReference[any])(nil)
+	_ Presenter[any]     = (*boundArrayReference[any])(nil)
+	_ SchemaValidator    = (*boundArrayReference[any])(nil)
+)
 
 func bindReference[P any](meta Meta, target Field[P], height int) Field[P] {
 	ref := &boundReference[P]{Meta: meta, target: target, height: height}

@@ -24,6 +24,12 @@ type StringField[P any] struct {
 	Config    StringFieldConfig `json:"config,omitempty"`
 }
 
+var (
+	_ Field[any]      = (*StringField[any])(nil)
+	_ MetaProvider    = (*StringField[any])(nil)
+	_ SchemaValidator = (*StringField[any])(nil)
+)
+
 func (*StringField[P]) Type() string { return "string" }
 
 func (f *StringField[P]) ValidateSchema() error {
@@ -38,7 +44,7 @@ func (f *StringField[P]) ValidateSchema() error {
 	return nil
 }
 
-func (f *StringField[P]) Parse(data any, _ P) (any, error) {
+func (f *StringField[P]) Parse(_ P, data any) (any, error) {
 	if err := f.ValidateSchema(); err != nil {
 		return nil, err
 	}

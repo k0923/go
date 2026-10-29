@@ -19,7 +19,7 @@ type resourceField struct {
 }
 
 func (*resourceField) Type() string { return "resource" }
-func (*resourceField) Parse(value any, deps *dependencies) (any, error) {
+func (*resourceField) Parse(deps *dependencies, value any) (any, error) {
 	if value == nil {
 		return nil, nil
 	}
@@ -38,7 +38,7 @@ func (*resourceField) Parse(value any, deps *dependencies) (any, error) {
 	}
 	return "stored:" + text, nil
 }
-func (*resourceField) Present(value any, deps *dependencies) any {
+func (*resourceField) Present(deps *dependencies, value any) any {
 	if value == nil {
 		return nil
 	}
@@ -178,14 +178,14 @@ func TestNestedPathPreservesExternalError(t *testing.T) {
 
 func TestLargeNumberPrecision(t *testing.T) {
 	field := &xfield.NumberField[struct{}]{Enum: []any{json.Number("9007199254740993")}}
-	if _, err := field.Parse(uint64(9007199254740993), struct{}{}); err != nil {
+	if _, err := field.Parse(struct{}{}, uint64(9007199254740993)); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := field.Parse(uint64(9007199254740992), struct{}{}); !errors.Is(err, xfield.ErrInvalidValue) {
+	if _, err := field.Parse(struct{}{}, uint64(9007199254740992)); !errors.Is(err, xfield.ErrInvalidValue) {
 		t.Fatalf("rounded integer accepted: %v", err)
 	}
 	for _, invalid := range []json.Number{"1e999999999", "NaN", "true", "1 2"} {
-		if _, err := (&xfield.NumberField[struct{}]{}).Parse(invalid, struct{}{}); err == nil {
+		if _, err := (&xfield.NumberField[struct{}]{}).Parse(struct{}{}, invalid); err == nil {
 			t.Fatalf("invalid number %q accepted", invalid)
 		}
 	}
@@ -207,7 +207,7 @@ func TestNamedContainers(t *testing.T) {
 	field := &xfield.ObjectField[struct{}]{Properties: xfield.Schema[struct{}]{
 		"items": &xfield.ArrayField[struct{}]{Items: &xfield.NumberField[struct{}]{}},
 	}}
-	got, err := field.Parse(namedMap{"items": namedSlice{int8(1), uint16(2)}, "extra": true}, struct{}{})
+	got, err := field.Parse(struct{}{}, namedMap{"items": namedSlice{int8(1), uint16(2)}, "extra": true})
 	want := map[string]any{"items": []any{int8(1), uint16(2)}}
 	if err != nil || !reflect.DeepEqual(got, want) {
 		t.Fatalf("named containers: %v, %v", got, err)

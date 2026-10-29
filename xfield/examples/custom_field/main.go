@@ -22,7 +22,7 @@ type ResourceField struct {
 
 func (*ResourceField) Type() string { return "resource" }
 
-func (*ResourceField) Parse(data any, params Params) (any, error) {
+func (*ResourceField) Parse(params Params, data any) (any, error) {
 	if data == nil {
 		return nil, nil
 	}
@@ -40,7 +40,7 @@ func (*ResourceField) Parse(data any, params Params) (any, error) {
 	return value, nil
 }
 
-func (*ResourceField) Present(data any, params Params) any {
+func (*ResourceField) Present(params Params, data any) any {
 	value, ok := data.(string)
 	if !ok || params.URL == nil {
 		return data
@@ -53,11 +53,11 @@ type StringField struct {
 	xfield.StringField[Params]
 }
 
-func (f *StringField) Parse(data any, params Params) (any, error) {
+func (f *StringField) Parse(params Params, data any) (any, error) {
 	if value, ok := data.(string); ok {
 		data = strings.TrimSpace(value)
 	}
-	return f.StringField.Parse(data, params)
+	return f.StringField.Parse(params, data)
 }
 
 func main() {
@@ -94,7 +94,7 @@ func run() error {
 
 	minLength := 1
 	field := &StringField{StringField: xfield.StringField[Params]{MinLength: &minLength}}
-	value, err := field.Parse(" Alice ", Params{})
+	value, err := field.Parse(Params{}, " Alice ")
 	if err != nil {
 		return err
 	}

@@ -15,6 +15,12 @@ type NumberField[P any] struct {
 	Enum []any    `json:"enum,omitempty"`
 }
 
+var (
+	_ Field[any]      = (*NumberField[any])(nil)
+	_ MetaProvider    = (*NumberField[any])(nil)
+	_ SchemaValidator = (*NumberField[any])(nil)
+)
+
 func (*NumberField[P]) Type() string { return "number" }
 
 func (f *NumberField[P]) ValidateSchema() error {
@@ -34,7 +40,7 @@ func (f *NumberField[P]) ValidateSchema() error {
 	return nil
 }
 
-func (f *NumberField[P]) Parse(data any, _ P) (any, error) {
+func (f *NumberField[P]) Parse(_ P, data any) (any, error) {
 	if err := f.ValidateSchema(); err != nil {
 		return nil, err
 	}
