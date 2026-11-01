@@ -20,11 +20,11 @@ func (a interfaceTestAction) Run(ctx context.Context, input int) (pollOutput, er
 	return pollOutput{Count: input + 5, Finished: true}, nil
 }
 
-func TestActionFn(t *testing.T) {
+func TestAsActionAdapter(t *testing.T) {
 	t.Run("forwards context input output and error", func(t *testing.T) {
 		cause := errors.New("action rejected")
 		ctx := context.WithValue(context.Background(), "trace", "step")
-		fn := ActionFn[int, int](func(received context.Context, input int) (int, error) {
+		fn := AsAction(func(received context.Context, input int) (int, error) {
 			if received != ctx || input != 3 || received.Value("trace") != "step" {
 				t.Fatal("context or input lost")
 			}
@@ -36,7 +36,7 @@ func TestActionFn(t *testing.T) {
 		}
 	})
 	t.Run("nil function returns invalid", func(t *testing.T) {
-		var fn ActionFn[int, int]
+		fn := AsAction[int, int](nil)
 		result, err := fn.Run(context.Background(), 3)
 		if result != 0 || !errors.Is(err, ErrInvalid) {
 			t.Fatalf("%d %v", result, err)
@@ -64,13 +64,13 @@ func TestInterfaceActionExecution(t *testing.T) {
 				case "Go":
 					return f.Go("step", action, input).Wait()
 				case "Loop":
-					return f.Loop("step", action, input, LoopOptions{Interval: 1, MaxAttempts: 2})
+					return f.Poll("step", action, input, PollOptions{Interval: 1, MaxAttempts: 2})
 				default:
 					return f.Run("step", action, input)
 				}
 			}))
 			for i := 0; i < 2; i++ {
-				result, err := engine.Drive(context.Background(), flow, 3)
+				result, err := engine.Start(context.Background(), flow, 3)
 				if err != nil || result.Status != Completed || result.Output.Count != 8 {
 					t.Fatalf("%+v %v", result, err)
 				}
@@ -84,7 +84,7 @@ func TestInterfaceActionExecution(t *testing.T) {
 		var calls atomic.Int32
 		action := interfaceTestAction{calls: &calls}
 		engine := testEngine(t, memory.New(), Options{})
-		result, err := engine.Drive(context.Background(), definition(FlowFunc[int, pollOutput](
+		result, err := engine.Start(context.Background(), definition(FlowFunc[int, pollOutput](
 			func(f *FlowContext, input int) (pollOutput, error) { return f.Run("step", action, input) },
 		)), 3)
 		if err != nil || result.Output.Count != 8 || calls.Load() != 1 {
@@ -97,7 +97,7 @@ func TestInvalidAction(t *testing.T) {
 	for _, mode := range []string{"Run", "Go", "Loop"} {
 		t.Run(mode, func(t *testing.T) {
 			for _, action := range []Action[int, pollOutput]{
-				nil, (*interfaceTestAction)(nil), ActionFn[int, pollOutput](nil),
+				nil, (*interfaceTestAction)(nil),
 				AsAction[int, pollOutput](nil), Pure[int, pollOutput](nil),
 			} {
 				store := memory.New()
@@ -109,12 +109,12 @@ func TestInvalidAction(t *testing.T) {
 					case "Go":
 						return f.Go("step", action, input).Wait()
 					case "Loop":
-						return f.Loop("step", action, input, LoopOptions{Interval: 1, MaxAttempts: 1})
+						return f.Poll("step", action, input, PollOptions{Interval: 1, MaxAttempts: 1})
 					default:
 						return f.Run("step", action, input)
 					}
 				}))
-				result, err := engine.Drive(context.Background(), flow, 3)
+				result, err := engine.Start(context.Background(), flow, 3)
 				// Misuse is deterministic, so replaying cannot fix it: terminal.
 				// 误用是确定性的，重放无法修复：终态。
 				if !errors.Is(err, ErrInvalid) || result.Status != Failed || started != 0 {

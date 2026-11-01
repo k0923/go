@@ -36,7 +36,7 @@ func waitAnyOutcome(f *FlowContext, key string, cases ...Case) (waitOutcome, err
 	return outcome, nil
 }
 
-func anyWaitFlow() Workflow[int, waitOutcome] {
+func anyWaitFlow() *flowFixture[int, waitOutcome] {
 	return definition(FlowFunc[int, waitOutcome](func(f *FlowContext, input int) (waitOutcome, error) {
 		return waitAnyOutcome(f, "race", OnSignal[string]("a", input), OnSignal[string]("b", input))
 	}))
@@ -61,7 +61,7 @@ func TestFlowContextWaitAny(t *testing.T) {
 			return f.Run("after", AsAction(func(context.Context, int) (string, error) { calls++; return winner.Key() + ":" + answer, nil }), input)
 		}))
 		for i := 0; i < 2; i++ {
-			result, err := e.Drive(ctx, flow, 1)
+			result, err := e.Start(ctx, flow, 1)
 			if err != nil || result.Status != Suspended || len(result.Pending) != 2 {
 				t.Fatalf("%+v %v", result, err)
 			}
@@ -96,7 +96,7 @@ func TestFlowContextWaitAny(t *testing.T) {
 			t.Fatalf("late callback: %t %v", ok, err)
 		}
 		for i := 0; i < 2; i++ {
-			result, err := testEngine(t, store, Options{}).Drive(ctx, flow, 1)
+			result, err := testEngine(t, store, Options{}).Start(ctx, flow, 1)
 			if err != nil || result.Status != Completed || result.Output != "race|b:answer" {
 				t.Fatalf("%+v %v", result, err)
 			}
@@ -109,7 +109,7 @@ func TestFlowContextWaitAny(t *testing.T) {
 		ctx := context.Background()
 		store := memory.New()
 		e := testEngine(t, store, Options{})
-		if _, err := e.Drive(ctx, anyWaitFlow(), 1); err != nil {
+		if _, err := e.Start(ctx, anyWaitFlow(), 1); err != nil {
 			t.Fatal(err)
 		}
 		start := make(chan struct{})
@@ -144,12 +144,12 @@ func TestFlowContextWaitAny(t *testing.T) {
 		if count != 1 {
 			t.Fatalf("winners=%d", count)
 		}
-		first, err := e.Drive(ctx, anyWaitFlow(), 1)
+		first, err := e.Start(ctx, anyWaitFlow(), 1)
 		if err != nil || first.Status != Completed || first.Output.Key != first.Output.Response {
 			t.Fatalf("%+v %v", first, err)
 		}
 		for i := 0; i < 5; i++ {
-			next, err := e.Drive(ctx, anyWaitFlow(), 1)
+			next, err := e.Start(ctx, anyWaitFlow(), 1)
 			if err != nil || next.Output.Key != first.Output.Key || next.Output.Response != first.Output.Response {
 				t.Fatal("winner changed")
 			}
@@ -159,11 +159,11 @@ func TestFlowContextWaitAny(t *testing.T) {
 		ctx := context.Background()
 		store := memory.New()
 		e := testEngine(t, store, Options{})
-		_, _ = e.Drive(ctx, anyWaitFlow(), 1)
+		_, _ = e.Start(ctx, anyWaitFlow(), 1)
 		if ok, err := e.FailWait(ctx, "race|a", 1, errors.New("provider unavailable")); !ok || err != nil {
 			t.Fatalf("%t %v", ok, err)
 		}
-		result, err := e.Drive(ctx, anyWaitFlow(), 1)
+		result, err := e.Start(ctx, anyWaitFlow(), 1)
 		if err != nil || result.Status != Suspended || len(result.Pending) != 1 || result.Pending[0].Key != "race|b" {
 			t.Fatalf("%+v %v", result, err)
 		}
@@ -174,7 +174,7 @@ func TestFlowContextWaitAny(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		result, err = e.Drive(ctx, anyWaitFlow(), 1)
+		result, err = e.Start(ctx, anyWaitFlow(), 1)
 		if err != nil || result.Output.Response != "healthy" || result.Output.Failures != 1 {
 			t.Fatalf("%+v %v", result, err)
 		}
@@ -193,14 +193,14 @@ func TestFlowContextWaitAny(t *testing.T) {
 			after++
 			return outcome, err
 		}))
-		_, _ = e.Drive(ctx, flow, 1)
+		_, _ = e.Start(ctx, flow, 1)
 		for _, key := range []string{"race|a", "race|b"} {
 			if _, err := e.FailWait(ctx, key, 1, errors.New("failed")); err != nil {
 				t.Fatal(err)
 			}
 		}
 		for i := 0; i < 2; i++ {
-			result, err := e.Drive(ctx, flow, 1)
+			result, err := e.Start(ctx, flow, 1)
 			if result.Status != Failed || !errors.Is(err, ErrWaitFailed) || after != 0 {
 				t.Fatalf("%+v %v after=%d", result, err, after)
 			}
@@ -219,14 +219,14 @@ func TestFlowContextWaitAny(t *testing.T) {
 			flow := definition(FlowFunc[int, waitOutcome](func(f *FlowContext, in int) (waitOutcome, error) {
 				return waitAnyOutcome(f, "race", OnSignal[string]("bad", bad), OnSignal[string]("good", in))
 			}))
-			result, err := e.Drive(context.Background(), flow, 1)
+			result, err := e.Start(context.Background(), flow, 1)
 			if err != nil || result.Status != Suspended || len(result.Pending) != 1 || result.Pending[0].Key != "race|good" {
 				t.Fatalf("%+v %v", result, err)
 			}
 			if _, err := e.ResolveSignal(context.Background(), "race|good", 1, "done"); err != nil {
 				t.Fatal(err)
 			}
-			result, err = e.Drive(context.Background(), flow, 1)
+			result, err = e.Start(context.Background(), flow, 1)
 			if err != nil || result.Output.Response != "done" || result.Output.Failures != 1 {
 				t.Fatalf("%+v %v", result, err)
 			}
@@ -243,7 +243,7 @@ func TestFlowContextWaitAny(t *testing.T) {
 				}
 				return waitAnyOutcome(f, "race", cases...)
 			}))
-			_, err := e.Drive(context.Background(), flow, 0)
+			_, err := e.Start(context.Background(), flow, 0)
 			if !errors.Is(err, ErrInvalid) {
 				t.Fatal(err)
 			}
@@ -256,16 +256,15 @@ func TestFlowContextWaitAny(t *testing.T) {
 	t.Run("nil reused and mistyped cases register nothing", func(t *testing.T) {
 		shared := OnSignal[string]("shared", 1)
 		for name, build := range map[string]func() []Case{
-			"nil":        func() []Case { return []Case{OnSignal[string]("a", 1), nil} },
-			"same call":  func() []Case { c := OnSignal[string]("a", 1); return []Case{c, c} },
-			"sleep kind": func() []Case { return []Case{OnKind[string](SleepKind, "a", 1)} },
+			"nil":       func() []Case { return []Case{OnSignal[string]("a", 1), nil} },
+			"same call": func() []Case { c := OnSignal[string]("a", 1); return []Case{c, c} },
 		} {
 			store := memory.New()
 			e := testEngine(t, store, Options{})
 			flow := definition(FlowFunc[int, waitOutcome](func(f *FlowContext, _ int) (waitOutcome, error) {
 				return waitAnyOutcome(f, "race", build()...)
 			}))
-			result, err := e.Drive(context.Background(), flow, 0)
+			result, err := e.Start(context.Background(), flow, 0)
 			if result.Status != Failed || !errors.Is(err, ErrInvalid) {
 				t.Fatalf("%s: %+v %v", name, result, err)
 			}
@@ -279,10 +278,10 @@ func TestFlowContextWaitAny(t *testing.T) {
 		flow := definition(FlowFunc[int, waitOutcome](func(f *FlowContext, _ int) (waitOutcome, error) {
 			return waitAnyOutcome(f, "race", shared)
 		}))
-		if result, err := e.Drive(context.Background(), flow, 0); err != nil || result.Status != Suspended {
+		if result, err := e.Start(context.Background(), flow, 0); err != nil || result.Status != Suspended {
 			t.Fatalf("%+v %v", result, err)
 		}
-		if _, err := e.Drive(context.Background(), flow, 0); !errors.Is(err, ErrInvalid) {
+		if _, err := e.Start(context.Background(), flow, 0); !errors.Is(err, ErrInvalid) {
 			t.Fatal("reused case accepted", err)
 		}
 	})
@@ -304,13 +303,13 @@ func TestFlowContextWaitAny(t *testing.T) {
 			}
 			return "", errors.New("unknown winner")
 		}))
-		if _, err := e.Drive(ctx, flow, 1); err != nil {
+		if _, err := e.Start(ctx, flow, 1); err != nil {
 			t.Fatal(err)
 		}
 		if ok, err := e.Signal(ctx, "decision|reject", 42); !ok || err != nil {
 			t.Fatalf("%t %v", ok, err)
 		}
-		result, err := e.Drive(ctx, flow, 1)
+		result, err := e.Start(ctx, flow, 1)
 		if err != nil || result.Output != "rejected code 42" {
 			t.Fatalf("%+v %v", result, err)
 		}
@@ -318,7 +317,7 @@ func TestFlowContextWaitAny(t *testing.T) {
 	t.Run("optional infrastructure and cancellation", func(t *testing.T) {
 		store := memory.New()
 		e := testEngine(t, struct{ Infrastructure }{store}, Options{})
-		if _, err := e.Drive(context.Background(), anyWaitFlow(), 0); !errors.Is(err, ErrWaitAnyUnsupported) {
+		if _, err := e.Start(context.Background(), anyWaitFlow(), 0); !errors.Is(err, ErrWaitAnyUnsupported) {
 			t.Fatal(err)
 		}
 		ctx, cancel := context.WithCancel(context.Background())

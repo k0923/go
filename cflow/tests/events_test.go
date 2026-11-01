@@ -56,7 +56,7 @@ func TestEngineEvents(t *testing.T) {
 			return f.Run("action", Pure(func(n int) int { return n + 1 }), input)
 		}))
 		for i := 0; i < 2; i++ {
-			result, err := engine.Drive(context.Background(), flow, 1)
+			result, err := engine.Start(context.Background(), flow, 1)
 			if err != nil || result.Output != 2 {
 				t.Fatalf("%+v %v", result, err)
 			}
@@ -71,7 +71,7 @@ func TestEngineEvents(t *testing.T) {
 			}
 			seen[event.ID] = true
 			if event.SchemaVersion != 1 || event.EngineID == "" || event.ExecutionID == "" ||
-				event.WorkflowName != "test" || event.WorkflowVersion != "1" || event.Sequence != uint64(i+1) {
+				event.WorkflowName != "test" || event.Sequence != uint64(i+1) {
 				t.Fatalf("incomplete event: %+v", event)
 			}
 			raw, err := json.Marshal(event)
@@ -105,13 +105,13 @@ func TestEngineEvents(t *testing.T) {
 		engine := testEngine(t, memory.New(), Options{})
 		collector := &eventCollector{}
 		engine.Subscribe(collector.listen)
-		_, err := engine.Drive(context.Background(), Workflow[int, int]{}, 0)
+		_, err := engine.Start(context.Background(), FlowFunc[int, int](nil), 0)
 		if !errors.Is(err, ErrInvalid) {
 			t.Fatal(err)
 		}
 		ctx, cancel := context.WithCancel(context.Background())
 		cancel()
-		_, err = engine.Drive(ctx, definition(FlowFunc[int, int](func(*FlowContext, int) (int, error) { t.Fatal("executed"); return 0, nil })), 0)
+		_, err = engine.Start(ctx, definition(FlowFunc[int, int](func(*FlowContext, int) (int, error) { t.Fatal("executed"); return 0, nil })), 0)
 		if !errors.Is(err, context.Canceled) {
 			t.Fatal(err)
 		}
@@ -146,7 +146,7 @@ func TestEngineEvents(t *testing.T) {
 						}
 					}), in, ActionOptions{Timeout: 10 * time.Millisecond})
 				}))
-				_, err := engine.Drive(context.Background(), flow, 0)
+				_, err := engine.Start(context.Background(), flow, 0)
 				if err == nil {
 					t.Fatal("error lost")
 				}
@@ -163,7 +163,7 @@ func TestEngineEvents(t *testing.T) {
 					if finished.Status != Failed {
 						t.Fatal(finished)
 					}
-					_, _ = engine.Drive(context.Background(), flow, 0)
+					_, _ = engine.Start(context.Background(), flow, 0)
 					replay := eventsOfType(collector.snapshot(), ActionReplayed)
 					if len(replay) != 1 || replay[0].Status != Failed || replay[0].Error.Category != "business" {
 						t.Fatal(replay)
@@ -191,7 +191,7 @@ func TestEngineEvents(t *testing.T) {
 			f.WaitFor[string]("wait", in)
 			return 0, nil
 		}))
-		result, err := engine.Drive(context.Background(), flow, 0)
+		result, err := engine.Start(context.Background(), flow, 0)
 		if err != nil || result.Status != Suspended || result.Pending[0].Key != "wait" {
 			t.Fatalf("%+v %v", result, err)
 		}
@@ -199,7 +199,7 @@ func TestEngineEvents(t *testing.T) {
 		if len(finished) != 1 || finished[0].Pending[0].Key != "wait" {
 			t.Fatal(finished)
 		}
-		_, err = engine.Drive(context.Background(), Workflow[int, int]{}, 0)
+		_, err = engine.Start(context.Background(), FlowFunc[int, int](nil), 0)
 		if err == nil {
 			t.Fatal("error lost")
 		}
@@ -225,7 +225,7 @@ func TestEngineEvents(t *testing.T) {
 			flow := definition(FlowFunc[int, int](func(f *FlowContext, input int) (int, error) {
 				return f.Run("action", Pure(func(n int) int { return n }), input)
 			}))
-			if _, err := engine.Drive(context.Background(), flow, 0); err == nil {
+			if _, err := engine.Start(context.Background(), flow, 0); err == nil {
 				t.Fatal("failure lost")
 			}
 			events := collector.snapshot()
@@ -253,7 +253,7 @@ func TestEngineEvents(t *testing.T) {
 		flow := definition(FlowFunc[int, int](func(f *FlowContext, input int) (int, error) {
 			return f.Run("action", AsAction(func(context.Context, int) (int, error) { return 0, cause }), input)
 		}))
-		_, err := engine.Drive(context.Background(), flow, 0)
+		_, err := engine.Start(context.Background(), flow, 0)
 		if !errors.Is(err, cause) {
 			t.Fatal("original error lost")
 		}
@@ -279,7 +279,7 @@ func TestEngineSubscribe(t *testing.T) {
 		unsubscribe = engine.Subscribe(func(context.Context, Event) { count++; unsubscribe(); unsubscribe() }, DriveStarted)
 		flow := definition(FlowFunc[int, int](func(_ *FlowContext, in int) (int, error) { return in, nil }))
 		for i := 0; i < 2; i++ {
-			if _, err := engine.Drive(context.Background(), flow, 0); err != nil {
+			if _, err := engine.Start(context.Background(), flow, 0); err != nil {
 				t.Fatal(err)
 			}
 		}
@@ -306,7 +306,7 @@ func TestEngineSubscribe(t *testing.T) {
 			f.Go("b", Pure(func(n int) int { return n + 2 }), in)
 			return in, nil
 		}))
-		if _, err := engine.Drive(context.Background(), flow, 0); err != nil {
+		if _, err := engine.Start(context.Background(), flow, 0); err != nil {
 			t.Fatal(err)
 		}
 		wg.Wait()
@@ -332,7 +332,7 @@ func TestEngineWaitEvents(t *testing.T) {
 		engine.Subscribe(collector.listen)
 		flow := definition(FlowFunc[int, string](func(f *FlowContext, in int) (string, error) { return f.WaitFor[string]("wait", in), nil }))
 		for i := 0; i < 2; i++ {
-			result, err := engine.Drive(context.Background(), flow, 0)
+			result, err := engine.Start(context.Background(), flow, 0)
 			if err != nil || result.Status != Suspended {
 				t.Fatalf("%+v %v", result, err)
 			}
@@ -343,7 +343,7 @@ func TestEngineWaitEvents(t *testing.T) {
 				t.Fatal(err)
 			}
 		}
-		result, err := engine.Drive(context.Background(), flow, 0)
+		result, err := engine.Start(context.Background(), flow, 0)
 		if err != nil || result.Output != "done" {
 			t.Fatalf("%+v %v", result, err)
 		}
@@ -372,7 +372,7 @@ func TestEngineWaitEvents(t *testing.T) {
 			engine.Subscribe(collector.listen)
 			flow := definition(FlowFunc[int, int](func(f *FlowContext, in int) (int, error) { f.Sleep("sleep", interval); return in, nil }))
 			for i := 0; i < 3; i++ {
-				result, err := engine.Drive(context.Background(), flow, 0)
+				result, err := engine.Start(context.Background(), flow, 0)
 				if err != nil {
 					t.Fatal(err)
 				}

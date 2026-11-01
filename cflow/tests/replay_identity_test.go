@@ -19,17 +19,17 @@ import (
 // （input_changed / type_changed）。
 func TestReplayIdentity(t *testing.T) {
 	ctx := context.Background()
-	t.Run("mounted Flow signature is not identity", func(t *testing.T) {
+	t.Run("namespace helper signature is not identity", func(t *testing.T) {
 		store := memory.New()
 		e := testEngine(t, store, Options{})
 		calls := 0
 		charge := func(f *FlowContext) (int, error) {
 			return f.Run("charge", Pure(func(n int) int { calls++; return n * 10 }), 1)
 		}
-		v1 := NewWorkflow("order", "1", FlowFunc[int, int](func(w *FlowContext, in int) (int, error) {
-			return w.RunFlow("pay", FlowFunc[int, int](func(f *FlowContext, _ int) (int, error) { return charge(f) }), in)
+		v1 := namedDefinition("order", FlowFunc[int, int](func(w *FlowContext, in int) (int, error) {
+			return charge(w.Scope("pay", ""))
 		}))
-		if result, err := e.Drive(ctx, v1, 0); err != nil || result.Output != 10 {
+		if result, err := e.Start(ctx, v1, 0); err != nil || result.Output != 10 {
 			t.Fatalf("%+v %v", result, err)
 		}
 		record, _ := store.Get(ctx, "pay|charge")
@@ -37,12 +37,11 @@ func TestReplayIdentity(t *testing.T) {
 			!record.Path.Equal(Path{{Name: "pay"}, {Name: "charge"}}) {
 			t.Fatalf("record: %+v", record)
 		}
-		// The mounted Flow's input type changed: inner steps still replay.
-		// 挂载 Flow 的输入类型变了：内部步骤仍然回放。
-		v2 := NewWorkflow("order", "1", FlowFunc[int, int](func(w *FlowContext, in int) (int, error) {
-			return w.RunFlow("pay", FlowFunc[string, int](func(f *FlowContext, _ string) (int, error) { return charge(f) }), fmt.Sprint(in))
+		// Namespace helpers carry no persisted Flow signature.
+		v2 := namedDefinition("order", FlowFunc[int, int](func(w *FlowContext, in int) (int, error) {
+			return charge(w.Scope("pay", ""))
 		}))
-		if result, err := e.Drive(ctx, v2, 0); err != nil || result.Output != 10 || calls != 1 {
+		if result, err := e.Start(ctx, v2, 0); err != nil || result.Output != 10 || calls != 1 {
 			t.Fatalf("%+v %v calls=%d", result, err, calls)
 		}
 	})
@@ -52,10 +51,11 @@ func TestReplayIdentity(t *testing.T) {
 		leaf := FlowFunc[int, int](func(f *FlowContext, in int) (int, error) {
 			return f.Run("step", Pure(func(n int) int { calls++; return n + 1 }), in)
 		})
-		run := NewWorkflow("order", "1", FlowFunc[int, int](func(w *FlowContext, in int) (int, error) { return w.RunFlow("leaf", leaf, in) }))
-		async := NewWorkflow("order", "1", FlowFunc[int, int](func(w *FlowContext, in int) (int, error) { return w.GoFlow("leaf", leaf, in).Wait() }))
-		for _, flow := range []Workflow[int, int]{run, async} {
-			if result, err := e.Drive(ctx, flow, 1); err != nil || result.Output != 2 || calls != 1 {
+		run := namedDefinition("order", FlowFunc[int, int](func(w *FlowContext, in int) (int, error) { return w.RunFlow("leaf", leaf, in) }))
+		async := namedDefinition("order", FlowFunc[int, int](func(w *FlowContext, in int) (int, error) { return w.GoFlow("leaf", leaf, in).Wait() }))
+		for _, flow := range []*flowFixture[int, int]{run, async} {
+			flow.Bindings = map[string]FlowDefinition{"leaf": leaf}
+			if result, err := e.Start(ctx, flow, 1); err != nil || result.Output != 2 || calls != 1 {
 				t.Fatalf("%+v %v calls=%d", result, err, calls)
 			}
 		}
@@ -67,7 +67,7 @@ func TestReplayIdentity(t *testing.T) {
 		flow := definition(FlowFunc[int, int](func(f *FlowContext, in int) (int, error) {
 			return f.Run("step", Pure(func(n int) int { return n * 3 }), in)
 		}))
-		if result, err := e.Drive(ctx, flow, 2); err != nil || result.Output != 6 {
+		if result, err := e.Start(ctx, flow, 2); err != nil || result.Output != 6 {
 			t.Fatalf("%+v %v", result, err)
 		}
 		if record, _ := store.Get(ctx, "step"); record.Type != "action[int,int]" || string(record.Input) != "2" ||
@@ -83,7 +83,7 @@ func TestReplayIdentity(t *testing.T) {
 			f.Sleep("pause", 0)
 			return f.UUID("id"), nil
 		}))
-		first, err := e.Drive(ctx, flow, 0)
+		first, err := e.Start(ctx, flow, 0)
 		if err != nil || first.Status != Completed {
 			t.Fatalf("%+v %v", first, err)
 		}
@@ -98,7 +98,7 @@ func TestReplayIdentity(t *testing.T) {
 			f.UUID("at")
 			return "", nil
 		}))
-		if _, err = e.Drive(ctx, swapped, 0); !errors.Is(err, ErrChanged) {
+		if _, err = e.Start(ctx, swapped, 0); !errors.Is(err, ErrChanged) {
 			t.Fatal(err)
 		}
 	})
@@ -112,18 +112,18 @@ func TestReplayIdentity(t *testing.T) {
 			f.WaitAny("race", reply, OnSleep("timeout", timeout))
 			return reply.Value(), nil
 		}))
-		if result, err := e.Drive(ctx, flow, 0); err != nil || result.Status != Suspended {
+		if result, err := e.Start(ctx, flow, 0); err != nil || result.Status != Suspended {
 			t.Fatalf("%+v %v", result, err)
 		}
 		request, timeout = 2, time.Minute
-		if result, err := e.Drive(ctx, flow, 0); err != nil || result.Status != Suspended {
+		if result, err := e.Start(ctx, flow, 0); err != nil || result.Status != Suspended {
 			t.Fatalf("changed inputs must replay: %+v %v", result, err)
 		}
 		renamed := definition(FlowFunc[int, string](func(f *FlowContext, _ int) (string, error) {
 			f.WaitAny("race", OnSignal[string]("answer", request), OnSleep("timeout", timeout))
 			return "", nil
 		}))
-		if _, err := e.Drive(ctx, renamed, 0); !errors.Is(err, ErrChanged) {
+		if _, err := e.Start(ctx, renamed, 0); !errors.Is(err, ErrChanged) {
 			t.Fatal("renamed member must be drift", err)
 		}
 	})
@@ -160,7 +160,7 @@ func TestStepKeyAndScope(t *testing.T) {
 			return out, nil
 		}))
 		for range 2 {
-			if result, err := e.Drive(ctx, flow, calls0); err != nil || len(result.Output) != 2 {
+			if result, err := e.Start(ctx, flow, calls0); err != nil || len(result.Output) != 2 {
 				t.Fatalf("%+v %v", result, err)
 			}
 		}
@@ -176,7 +176,7 @@ func TestStepKeyAndScope(t *testing.T) {
 		// Same StepKey twice in one drive is a duplicate.
 		// 同一次 drive 中出现两次相同的 StepKey 属于重复。
 		dup := testEngine(t, memory.New(), Options{})
-		if result, err := dup.Drive(ctx, flow, []toolCall{{"x", "a"}, {"x", "b"}}); result.Status != Failed || !errors.Is(err, ErrInvalid) {
+		if result, err := dup.Start(ctx, flow, []toolCall{{"x", "a"}, {"x", "b"}}); result.Status != Failed || !errors.Is(err, ErrInvalid) {
 			t.Fatalf("%+v %v", result, err)
 		}
 	})
@@ -196,7 +196,7 @@ func TestStepKeyAndScope(t *testing.T) {
 			}
 			return sum, nil
 		}))
-		if result, err := e.Drive(ctx, flow, 3); err != nil || result.Output != 5 {
+		if result, err := e.Start(ctx, flow, 3); err != nil || result.Output != 5 {
 			t.Fatalf("%+v %v", result, err)
 		}
 		if record, _ := store.Get(ctx, "step[2]|llm"); record == nil || record.Status != Completed {
@@ -212,13 +212,13 @@ func TestStepKeyAndScope(t *testing.T) {
 			f.Scope("s", strings.Repeat("x", MaxIDLength+1))
 			return 0, nil
 		}))
-		if result, err := e.Drive(ctx, flow, 0); result.Status != Failed || !errors.Is(err, ErrInvalid) {
+		if result, err := e.Start(ctx, flow, 0); result.Status != Failed || !errors.Is(err, ErrInvalid) {
 			t.Fatalf("%+v %v", result, err)
 		}
 		bad := definition(FlowFunc[int, int](func(f *FlowContext, _ int) (int, error) {
 			return f.Run("step", Pure(func(panicky) int { return 0 }), panicky{})
 		}))
-		if result, err := testEngine(t, memory.New(), Options{}).Drive(ctx, bad, 0); result.Status != Failed || !errors.Is(err, ErrInvalid) {
+		if result, err := testEngine(t, memory.New(), Options{}).Start(ctx, bad, 0); result.Status != Failed || !errors.Is(err, ErrInvalid) {
 			t.Fatalf("%+v %v", result, err)
 		}
 	})
@@ -245,8 +245,9 @@ func TestNestedFlows(t *testing.T) {
 			va, err := a.Wait()
 			return va + "," + b, err
 		})
-		flow := NewWorkflow("nested", "1", agent)
-		if result, err := e.Drive(ctx, flow, 0); err != nil || result.Output != "done:t1,done:t2" {
+		flow := namedDefinition("nested", agent)
+		flow.Bindings = map[string]FlowDefinition{"sub": sub}
+		if result, err := e.Start(ctx, flow, 0); err != nil || result.Output != "done:t1,done:t2" {
 			t.Fatalf("%+v %v", result, err)
 		}
 		record, _ := store.Get(ctx, "agent[t1]|work[t1]")
@@ -255,28 +256,32 @@ func TestNestedFlows(t *testing.T) {
 		}
 	})
 	t.Run("recursion is bounded by MaxFlowDepth", func(t *testing.T) {
-		var recurse FlowFunc[int, int]
-		recurse = func(f *FlowContext, n int) (int, error) {
+		var recurse Flow[int, int]
+		recurse = FlowFunc(func(f *FlowContext, n int) (int, error) {
 			v, err := f.RunFlow("child", recurse, n+1)
 			return v + 1, err
-		}
+		})
 		e := testEngine(t, memory.New(), Options{MaxFlowDepth: 3})
-		result, err := e.Drive(ctx, NewWorkflow("recurse", "1", recurse), 0)
-		if result.Status != Failed || !errors.Is(err, ErrInvalid) || !strings.Contains(err.Error(), "MaxFlowDepth") {
+		root := namedDefinition("recurse", recurse)
+		root.Bindings = map[string]FlowDefinition{"recursive": recurse}
+		result, err := e.Start(ctx, root, 0)
+		if result.Status != Failed || err == nil || !strings.Contains(err.Error(), "MaxFlowDepth") {
 			t.Fatalf("%+v %v", result, err)
 		}
 	})
 	t.Run("depth 3 within the limit succeeds", func(t *testing.T) {
-		var down FlowFunc[int, int]
-		down = func(f *FlowContext, n int) (int, error) {
+		var down Flow[int, int]
+		down = FlowFunc(func(f *FlowContext, n int) (int, error) {
 			if n == 0 {
 				return f.Run("leaf", Pure(func(int) int { return 42 }), 0)
 			}
 			return f.RunFlow("child", down, n-1)
-		}
+		})
 		store := memory.New()
 		e := testEngine(t, store, Options{MaxFlowDepth: 3})
-		if result, err := e.Drive(ctx, NewWorkflow("down", "1", down), 3); err != nil || result.Output != 42 {
+		root := namedDefinition("down", down)
+		root.Bindings = map[string]FlowDefinition{"recursive": down}
+		if result, err := e.Start(ctx, root, 3); err != nil || result.Output != 42 {
 			t.Fatalf("%+v %v", result, err)
 		}
 		if record, _ := store.Get(ctx, "child|child|child|leaf"); record == nil {
@@ -303,11 +308,9 @@ func TestKeyBuilder(t *testing.T) {
 		store := lossyKeys{memory.New()}
 		e := testEngine(t, store, Options{})
 		flow := definition(FlowFunc[int, int](func(f *FlowContext, in int) (int, error) {
-			return f.RunFlow("pay", FlowFunc[int, int](func(f *FlowContext, in int) (int, error) {
-				return f.Run("charge", Pure(func(n int) int { return n + 1 }), in)
-			}), in)
+			return f.Scope("pay", "").Run("charge", Pure(func(n int) int { return n + 1 }), in)
 		}))
-		if result, err := e.Drive(ctx, flow, 1); err != nil || result.Output != 2 {
+		if result, err := e.Start(ctx, flow, 1); err != nil || result.Output != 2 {
 			t.Fatalf("%+v %v", result, err)
 		}
 		if record, _ := store.Get(ctx, "custom:pay/charge"); record == nil {
@@ -323,7 +326,7 @@ func TestKeyBuilder(t *testing.T) {
 			y, _ := b.Wait()
 			return x + y, nil
 		}))
-		result, err := e.Drive(ctx, flow, 0)
+		result, err := e.Start(ctx, flow, 0)
 		if result.Status != Failed || !errors.Is(err, ErrInvalid) || !strings.Contains(err.Error(), "not injective") {
 			t.Fatalf("%+v %v", result, err)
 		}
@@ -335,11 +338,11 @@ func TestKeyBuilder(t *testing.T) {
 		flow := definition(FlowFunc[int, int](func(f *FlowContext, in int) (int, error) {
 			return f.Run("tool", Pure(func(c toolCall) int { return len(c.ID) }), toolCall{ID: id})
 		}))
-		if _, err := e.Drive(ctx, flow, 0); err != nil {
+		if _, err := e.Start(ctx, flow, 0); err != nil {
 			t.Fatal(err)
 		}
 		id = "b" // different path, same lossy key
-		if result, err := e.Drive(ctx, flow, 0); result.Status != Failed || !errors.Is(err, ErrChanged) {
+		if result, err := e.Start(ctx, flow, 0); result.Status != Failed || !errors.Is(err, ErrChanged) {
 			t.Fatalf("%+v %v", result, err)
 		}
 	})

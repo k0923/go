@@ -18,6 +18,13 @@ import (
 )
 
 type Options struct {
+	// Flows registers root and independent child definitions on this worker.
+	// A name is the identity of one immutable Flow: change semantics by
+	// registering a new name and routing new runs to it, never by editing the
+	// Flow behind an existing name. Experimental.
+	// Flows 统一注册本 worker 的根与子定义。名字即一个不可变 Flow 的身份：改变语义时注册新名字
+	// 并把新运行路由过去，而不是修改已有名字背后的 Flow。实验性。
+	Flows          map[string]FlowDefinition
 	LeaseTTL       time.Duration
 	CleanupTimeout time.Duration
 	// MaxFlowDepth bounds how deeply Flows may mount Flows (RunFlow/GoFlow
@@ -34,20 +41,21 @@ type Options struct {
 	Now func() time.Time
 }
 
-// Engine executes ONE definition replay per Drive. It is an execution kernel:
-// run-level state (created/finished/output), scheduling and versioning belong
-// to the caller. Bind each run to the definition version that started it; a
-// hotfix ships as a new version for new runs while old runs keep their code.
-// Engine 每次 Drive 执行一次定义回放。它是执行内核：run 级状态（创建/结束/输出）、
-// 调度与版本管理归调用方。每个 run 绑定启动它的定义版本；热修复以新版本发布给
-// 新 run，老 run 继续运行原代码。
+// Engine executes ONE boundary replay per Start/Resume. It is an execution
+// kernel: run-level state (created/finished/output) and scheduling belong to
+// the caller. A run keeps the registered name that started it; a hotfix ships
+// as a new name for new runs while old runs keep their code.
+// Engine 每次 Start/Resume 执行一个执行边界的回放。它是执行内核：run 级状态（创建/结束/输出）
+// 与调度归调用方。每个 run 绑定启动它的注册名；热修复以新名字发布给新 run，老 run 继续运行原代码。
 type Engine struct {
-	store    Infrastructure
-	options  Options
-	leases   *lease.Runner
-	eventID  string
-	events   eventHub
-	buildKey func(Path) string
+	flows     map[string]flowRunner
+	flowNames map[any]string
+	store     Infrastructure
+	options   Options
+	leases    *lease.Runner
+	eventID   string
+	events    eventHub
+	buildKey  func(Path) string
 }
 
 func NewEngine(store Infrastructure, options Options) (*Engine, error) {
@@ -82,7 +90,41 @@ func NewEngine(store Infrastructure, options Options) (*Engine, error) {
 	if builder, ok := store.(KeyBuilder); ok {
 		buildKey = builder.BuildKey
 	}
-	return &Engine{store: store, options: options, leases: leases, eventID: uuid.NewString(), buildKey: buildKey}, nil
+	flows := make(map[string]flowRunner, len(options.Flows))
+	names := make(map[any]string, len(options.Flows))
+	for name, flow := range options.Flows {
+		if !localKey.MatchString(name) || nilValue(flow) {
+			return nil, ErrInvalid
+		}
+		id, err := definitionIdentity(flow)
+		if err != nil || names[id] != "" {
+			return nil, fmt.Errorf("%w: duplicate or invalid flow definition %s", ErrInvalid, name)
+		}
+		runner, err := flow.bindFlow(flow)
+		if err != nil {
+			return nil, fmt.Errorf("%w: flow %s: %v", ErrInvalid, name, err)
+		}
+		flows[name], names[id] = runner, name
+	}
+	return &Engine{store: store, options: options, leases: leases, eventID: uuid.NewString(), buildKey: buildKey, flows: flows, flowNames: names}, nil
+}
+
+func (e *Engine) flowName(flow FlowDefinition) (string, error) {
+	id, err := definitionIdentity(flow)
+	if err != nil {
+		return "", err
+	}
+	name := e.flowNames[id]
+	if name == "" {
+		return "", fmt.Errorf("%w: flow is not registered", ErrInvalid)
+	}
+	return name, nil
+}
+
+// FlowName returns the name flow is registered under in Options.Flows.
+// FlowName 返回 flow 在 Options.Flows 中的注册名。
+func (e *Engine) FlowName(flow FlowDefinition) (string, error) {
+	return e.flowName(flow)
 }
 
 // ActionKey is stable within a scoped run. For external idempotency compose
@@ -102,32 +144,32 @@ type actionKey struct{}
 // execution 是一次 Drive 的状态。abort 保存框架故障（基础设施、可重试 Action
 // 失败、误用、漂移）；它们不会以 error 形式交给编排代码，而是停止编排。
 type execution struct {
-	engine *Engine
-	ctx    context.Context
-	cancel context.CancelFunc
-	mu     sync.Mutex
+	flowKey string // empty for the root run; identifies an independently resumed child
+	engine  *Engine
+	ctx     context.Context
+	cancel  context.CancelFunc
+	mu      sync.Mutex
 	// keys maps every claimed key to its path, so a non-injective BuildKey is
 	// told apart from a genuinely duplicated step.
 	// keys 记录每个已占用 key 对应的路径，以区分非单射的 BuildKey 与真正重复的步骤。
-	keys    map[string]Path
+	keys map[string]Path
+	// records, flows and loops hold this boundary's preloaded terminal state;
+	// nil without an ExecutionLoader. Read-only afterwards.
+	// records、flows、loops 保存本执行边界预加载的终态数据；没有 ExecutionLoader 时为 nil。之后只读。
+	records map[string]*Record
+	flows   map[string]*FlowExecution
+	loops   map[string]*LoopSnapshot
+	// token is the owner's lease held while resuming a child; nil for the root.
+	// token 是恢复子级时持有的执行单元租约；根运行为 nil。
+	token   *Lease
 	abort   []error
 	pending map[string]Pending
-	// records holds terminal records preloaded by Drive; read-only afterwards.
-	// records 保存 Drive 预加载的终态记录；之后只读。
-	records map[string]*Record
 	futures []observable
 	closed  bool
 	wg      sync.WaitGroup
 }
 
 var localKey = regexp.MustCompile(`^[A-Za-z0-9_]+$`)
-
-// flowScope joins asynchronous descendants before this Flow returns to its
-// caller. Mutable fields are protected by execution.mu.
-type flowScope struct {
-	wg     sync.WaitGroup
-	closed bool
-}
 
 // FlowContext provides Action, wait and Flow-mounting primitives. Flows may
 // mount Flows; Options.MaxFlowDepth bounds the nesting. Actions receive a
@@ -149,7 +191,6 @@ type FlowContext struct {
 	execution *execution
 	path      Path
 	depth     int // mounted Flow depth; the root Flow is 0
-	scope     *flowScope
 	strand    *strand
 }
 
@@ -180,7 +221,7 @@ func (f *FlowContext) Key() string {
 // id 必须确定（下标、业务 ID），不能是时间或随机数。Scope 与调用方共享 strand 和异步汇合。
 func (f *FlowContext) Scope(name string, id string) *FlowContext {
 	path, _ := f.claim(name, id)
-	return &FlowContext{execution: f.execution, path: path, depth: f.depth, scope: f.scope, strand: f.strand}
+	return &FlowContext{execution: f.execution, path: path, depth: f.depth, strand: f.strand}
 }
 
 // signature renders the leaf type of a step for observation, e.g.
@@ -203,6 +244,9 @@ func sameStep(r *Record, kind Kind, path Path) bool {
 // leaf type differs from the persisted one; the persisted outcome is used.
 // replayed 报告（但不失败）当前输入或叶子类型与持久化值不同的回放步骤；仍使用持久化结果。
 func (f *FlowContext) replayed(r *Record, typ string, input json.RawMessage) {
+	if r.ExecutionKey != f.execution.flowKey {
+		f.fail(ErrChanged)
+	}
 	e := f.execution.engine
 	if !sameJSON(r.Input, input) {
 		e.emit(f.Context(), Event{Type: InputChanged, Key: r.Key, Path: r.Path, Kind: r.Kind,
@@ -268,7 +312,7 @@ func (f *FlowContext) claim(name, id string) (Path, string) {
 	key := f.execution.engine.buildKey(path)
 	e := f.execution
 	e.mu.Lock()
-	if e.closed || (f.scope != nil && f.scope.closed) {
+	if e.closed {
 		e.mu.Unlock()
 		f.abort(fatal(fmt.Errorf("%w: execution closed", ErrInvalid)))
 	}
@@ -320,7 +364,7 @@ func (f *FlowContext) must(err error) {
 		return
 	}
 	if errors.Is(err, ErrChanged) || errors.Is(err, ErrInvalid) || errors.Is(err, ErrSignalUnsupported) ||
-		errors.Is(err, ErrWaitAnyUnsupported) {
+		errors.Is(err, ErrWaitAnyUnsupported) || errors.Is(err, ErrFlowUnsupported) {
 		err = fatal(err)
 	}
 	f.abort(err)
@@ -355,74 +399,162 @@ func runStrand[T any](s *strand, fn func() (T, error)) (output T, err error, hal
 	return output, err, false
 }
 
-// Drive replays the definition from its entry point. It joins all registered
-// async work before returning, including work the caller forgot to Wait().
+// Start begins or rejoins the root run of a registered Flow with input, then
+// replays it once. Later deliveries resume the run with Resume(ctx, "") and need
+// neither the Flow nor its input: both are recorded at the first Start. A later
+// Start with another name or input fails with ErrChanged.
+// It joins all registered async work before returning, including work the
+// caller forgot to Wait().
 //
 // Result.Status: Completed (Output valid), Suspended (Pending lists every
 // wait), Failed (err is terminal: an escaped business error, definition drift,
 // misuse or an orchestration panic), Running (err is retryable: infrastructure,
-// lease conflict, retryable Action failure or cancellation; re-drive later).
-// Drive 从入口点回放定义。返回前它会等待所有已注册的异步工作，包括调用方忘记
-// Wait 的工作。
+// lease conflict, retryable Action failure or cancellation; resume later).
+// Start 以 input 启动或重新汇合已注册 Flow 的根运行，并回放一次。之后的投递用 Resume(ctx, "")
+// 恢复，不需要再提供 Flow 与输入：二者在首次 Start 时已记录。之后以不同名称或输入调用
+// Start 会以 ErrChanged 失败。返回前会等待所有已注册的异步工作，包括调用方忘记 Wait 的工作。
 //
 // Result.Status：Completed（Output 有效）、Suspended（Pending 列出全部等待）、
 // Failed（err 为终态：逃逸的业务错误、定义漂移、误用或编排 panic）、
-// Running（err 可重试：基础设施、租约冲突、可重试 Action 失败或取消；稍后重新驱动）。
-func (e *Engine) Drive[I, O any](ctx context.Context, workflow Workflow[I, O], input I) (result Result[O], err error) {
+// Running（err 可重试：基础设施、租约冲突、可重试 Action 失败或取消；稍后恢复）。
+func (e *Engine) Start[I, O any](ctx context.Context, flow Flow[I, O], input I) (result Result[O], err error) {
 	result.Status = Running
-	eventCtx := ctx
-	if eventCtx == nil {
-		eventCtx = context.Background()
+	var name string
+	var raw json.RawMessage
+	err = ErrInvalid
+	if ctx != nil && !invalidFlow(flow) {
+		if name, err = e.flowName(flow); err == nil {
+			raw, err = json.Marshal(input)
+		}
 	}
-	eventCtx = context.WithValue(eventCtx, eventContextKey{}, eventContext{
-		executionID: uuid.NewString(), name: workflow.Name, version: workflow.Version,
-	})
+	if err != nil {
+		// Rejected starts are still observable as one drive.
+		// 被拒绝的启动仍作为一次 drive 可被观测。
+		eventCtx := ctx
+		if eventCtx == nil {
+			eventCtx = context.Background()
+		}
+		eventCtx = context.WithValue(eventCtx, eventContextKey{}, eventContext{executionID: uuid.NewString(), name: name})
+		started := e.options.Now()
+		e.emit(eventCtx, Event{Type: DriveStarted, Key: name, Status: Running, StartedAt: started}, nil)
+		e.emit(eventCtx, Event{Type: DriveFinished, Key: name, Status: Running, StartedAt: started}, err)
+		return result, err
+	}
+	out, err := e.root(ctx, name, raw, nil)
+	result.Status, result.Pending = out.Status, out.Pending
+	if out.Status == Completed {
+		if decodeErr := decode(out.Output, &result.Output); decodeErr != nil {
+			result.Status = Failed
+			return result, decodeErr
+		}
+	}
+	return result, err
+}
+
+// Resume replays one execution boundary from its persisted state. key is the
+// Notification.ExecutionKey of a WAKE: "" resumes the root run started by
+// Start, any other key the independent child Flow or ForEach item at that
+// address. Children are resumed only from their own steps. Register every
+// Flow through Options.Flows on every worker. A queued item returns ErrConflict;
+// terminal children return their stored outcome. A failed child must still be
+// ACKed and its parent's wake processed; the run's status belongs to the root.
+// Resume 从持久状态回放一个执行单元。key 取 WAKE 的 Notification.ExecutionKey：空串恢复 Start
+// 启动的根运行，其他 key 恢复该地址上的独立子 Flow 或 ForEach 元素，且只回放其自身步骤。
+// 每个 worker 需在 Options.Flows 中注册全部 Flow。未激活的元素返回 ErrConflict，终态子级返回已存结果。
+// 子级失败后仍需确认该投递并处理父级唤醒；运行整体状态以根为准。
+func (e *Engine) Resume(ctx context.Context, key string) (Result[json.RawMessage], error) {
+	if ctx == nil {
+		return Result[json.RawMessage]{Status: Running}, ErrInvalid
+	}
+	if key != "" {
+		return e.resumeFlow(ctx, key)
+	}
+	definition, err := e.store.Get(ctx, definitionKey)
+	if err != nil {
+		return Result[json.RawMessage]{Status: Running}, &OperationError{Key: definitionKey, Op: "Get", Cause: err}
+	}
+	if definition == nil || definition.Kind != DefinitionKind {
+		return Result[json.RawMessage]{Status: Running}, ErrNotFound
+	}
+	var identity struct {
+		Name  string
+		Input json.RawMessage
+	}
+	if err := json.Unmarshal(definition.Input, &identity); err != nil {
+		return Result[json.RawMessage]{Status: Failed}, fatal(fmt.Errorf("decode %s: %w", definitionKey, err))
+	}
+	return e.root(ctx, identity.Name, identity.Input, definition)
+}
+
+// root binds the run's definition record and replays the registered root.
+// stored is the already read definition record, if any.
+// root 绑定运行的定义记录并回放已注册的根 Flow。stored 为已读取的定义记录（若有）。
+func (e *Engine) root(ctx context.Context, name string, input json.RawMessage, stored *Record) (result Result[json.RawMessage], err error) {
+	result.Status = Running
+	eventCtx := context.WithValue(ctx, eventContextKey{}, eventContext{executionID: uuid.NewString(), name: name})
 	eventStarted := e.options.Now()
-	e.emit(eventCtx, Event{Type: DriveStarted, Key: workflow.Name, Status: Running, StartedAt: eventStarted}, nil)
+	e.emit(eventCtx, Event{Type: DriveStarted, Key: name, Status: Running, StartedAt: eventStarted}, nil)
 	defer func() {
 		e.emit(eventCtx, Event{
-			Type: DriveFinished, Key: workflow.Name, Status: result.Status,
+			Type: DriveFinished, Key: name, Status: result.Status,
 			StartedAt: eventStarted, Pending: result.Pending,
 		}, err)
 	}()
-	if ctx == nil || invalidFlow(workflow.root) || !localKey.MatchString(workflow.Name) || workflow.Version == "" {
-		return result, ErrInvalid
+	runner := e.flows[name]
+	if runner == nil {
+		return result, fmt.Errorf("%w: register flow %s", ErrInvalid, name)
 	}
 	if err = ctx.Err(); err != nil {
 		return result, err
 	}
 	identity, err := json.Marshal(struct {
-		Name, Version string
-		Input         I
-	}{workflow.Name, workflow.Version, input})
+		Name  string
+		Input json.RawMessage
+	}{name, input})
 	if err != nil {
 		return result, err
 	}
-	definition, err := e.store.Put(ctx, &Record{
-		Key: definitionKey, Path: Path{{Name: definitionKey}}, Kind: DefinitionKind, Status: Completed, Input: identity,
-	})
-	if err != nil {
-		return result, &OperationError{Key: definitionKey, Op: "Put", Cause: err}
+	if stored == nil {
+		stored, err = e.store.Put(ctx, &Record{
+			Key: definitionKey, Path: Path{{Name: definitionKey}}, Kind: DefinitionKind, Status: Completed, Input: identity,
+		})
+		if err != nil {
+			return result, &OperationError{Key: definitionKey, Op: "Put", Cause: err}
+		}
 	}
-	if !sameJSON(definition.Input, identity) {
+	if !sameJSON(stored.Input, identity) {
 		result.Status = Failed
 		return result, fatal(ErrChanged)
 	}
-	var records map[string]*Record
-	if lister, ok := e.store.(RecordLister); ok {
-		all, listErr := lister.Records(ctx)
-		if listErr != nil {
-			return result, &OperationError{Key: "$records", Op: "Records", Cause: listErr}
+	body := FlowFunc[json.RawMessage, json.RawMessage](func(f *FlowContext, in json.RawMessage) (json.RawMessage, error) {
+		return runner(f, in)
+	})
+	return e.execute(eventCtx, body, input, nil, 0, "", nil)
+}
+
+func (e *Engine) flowEventContext(ctx context.Context, item *FlowExecution) context.Context {
+	return context.WithValue(ctx, eventContextKey{}, eventContext{executionID: uuid.NewString(), name: item.Workflow})
+}
+
+// execute is shared by root and independent entry points. Each entry preloads
+// only its own state, never the internals of parents, siblings or children.
+// execute 由根与独立入口共用。每个入口只预加载自身状态，不读取父级、兄弟或子级的内部数据。
+func (e *Engine) execute[I, O any](ctx context.Context, flow Flow[I, O], input I, path Path, depth int, owner string, token *Lease) (result Result[O], err error) {
+	result.Status = Running
+	ex := &execution{engine: e, keys: make(map[string]Path), flowKey: owner, pending: make(map[string]Pending), token: token}
+	if loader, ok := e.store.(ExecutionLoader); ok {
+		snapshot, loadErr := loader.LoadExecution(ctx, owner)
+		if loadErr != nil {
+			return result, &OperationError{Key: "$execution", Op: "LoadExecution", Cause: loadErr}
 		}
-		records = terminalRecords(all)
+		ex.preload(snapshot)
 	}
-	runCtx, cancel := context.WithCancel(eventCtx)
+	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	ex := &execution{engine: e, ctx: runCtx, cancel: cancel, keys: make(map[string]Path),
-		pending: make(map[string]Pending), records: records}
+	ex.ctx, ex.cancel = runCtx, cancel
 	root := &strand{}
-	rootCtx := &FlowContext{execution: ex, strand: root}
-	output, handlerErr, _ := runStrand(root, func() (O, error) { return rootCtx.runChildFlow(nil, workflow.root, input) })
+	rootCtx := &FlowContext{execution: ex, strand: root, path: path, depth: depth}
+	output, handlerErr, _ := runStrand(root, func() (O, error) { return flow.Run(rootCtx, input) })
 	ex.wg.Wait()
 	ex.mu.Lock()
 	ex.closed = true
@@ -477,24 +609,38 @@ func (e *Engine) Drive[I, O any](ctx context.Context, workflow Workflow[I, O], i
 	return result, err
 }
 
-// terminalRecords keeps outcomes that can never change, so replaying them from
-// a snapshot is equivalent to reading the store: finished Actions, resolved
-// Signal/Sleep records and checkpoints.
-// terminalRecords 只保留永不改变的结果，因此从快照回放等价于读取存储：
-// 已结束的 Action、已解析的 Signal/Sleep 记录和检查点。
-func terminalRecords(all []*Record) map[string]*Record {
-	records := make(map[string]*Record, len(all))
-	for _, r := range all {
-		if r == nil {
+// preload keeps the owner's outcomes that can never change, so replaying them
+// from a snapshot is equivalent to reading the store: finished Actions,
+// resolved Signal/Sleep records, checkpoints, and terminal children and loops.
+// preload 只保留该执行边界永不改变的结果，因此从快照回放等价于读取存储：
+// 已结束的 Action、已解析的 Signal/Sleep、检查点，以及已结束的子级和循环。
+func (ex *execution) preload(snapshot *ExecutionSnapshot) {
+	ex.records = make(map[string]*Record)
+	ex.flows = make(map[string]*FlowExecution)
+	ex.loops = make(map[string]*LoopSnapshot)
+	if snapshot == nil {
+		return
+	}
+	for _, r := range snapshot.Records {
+		if r == nil || r.ExecutionKey != ex.flowKey {
 			continue
 		}
 		switch {
 		case r.Kind == ActionKind && (r.Status == Completed || r.Status == Failed),
 			(r.Kind == SignalKind || r.Kind == SleepKind || r.Kind == CheckpointKind) && r.Status == Completed:
-			records[r.Key] = r
+			ex.records[r.Key] = r
 		}
 	}
-	return records
+	for _, item := range snapshot.Flows {
+		if item != nil && item.LoopKey == "" && item.ParentKey == ex.flowKey && (item.Status == Completed || item.Status == Failed) {
+			ex.flows[item.Key] = item
+		}
+	}
+	for _, loop := range snapshot.Loops {
+		if loop != nil && loop.ParentKey == ex.flowKey && (loop.Status == Completed || loop.Status == Failed) {
+			ex.loops[loop.Key] = loop
+		}
+	}
 }
 
 // definitionKey addresses the run's definition record. It cannot collide with
@@ -556,8 +702,12 @@ func (f *FlowContext) runAction[I, O any](path Path, key string, action Action[I
 		return output, nil, fatal(err)
 	}
 	started := e.options.Now()
+	// With a boundary preload, an absent record is known not to be terminal;
+	// under the owner's lease the protected section reads it again anyway.
+	// 有预加载时，缺失的记录必然不是终态；持有执行单元租约时受保护区段还会再读一次。
+	token := f.execution.token
 	record := f.execution.records[key]
-	if record == nil {
+	if record == nil && f.execution.records == nil && token == nil {
 		if record, err = e.store.Get(f.Context(), key); err != nil {
 			return output, nil, &OperationError{key, "Get", err}
 		}
@@ -597,7 +747,7 @@ func (f *FlowContext) runAction[I, O any](path Path, key string, action Action[I
 	if done, replayErr := replay(record); done {
 		return output, business, replayErr
 	}
-	err = e.leases.Run(f.Context(), key, func(executionCtx context.Context, token lease.Token) error {
+	protected := func(executionCtx context.Context, token lease.Token) error {
 		record, err = e.store.Get(executionCtx, key)
 		if err != nil {
 			return &OperationError{key, "Get", err}
@@ -607,7 +757,7 @@ func (f *FlowContext) runAction[I, O any](path Path, key string, action Action[I
 		}
 		if record == nil {
 			record, err = e.store.Commit(executionCtx, token, &Record{
-				Key: key, Path: path, Kind: ActionKind, Status: Running, Type: typ, Input: data, StartedAt: started,
+				Key: key, Path: path, ExecutionKey: f.execution.flowKey, Kind: ActionKind, Status: Running, Type: typ, Input: data, StartedAt: started,
 			}, 0)
 			if err != nil {
 				return &OperationError{key, "Commit", err}
@@ -680,7 +830,15 @@ func (f *FlowContext) runAction[I, O any](path Path, key string, action Action[I
 			business = &ActionError{Key: key, Message: actionErr.Error(), Cause: actionErr}
 		}
 		return nil
-	})
+	}
+	if token != nil {
+		// Resuming a child holds and renews its lease; Commit fences
+		// every Action write by it, so no per-Action lease is needed.
+		// 恢复子级时已持有并续租其租约，Commit 以它校验每次 Action 写入，无需逐个 Action 加锁。
+		err = protected(f.Context(), *token)
+	} else {
+		err = e.leases.Run(f.Context(), key, protected)
+	}
 	if err != nil {
 		var zero O
 		return zero, nil, err

@@ -279,7 +279,6 @@ function renderDetail() {
     : `<span class="chip bg-slate-500/10 text-slate-400 ring-1 ring-white/5">worker 离线${isZero(run.last_seen) ? '' : ' · ' + ago(run.last_seen)}</span>`)
   setHTML('#d-meta', [
     ['Workflow', `<span class="text-slate-200">${esc(run.workflow || '—')}</span>`],
-    ['Version', `<span class="font-mono text-slate-200">${esc(run.version || '—')}</span>`],
     ['Drives', `<span class="text-slate-200 tabular-nums">${run.drives}</span>`],
     ['创建', fmtDate(run.created_at)],
     ['更新', ago(run.updated_at)],

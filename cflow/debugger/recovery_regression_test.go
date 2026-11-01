@@ -161,6 +161,7 @@ func TestWakeRetainedAcrossDriveAndAckFailures(t *testing.T) {
 		}), input)
 	})
 	result, err := Run(ctx, flow, 42, Options{Server: proxy.URL, RunID: "ack-order",
+		Engine:     cflow.Options{Flows: map[string]cflow.FlowDefinition{"test": flow}},
 		RetryDelay: time.Millisecond, Logf: func(string, ...any) {}})
 	if err != nil || result.Output != 42 || earlyAck.Load() || calls.Load() != 2 || acks.Load() != 2 {
 		t.Fatalf("result=%+v err=%v early=%t calls=%d acks=%d", result, err, earlyAck.Load(), calls.Load(), acks.Load())
@@ -179,7 +180,7 @@ func TestStaleSuspensionRechecksDurableWait(t *testing.T) {
 	flow := definition(func(fc *cflow.FlowContext, input int) (int, error) {
 		return fc.WaitFor[int]("approval", input), nil
 	})
-	result, err := engine.Drive(ctx, flow, 1)
+	result, err := engine.Start(ctx, flow, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -208,7 +209,8 @@ func TestAutomaticRunIDsIsolateConcurrentRuns(t *testing.T) {
 	done := make(chan error, count)
 	for i := range count {
 		go func() {
-			result, err := Run(ctx, flow, i, Options{Server: f.server.URL, Logf: func(string, ...any) {}})
+			result, err := Run(ctx, flow, i, Options{Server: f.server.URL,
+				Engine: cflow.Options{Flows: map[string]cflow.FlowDefinition{"test": flow}}, Logf: func(string, ...any) {}})
 			if err == nil && result.Output != i {
 				err = errors.New("output from another run")
 			}
@@ -329,28 +331,38 @@ func TestEventOutageRetainsBatchAndReportsIncompleteTimeline(t *testing.T) {
 	}
 }
 
-func TestStoreRejectsDatabaseWithoutPath(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "old.db")
-	db, err := sql.Open("sqlite", path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	// The records table as it existed before Record.Path.
-	// Record.Path 引入之前的 records 表结构。
-	_, err = db.Exec(`CREATE TABLE records (run_id TEXT NOT NULL, key TEXT NOT NULL, kind TEXT NOT NULL,
+func TestStoreRejectsOutdatedSchema(t *testing.T) {
+	for name, ddl := range map[string]string{
+		// The records table as it existed before Record.Path.
+		// Record.Path 引入之前的 records 表结构。
+		"records_without_path": `CREATE TABLE records (run_id TEXT NOT NULL, key TEXT NOT NULL, kind TEXT NOT NULL,
 		status TEXT NOT NULL, version INTEGER NOT NULL, input BLOB, result BLOB, error TEXT NOT NULL DEFAULT '',
 		until INTEGER NOT NULL DEFAULT 0, started_at INTEGER NOT NULL DEFAULT 0, ended_at INTEGER NOT NULL DEFAULT 0,
 		updated_at INTEGER NOT NULL DEFAULT 0, group_key TEXT NOT NULL DEFAULT '', type_path TEXT NOT NULL DEFAULT '',
-		PRIMARY KEY (run_id, key))`)
-	db.Close()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if store, err := OpenStore(path); err == nil || !strings.Contains(err.Error(), "predates Record.Path") {
-		if store != nil {
-			store.Close()
-		}
-		t.Fatalf("old schema must be rejected: %v", err)
+		PRIMARY KEY (run_id, key))`,
+		// The loops table before parent_key indexed execution boundaries.
+		// parent_key 索引执行边界之前的 loops 表结构。
+		"loops_without_parent_key": `CREATE TABLE loops (run_id TEXT NOT NULL, key TEXT NOT NULL, data BLOB NOT NULL,
+		PRIMARY KEY (run_id, key))`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "old.db")
+			db, err := sql.Open("sqlite", path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, err = db.Exec(ddl)
+			db.Close()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if store, err := OpenStore(path); err == nil || !strings.Contains(err.Error(), "predates the current schema") {
+				if store != nil {
+					store.Close()
+				}
+				t.Fatalf("old schema must be rejected: %v", err)
+			}
+		})
 	}
 }
 

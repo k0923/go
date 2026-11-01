@@ -68,13 +68,13 @@ func run(ctx context.Context) error {
 		*session = fmt.Sprintf("react-%d", time.Now().Unix())
 	}
 	llm, tools := &MockLLM{Console: console, Flaky: *flaky}, &Tools{Console: console, Flaky: *flaky}
-	definition := cflow.NewWorkflow("react_turn", "1", TurnFlow{
+	definition := TurnFlow{
 		Agent: Agent{Name: "main", LLM: llm, Tools: tools, Specs: toolSpecs(), MaxSteps: 5},
 		// The sub-agent is just another Flow, mounted from inside TurnFlow.
 		// 子 Agent 只是另一个 Flow，在 TurnFlow 内部挂载。
 		Research:        ResearchFlow{Agent: Agent{Name: "research", LLM: llm, Tools: tools, Specs: researchSpecs(), MaxSteps: 3}},
 		ApprovalTimeout: *approvalTimeout,
-	})
+	}
 
 	console.Println(bold, "ReAct workflow demo — 输入消息开始对话；/history 查看对话，/records 查看上一轮的持久化记录，/bye 或 Ctrl+C 退出")
 	history := []Message{{Role: RoleSystem, Content: "You are a helpful assistant. Use tools when needed."}}
@@ -125,9 +125,11 @@ func run(ctx context.Context) error {
 // driveTurn drives one run to a terminal state. Between drives it answers
 // the approval the run is suspended on (or waits for the durable timer).
 // driveTurn 把一个 run 驱动到终态。两次 Drive 之间，宿主回答 run 正在等待的审批（或等待持久化计时器）。
-func driveTurn(ctx context.Context, store cflow.Infrastructure, definition cflow.Workflow[TurnInput, TurnOutput],
+func driveTurn(ctx context.Context, store cflow.Infrastructure, definition TurnFlow,
 	input TurnInput, console *Console, lines <-chan string) (TurnOutput, error) {
-	engine, err := cflow.NewEngine(store, cflow.Options{})
+	engine, err := cflow.NewEngine(store, cflow.Options{Flows: map[string]cflow.FlowDefinition{
+		"react_turn": definition, "research": definition.Research,
+	}})
 	if err != nil {
 		return TurnOutput{}, err
 	}
@@ -135,7 +137,7 @@ func driveTurn(ctx context.Context, store cflow.Infrastructure, definition cflow
 	for drive := 1; ; drive++ {
 		stats.reset()
 		started := time.Now()
-		result, err := engine.Drive(ctx, definition, input)
+		result, err := engine.Start(ctx, definition, input)
 		report(ctx, store, result, err)
 		console.Println(dim, "  ── drive #%d %s：执行 %d 个 action，回放 %d 个，耗时 %s",
 			drive, result.Status, stats.executed.Load(), stats.replayed.Load(), time.Since(started).Round(time.Millisecond))
@@ -156,6 +158,70 @@ func driveTurn(ctx context.Context, store cflow.Infrastructure, definition cflow
 		}
 		if err := approve(ctx, engine, store, console, lines, result.Pending); err != nil {
 			return result.Output, err
+		}
+		hasChildren := false
+		for _, pending := range result.Pending {
+			hasChildren = hasChildren || pending.Kind == cflow.FlowKind
+		}
+		if hasChildren {
+			if err := driveChildren(ctx, engine, store, console, lines); err != nil {
+				return result.Output, err
+			}
+		}
+	}
+}
+
+// Consume child wakes until a completed child asks the root to resume.
+func driveChildren(ctx context.Context, engine *cflow.Engine, store cflow.Infrastructure, console *Console, lines <-chan string) error {
+	outbox := store.(memory.Outbox)
+	// A successful root drive has consumed any previous root wakes.
+	initial, err := outbox.Pending(ctx, time.Now())
+	if err != nil {
+		return err
+	}
+	for _, message := range initial {
+		if message.Purpose == memory.WakeNotification && message.ExecutionKey == "" {
+			if err := outbox.Ack(ctx, message.ID); err != nil {
+				return err
+			}
+		}
+	}
+	for {
+		messages, err := outbox.Pending(ctx, time.Now())
+		if err != nil {
+			return err
+		}
+		if len(messages) == 0 {
+			if err := sleepCtx(ctx, 50*time.Millisecond); err != nil {
+				return err
+			}
+			continue
+		}
+		for _, message := range messages {
+			if message.Purpose == memory.WakeNotification {
+				if message.ExecutionKey == "" {
+					return nil
+				}
+				result, err := engine.Resume(ctx, message.ExecutionKey)
+				console.Println(dim, "  ── 子 Flow %s：%s", message.ExecutionKey, result.Status)
+				if result.Status == cflow.Running {
+					if err := sleepCtx(ctx, time.Second); err != nil {
+						return err
+					}
+					continue
+				}
+				if err != nil && result.Status != cflow.Failed {
+					return err
+				}
+				if result.Status == cflow.Suspended {
+					if err := approve(ctx, engine, store, console, lines, result.Pending); err != nil {
+						return err
+					}
+				}
+			}
+			if err := outbox.Ack(ctx, message.ID); err != nil {
+				return err
+			}
 		}
 	}
 }
@@ -324,7 +390,7 @@ func openStore(ctx context.Context, runID string) (cflow.Infrastructure, error) 
 	}
 	// Register the run so the UI shows its workflow name; records are created on demand anyway.
 	// 注册 run，让 UI 显示工作流名称；记录本身会按需创建。
-	spec, _ := json.Marshal(debugger.RunSpec{ID: runID, Workflow: "react_turn", Version: "1"})
+	spec, _ := json.Marshal(debugger.RunSpec{ID: runID, Workflow: "react_turn"})
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(*server, "/")+"/api/runs", bytes.NewReader(spec))
 	if err != nil {
 		return nil, err

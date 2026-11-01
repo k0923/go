@@ -38,6 +38,7 @@ func (a LoadOrderAction) Run(ctx context.Context, id string) (Order, error) {
 
 // Flow holds executable steps; external clients belong to those Actions.
 type OrderFlow struct {
+	cflow.FlowBase[string, Order]
 	LoadOrder cflow.Action[string, Order]
 }
 
@@ -53,16 +54,16 @@ func (flow OrderFlow) Run(base *cflow.FlowContext, input string) (Order, error) 
 }
 
 func main() {
-	engine, err := cflow.NewEngine(memory.New(), cflow.Options{})
+	repository := &Repository{}
+	definition := OrderFlow{LoadOrder: LoadOrderAction{Repository: repository}}
+	engine, err := cflow.NewEngine(memory.New(), cflow.Options{
+		Flows: map[string]cflow.FlowDefinition{"order": definition},
+	})
 	if err != nil {
 		panic(err)
 	}
-	repository := &Repository{}
-	definition := cflow.NewWorkflow("order", "1", cflow.FlowFunc[string, Order](func(f *cflow.FlowContext, input string) (Order, error) {
-		return f.RunFlow("order", OrderFlow{LoadOrder: LoadOrderAction{Repository: repository}}, input)
-	}))
 	for i := 0; i < 2; i++ {
-		result, err := engine.Drive(context.Background(), definition, "order_123")
+		result, err := engine.Start(context.Background(), definition, "order_123")
 		if err != nil {
 			panic(err)
 		}

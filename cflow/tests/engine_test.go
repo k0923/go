@@ -13,19 +13,17 @@ import (
 	"github.com/k0923/go/cflow/memory"
 )
 
-func testEngine(t *testing.T, store Infrastructure, options Options) *Engine {
+func testEngine(t *testing.T, store Infrastructure, options Options) *testDriver {
 	t.Helper()
 	e, err := NewEngine(store, options)
 	if err != nil {
 		t.Fatal(err)
 	}
-	return e
+	return &testDriver{Engine: e, active: e, store: store, options: options, engines: make(map[fixtureKey]*Engine)}
 }
 
-func definition[I, O any](fn FlowFunc[I, O]) Workflow[I, O] {
-	// The root Flow adds no namespace, so keys carry no prefix.
-	// 根 Flow 不追加命名空间，因此 key 不带前缀。
-	return NewWorkflow("test", "1", Flow[I, O](fn))
+func definition[I, O any](fn Flow[I, O]) *flowFixture[I, O] {
+	return namedDefinition("test", fn)
 }
 
 func TestNewEngine(t *testing.T) {
@@ -65,7 +63,7 @@ func TestEngineDrive(t *testing.T) {
 		}))
 		ctx := context.WithValue(context.Background(), "trace", "parent")
 		for i := 0; i < 2; i++ {
-			result, err := e.Drive(ctx, flow, 3)
+			result, err := e.Start(ctx, flow, 3)
 			if err != nil || result.Status != Completed || result.Output != 6 {
 				t.Fatalf("%+v %v", result, err)
 			}
@@ -82,14 +80,14 @@ func TestEngineDrive(t *testing.T) {
 		if !found {
 			t.Fatal("replay not observed")
 		}
-		result, err := e.Drive(ctx, flow, 4)
+		result, err := e.Start(ctx, flow, 4)
 		if !errors.Is(err, ErrChanged) || result.Status != Failed {
 			t.Fatalf("input mismatch: %+v %v", result, err)
 		}
-		flow.Version = "2"
-		result, err = e.Drive(ctx, flow, 3)
+		flow.Name = "renamed"
+		result, err = e.Start(ctx, flow, 3)
 		if !errors.Is(err, ErrChanged) || result.Status != Failed {
-			t.Fatalf("version mismatch: %+v %v", result, err)
+			t.Fatalf("name mismatch: %+v %v", result, err)
 		}
 	})
 	t.Run("ordinary failure retries", func(t *testing.T) {
@@ -106,7 +104,7 @@ func TestEngineDrive(t *testing.T) {
 				return 9, nil
 			}), in)
 		}))
-		result, err := e.Drive(context.Background(), flow, 1)
+		result, err := e.Start(context.Background(), flow, 1)
 		if !errors.Is(err, transient) || result.Status != Running {
 			t.Fatalf("%+v %v", result, err)
 		}
@@ -114,7 +112,7 @@ func TestEngineDrive(t *testing.T) {
 		if r.Status != Running {
 			t.Fatalf("permanently failed: %+v", r)
 		}
-		result, err = e.Drive(context.Background(), flow, 1)
+		result, err = e.Start(context.Background(), flow, 1)
 		if err != nil || result.Output != 9 || calls != 2 {
 			t.Fatalf("%+v %v calls=%d", result, err, calls)
 		}
@@ -127,12 +125,12 @@ func TestEngineDrive(t *testing.T) {
 		flow := definition(FlowFunc[int, int](func(f *FlowContext, in int) (int, error) {
 			return f.Run("pay", AsAction(func(context.Context, int) (int, error) { calls++; return 0, Permanent(cause) }), in)
 		}))
-		result, err := e.Drive(context.Background(), flow, 1)
+		result, err := e.Start(context.Background(), flow, 1)
 		var business *ActionError
 		if result.Status != Failed || !errors.Is(err, cause) || !errors.As(err, &business) {
 			t.Fatalf("%+v %v", result, err)
 		}
-		result, err = e.Drive(context.Background(), flow, 1)
+		result, err = e.Start(context.Background(), flow, 1)
 		if result.Status != Failed || !errors.As(err, &business) || business.Message != "declined" || business.Cause != nil || calls != 1 {
 			t.Fatalf("%+v %v", result, err)
 		}
@@ -148,13 +146,13 @@ func TestEngineDrive(t *testing.T) {
 				return 7, nil
 			}), in)
 		}))
-		result, err := e.Drive(context.Background(), flow, 0)
+		result, err := e.Start(context.Background(), flow, 0)
 		var p *PanicError
 		if !errors.As(err, &p) || len(p.Stack) == 0 || result.Status != Running {
 			t.Fatalf("%+v %v", result, err)
 		}
 		broken = false
-		result, err = e.Drive(context.Background(), flow, 0)
+		result, err = e.Start(context.Background(), flow, 0)
 		if err != nil || result.Output != 7 {
 			t.Fatalf("%+v %v", result, err)
 		}
@@ -168,7 +166,7 @@ func TestEngineDrive(t *testing.T) {
 				return 1, nil
 			}), in, ActionOptions{Timeout: time.Millisecond})
 		}))
-		result, err := e.Drive(context.Background(), flow, 0)
+		result, err := e.Start(context.Background(), flow, 0)
 		if !errors.Is(err, context.DeadlineExceeded) || result.Status != Running {
 			t.Fatalf("%+v %v", result, err)
 		}
@@ -182,13 +180,13 @@ func TestEngineDrive(t *testing.T) {
 	})
 	t.Run("invalid definition and cancelled input", func(t *testing.T) {
 		e := testEngine(t, memory.New(), Options{})
-		_, err := e.Drive(context.Background(), Workflow[int, int]{}, 0)
+		_, err := e.Start(context.Background(), FlowFunc[int, int](nil), 0)
 		if !errors.Is(err, ErrInvalid) {
 			t.Fatal(err)
 		}
 		ctx, cancel := context.WithCancel(context.Background())
 		cancel()
-		_, err = e.Drive(ctx, definition(FlowFunc[int, int](func(*FlowContext, int) (int, error) { t.Fatal("executed"); return 0, nil })), 0)
+		_, err = e.Start(ctx, definition(FlowFunc[int, int](func(*FlowContext, int) (int, error) { t.Fatal("executed"); return 0, nil })), 0)
 		if !errors.Is(err, context.Canceled) {
 			t.Fatal(err)
 		}
@@ -207,7 +205,7 @@ func TestEngineDrive(t *testing.T) {
 			f.Run("charge", AsAction(func(context.Context, int) (int, error) { calls++; return 1, nil }), in)
 			return 123, nil
 		}))
-		result, err := e.Drive(context.Background(), flow, 0)
+		result, err := e.Start(context.Background(), flow, 0)
 		if err != nil || result.Status != Suspended || result.Output != 0 || len(result.Pending) != 1 || calls != 0 {
 			t.Fatalf("%+v %v calls=%d", result, err, calls)
 		}
@@ -224,7 +222,7 @@ func TestEngineDrive(t *testing.T) {
 			}()
 			return 1, nil
 		}))
-		result, err := e.Drive(context.Background(), flow, 0)
+		result, err := e.Start(context.Background(), flow, 0)
 		if result.Status != Failed || !errors.Is(err, ErrInvalid) {
 			t.Fatalf("%+v %v", result, err)
 		}
@@ -244,7 +242,7 @@ func TestEngineDrive(t *testing.T) {
 			return "paid", nil
 		}))
 		for i := 0; i < 2; i++ {
-			result, err := e.Drive(context.Background(), flow, 0)
+			result, err := e.Start(context.Background(), flow, 0)
 			if err != nil || result.Status != Completed || result.Output != "refunded" {
 				t.Fatalf("%+v %v", result, err)
 			}
@@ -257,7 +255,7 @@ func TestEngineDrive(t *testing.T) {
 		e := testEngine(t, memory.New(), Options{})
 		cause := errors.New("invalid order")
 		flow := definition(FlowFunc[int, int](func(*FlowContext, int) (int, error) { return 0, cause }))
-		result, err := e.Drive(context.Background(), flow, 0)
+		result, err := e.Start(context.Background(), flow, 0)
 		if result.Status != Failed || !errors.Is(err, cause) {
 			t.Fatalf("%+v %v", result, err)
 		}
@@ -265,7 +263,7 @@ func TestEngineDrive(t *testing.T) {
 	t.Run("orchestration panic is terminal", func(t *testing.T) {
 		e := testEngine(t, memory.New(), Options{})
 		flow := definition(FlowFunc[int, int](func(*FlowContext, int) (int, error) { panic("bug") }))
-		result, err := e.Drive(context.Background(), flow, 0)
+		result, err := e.Start(context.Background(), flow, 0)
 		var p *PanicError
 		if result.Status != Failed || !errors.As(err, &p) || len(p.Stack) == 0 {
 			t.Fatalf("%+v %v", result, err)
@@ -286,7 +284,7 @@ func TestEngineDrive(t *testing.T) {
 			return "ok", nil
 		}))
 		for i := 0; i < 2; i++ {
-			result, err := e.Drive(context.Background(), flow, 0)
+			result, err := e.Start(context.Background(), flow, 0)
 			if err != nil || result.Output != "fallback" || calls != 3 {
 				t.Fatalf("%+v %v calls=%d", result, err, calls)
 			}
@@ -307,7 +305,7 @@ func TestEngineDrive(t *testing.T) {
 				return 7, nil
 			}), in, ActionOptions{Retry: RetryPolicy{MaxAttempts: 5, InitialInterval: time.Microsecond}})
 		}))
-		result, err := e.Drive(context.Background(), flow, 0)
+		result, err := e.Start(context.Background(), flow, 0)
 		if err != nil || result.Output != 7 || calls != 3 {
 			t.Fatalf("%+v %v calls=%d", result, err, calls)
 		}
@@ -315,7 +313,7 @@ func TestEngineDrive(t *testing.T) {
 	t.Run("listener panic isolated", func(t *testing.T) {
 		e := testEngine(t, memory.New(), Options{})
 		defer e.Subscribe(func(context.Context, Event) { panic("metrics") })()
-		result, err := e.Drive(context.Background(), definition(FlowFunc[int, int](func(f *FlowContext, in int) (int, error) {
+		result, err := e.Start(context.Background(), definition(FlowFunc[int, int](func(f *FlowContext, in int) (int, error) {
 			return f.Run("pure", Pure(func(n int) int { return n + 1 }), in)
 		})), 4)
 		if err != nil || result.Output != 5 {
@@ -332,7 +330,7 @@ func TestFlowContextRun(t *testing.T) {
 				f.Run("one", Pure(func(n int) int { return n }), in)
 				return f.Run(key, Pure(func(n int) int { return n }), in)
 			}))
-			result, err := e.Drive(context.Background(), flow, 0)
+			result, err := e.Start(context.Background(), flow, 0)
 			if !errors.Is(err, ErrInvalid) || result.Status != Failed {
 				t.Fatalf("key=%q: %+v %v", key, result, err)
 			}
@@ -353,9 +351,9 @@ func TestFlowContextRun(t *testing.T) {
 			}), in)
 		}))
 		first := make(chan error, 1)
-		go func() { _, err := e.Drive(context.Background(), flow, 0); first <- err }()
+		go func() { _, err := e.Start(context.Background(), flow, 0); first <- err }()
 		<-started
-		_, err := e.Drive(context.Background(), flow, 0)
+		_, err := e.Start(context.Background(), flow, 0)
 		if !errors.Is(err, ErrConflict) {
 			t.Fatalf("second: %v", err)
 		}
@@ -375,11 +373,11 @@ func TestFlowContextRun(t *testing.T) {
 		flow := definition(FlowFunc[int, int](func(f *FlowContext, _ int) (int, error) {
 			return f.Run("step", Pure(func(n int) int { calls++; return n }), input)
 		}))
-		if _, err := e.Drive(context.Background(), flow, 0); err != nil {
+		if _, err := e.Start(context.Background(), flow, 0); err != nil {
 			t.Fatal(err)
 		}
 		input = 2
-		result, err := e.Drive(context.Background(), flow, 0)
+		result, err := e.Start(context.Background(), flow, 0)
 		if err != nil || result.Status != Completed || result.Output != 1 || calls != 1 {
 			t.Fatalf("%+v %v calls=%d", result, err, calls)
 		}
@@ -393,7 +391,7 @@ func TestFlowContextRun(t *testing.T) {
 		e.Subscribe(func(_ context.Context, event Event) { events = append(events, event) }, TypeChanged)
 		type v1 struct{ N int }
 		type v2 struct{ N int } // renamed type, same JSON shape
-		if _, err := e.Drive(context.Background(), definition(FlowFunc[int, int](func(f *FlowContext, _ int) (int, error) {
+		if _, err := e.Start(context.Background(), definition(FlowFunc[int, int](func(f *FlowContext, _ int) (int, error) {
 			out, err := f.Run("step", Pure(func(n int) v1 { return v1{n} }), 1)
 			return out.N, err
 		})), 0); err != nil {
@@ -401,7 +399,7 @@ func TestFlowContextRun(t *testing.T) {
 		}
 		// Same key, renamed output type: replayed, not rejected.
 		// key 相同、输出类型改名：照常回放，不拒绝。
-		result, err := e.Drive(context.Background(), definition(FlowFunc[int, int](func(f *FlowContext, _ int) (int, error) {
+		result, err := e.Start(context.Background(), definition(FlowFunc[int, int](func(f *FlowContext, _ int) (int, error) {
 			out, err := f.Run("step", Pure(func(n int) v2 { t.Fatal("re-executed"); return v2{} }), 1)
 			return out.N, err
 		})), 0)
@@ -414,7 +412,7 @@ func TestFlowContextRun(t *testing.T) {
 		}
 		// An incompatible shape still fails to decode, deterministically.
 		// 结构不兼容时解码仍会确定地失败。
-		result, err = e.Drive(context.Background(), definition(FlowFunc[int, int](func(f *FlowContext, _ int) (int, error) {
+		result, err = e.Start(context.Background(), definition(FlowFunc[int, int](func(f *FlowContext, _ int) (int, error) {
 			out, err := f.Run("step", Pure(func(n int) string { return "x" }), 1)
 			return len(out), err
 		})), 0)
@@ -424,12 +422,12 @@ func TestFlowContextRun(t *testing.T) {
 	})
 	t.Run("kind change rejected", func(t *testing.T) {
 		e := testEngine(t, memory.New(), Options{})
-		if _, err := e.Drive(context.Background(), definition(FlowFunc[int, int](func(f *FlowContext, _ int) (int, error) {
+		if _, err := e.Start(context.Background(), definition(FlowFunc[int, int](func(f *FlowContext, _ int) (int, error) {
 			return f.Run("step", Pure(func(n int) int { return n }), 1)
 		})), 0); err != nil {
 			t.Fatal(err)
 		}
-		result, err := e.Drive(context.Background(), definition(FlowFunc[int, int](func(f *FlowContext, _ int) (int, error) {
+		result, err := e.Start(context.Background(), definition(FlowFunc[int, int](func(f *FlowContext, _ int) (int, error) {
 			return f.WaitFor[int]("step", 1), nil
 		})), 0)
 		if !errors.Is(err, ErrChanged) || result.Status != Failed {
@@ -443,15 +441,16 @@ func TestRootRunFlow(t *testing.T) {
 	leaf := FlowFunc[int, string](func(f *FlowContext, in int) (string, error) {
 		return f.Run("action", AsAction(func(ctx context.Context, _ int) (string, error) { return ActionKey(ctx), nil }), in)
 	})
-	flow := NewWorkflow("test", "1", FlowFunc[int, string](func(f *FlowContext, in int) (string, error) { return f.RunFlow("leaf", leaf, in) }))
-	result, err := e.Drive(context.Background(), flow, 1)
+	flow := namedDefinition("test", FlowFunc[int, string](func(f *FlowContext, in int) (string, error) { return f.RunFlow("leaf", leaf, in) }))
+	flow.Bindings = map[string]FlowDefinition{"leaf": leaf}
+	result, err := e.Start(context.Background(), flow, 1)
 	if err != nil || result.Output != "leaf|action" {
 		t.Fatalf("%+v %v", result, err)
 	}
 	// A nil root, including a typed nil FlowFunc, is rejected before running.
 	// nil 根（包括带类型的 nil FlowFunc）会在执行前被拒绝。
 	for _, root := range []Flow[int, string]{nil, FlowFunc[int, string](nil)} {
-		if result, err := e.Drive(context.Background(), NewWorkflow("test", "1", root), 1); !errors.Is(err, ErrInvalid) || result.Status == Completed {
+		if result, err := e.Start(context.Background(), root, 1); !errors.Is(err, ErrInvalid) || result.Status == Completed {
 			t.Fatalf("%+v %v", result, err)
 		}
 	}

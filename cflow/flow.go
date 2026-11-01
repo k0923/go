@@ -11,56 +11,68 @@ import (
 	"github.com/google/uuid"
 )
 
-// RunFlow mounts a Flow under name[input.StepKey()] (or name) on the current
-// strand. It creates a namespace, not another lease or workflow state.
-// Returning includes joining the Flow's async Actions. err is whatever the
-// Flow returned; a waiting Flow halts the caller instead of returning.
-// Nesting deeper than Options.MaxFlowDepth fails the drive with ErrInvalid.
-// RunFlow 在当前 strand 上把 Flow 挂载到 name[input.StepKey()]（或 name）之下。它创建的是
-// 命名空间，而不是另一个租约或工作流状态。返回前会汇合该 Flow 的异步 Action。err 即 Flow
-// 返回的错误；处于等待中的 Flow 会停止调用方，而不是返回。嵌套超过 Options.MaxFlowDepth
-// 时 drive 以 ErrInvalid 失败。
+// RunFlow starts or joins an independently persisted registered Flow at
+// name[input.StepKey()] (or name). An empty name uses the registered type name.
+// While the child runs, the caller suspends; Resume(key) resumes only the child.
+// RunFlow 在 name[input.StepKey()]（或 name）启动或汇合独立持久化的已注册 Flow。
+// name 为空时使用注册类型名；子级运行期间父级挂起，Resume(key) 只恢复子级。
 func (f *FlowContext) RunFlow[I, O any](name string, flow Flow[I, O], input I) (O, error) {
+	if name == "" {
+		var err error
+		name, err = f.execution.engine.flowName(flow)
+		f.must(err)
+	}
 	path, _ := f.claimInput(name, input)
 	if invalidFlow(flow) {
 		f.abort(fatal(ErrInvalid))
 	}
-	return f.runChildFlow(path, flow, input)
+	return f.callFlow(path, flow, input)
 }
 
-// runChildFlow runs a Flow on the CURRENT strand and joins its async tasks.
-// The workflow root (path == nil) adds no namespace and depth.
-// runChildFlow 在当前 strand 上运行 Flow，并汇合其异步任务。
-// 工作流根（path == nil）不追加命名空间，也不增加深度。
-func (f *FlowContext) runChildFlow[I, O any](path Path, flow Flow[I, O], input I) (output O, err error) {
-	depth := f.depth
-	if path != nil {
-		depth++
+// callFlow joins a registered, durable child. A terminal child preloaded with
+// the parent's boundary is replayed directly from its own execution, without
+// StartFlow; its identity is still checked against the current call.
+// callFlow 汇合已注册的持久子级。随父级预加载的终态子级直接从其自身执行回放，不调用 StartFlow；
+// 仍按当前调用校验其身份。
+func (f *FlowContext) callFlow[I, O any](path Path, flow Flow[I, O], input I) (output O, err error) {
+	e := f.execution.engine
+	if f.depth+1 > e.options.MaxFlowDepth {
+		f.fail(fmt.Errorf("%w: flow %s exceeds MaxFlowDepth", ErrInvalid, path))
 	}
-	if depth > f.execution.engine.options.MaxFlowDepth {
-		f.abort(fatal(fmt.Errorf("%w: flow %s exceeds MaxFlowDepth %d", ErrInvalid, path, f.execution.engine.options.MaxFlowDepth)))
+	name, err := e.flowName(flow)
+	f.must(err)
+	api, ok := e.store.(FlowInfrastructure)
+	if !ok {
+		f.must(ErrFlowUnsupported)
 	}
-	scope := &flowScope{}
-	child := &FlowContext{execution: f.execution, path: path, depth: depth, scope: scope, strand: f.strand}
-	if path == nil {
-		child.path = f.path
+	raw, err := json.Marshal(input)
+	f.must(fatal(err))
+	event, _ := f.Context().Value(eventContextKey{}).(eventContext)
+	spec := FlowExecution{Key: e.buildKey(path), Path: path, ParentKey: f.execution.flowKey,
+		Workflow: event.name, FlowName: name, Depth: f.depth + 1, Input: raw}
+	item := f.execution.flows[spec.Key]
+	if item == nil {
+		item, err = api.StartFlow(f.Context(), spec)
+		f.must(err)
 	}
-	defer func() {
-		// Join descendants even while unwinding, so Drive never returns early.
-		// 即使在展开过程中也要汇合后代，确保 Drive 不会提前返回。
-		scope.wg.Wait()
-		f.execution.mu.Lock()
-		scope.closed = true
-		f.execution.mu.Unlock()
-	}()
-	output, err = flow.Run(child, input)
-	scope.wg.Wait()
-	if f.execution.ctx.Err() != nil {
-		// A joined task aborted the drive; do not hand partial results onward.
-		// 已汇合的任务中止了 drive；不要把部分结果继续向后传递。
-		f.halt()
+	if item == nil || !SameFlow(spec, *item) {
+		f.fail(ErrChanged)
 	}
-	return output, err
+	switch item.Status {
+	case Completed:
+		f.must(decode(item.Output, &output))
+		return output, nil
+	case Failed:
+		if item.Failure == nil || item.Failure.Fatal {
+			f.fail(fmt.Errorf("%s: %w", item.Key, item.Failure.Err()))
+		}
+		return output, item.Failure.Err()
+	case Running:
+		f.suspend(Pending{Key: item.Key, Path: path, ExecutionKey: spec.ParentKey, Kind: FlowKind})
+	default:
+		f.fail(ErrInvalid)
+	}
+	panic("unreachable")
 }
 
 // WaitFor registers a durable request in the Flow, outside any Action lease.
@@ -79,7 +91,7 @@ func (f *FlowContext) WaitFor[Response, Request any](name string, request Reques
 	record := f.execution.records[resolved]
 	if record == nil {
 		if record, err = e.store.Put(f.Context(), &Record{
-			Key: resolved, Path: path, Kind: SignalKind, Status: Suspended, Type: typ, Input: raw, StartedAt: e.options.Now(),
+			Key: resolved, Path: path, ExecutionKey: f.execution.flowKey, Kind: SignalKind, Status: Suspended, Type: typ, Input: raw, StartedAt: e.options.Now(),
 		}); err != nil {
 			f.must(&OperationError{resolved, "Put", err})
 		}
@@ -98,7 +110,7 @@ func (f *FlowContext) WaitFor[Response, Request any](name string, request Reques
 	if record.Status != Suspended {
 		f.must(ErrInvalid)
 	}
-	pending := Pending{Key: resolved, Path: path, Kind: SignalKind}
+	pending := Pending{Key: resolved, Path: path, ExecutionKey: f.execution.flowKey, Kind: SignalKind}
 	e.emit(f.Context(), Event{
 		Type: WaitSuspended, Key: resolved, Path: path, Kind: SignalKind, Status: Suspended, StepType: typ,
 		StartedAt: record.StartedAt, RecordVersion: record.Version, Pending: []Pending{pending},
@@ -111,9 +123,9 @@ func (f *FlowContext) WaitFor[Response, Request any](name string, request Reques
 // Sleep 持久地等待 duration；截止时间在首次注册时固定。
 // A Sleep has no input to derive an identity from: its name is fixed and its
 // uniqueness comes from the enclosing namespace (a Scope, a keyed Flow, a
-// WaitAny group, or Loop's own sleep_N).
+// WaitAny group, or Poll's own sleep_N).
 // Sleep 没有可推导身份的输入：名字固定，唯一性来自外层命名空间
-// （Scope、带 key 的 Flow、WaitAny 组，或 Loop 自带的 sleep_N）。
+// （Scope、带 key 的 Flow、WaitAny 组，或 Poll 自带的 sleep_N）。
 func (f *FlowContext) Sleep(name string, duration time.Duration) {
 	path, key := f.claim(name, "")
 	f.sleep(path, key, f.execution.engine.options.Now().Add(duration))
@@ -130,12 +142,12 @@ func (f *FlowContext) sleep(path Path, key string, until time.Time) {
 	if record == nil {
 		var err error
 		if record, err = e.store.Put(f.Context(), &Record{
-			Key: key, Path: path, Kind: SleepKind, Status: Suspended, Type: "sleep", Until: until, StartedAt: e.options.Now(),
+			Key: key, Path: path, ExecutionKey: f.execution.flowKey, Kind: SleepKind, Status: Suspended, Type: "sleep", Until: until, StartedAt: e.options.Now(),
 		}); err != nil {
 			f.must(&OperationError{key, "Put", err})
 		}
 	}
-	if !sameStep(record, SleepKind, path) {
+	if !sameStep(record, SleepKind, path) || record.ExecutionKey != f.execution.flowKey {
 		f.must(ErrChanged)
 	}
 	if record.Status == Completed {
@@ -156,7 +168,7 @@ func (f *FlowContext) sleep(path Path, key string, until time.Time) {
 		}
 		return
 	}
-	pending := Pending{Key: key, Path: path, Kind: SleepKind, Until: record.Until}
+	pending := Pending{Key: key, Path: path, ExecutionKey: f.execution.flowKey, Kind: SleepKind, Until: record.Until}
 	e.emit(f.Context(), Event{
 		Type: WaitSuspended, Key: key, Path: path, Kind: SleepKind, Status: Suspended, StepType: "sleep",
 		StartedAt: record.StartedAt, RecordVersion: record.Version, Pending: []Pending{pending},
@@ -180,7 +192,7 @@ func (f *FlowContext) checkpoint[T any](name, primitive string, generate func() 
 		raw, marshalErr := json.Marshal(generate())
 		f.must(fatal(marshalErr))
 		record, err = e.store.Put(f.Context(), &Record{
-			Key: resolved, Path: path, Kind: CheckpointKind, Status: Completed, Type: typ, Input: tag, Result: raw,
+			Key: resolved, Path: path, ExecutionKey: f.execution.flowKey, Kind: CheckpointKind, Status: Completed, Type: typ, Input: tag, Result: raw,
 			StartedAt: e.options.Now(), EndedAt: e.options.Now(),
 		})
 		if err != nil {
@@ -210,33 +222,34 @@ func (f *FlowContext) UUID(name string) string {
 	return f.checkpoint(name, "uuid", uuid.NewString)
 }
 
-type LoopOptions struct {
+type PollOptions struct {
 	Interval    time.Duration
 	MaxAttempts int
 	Action      ActionOptions
 }
 
-type LoopOutput interface{ Done() bool }
+type PollOutput interface{ Done() bool }
 
-// Loop records EACH attempt as an Action, so a crash after an attempt cannot
+// Poll runs action until its output is Done. It records EACH attempt as an
+// Action, so a crash after an attempt cannot
 // repeat a completed attempt. Its interval is a separate durable sleep.
-// err is nil, an attempt's *ActionError, or ErrLoopExhausted (wrapped).
-// Loop 将每一次 attempt 都记录为一个 Action，因此 attempt 之后崩溃不会重复
+// err is nil, an attempt's *ActionError, or ErrPollExhausted (wrapped).
+// Poll 反复执行 action 直到输出 Done。每一次 attempt 都记录为一个 Action，因此 attempt 之后崩溃不会重复
 // 已完成的 attempt。它的间隔是一个独立的持久化 sleep。
-// err 只会是 nil、某次 attempt 的 *ActionError，或包装后的 ErrLoopExhausted。
-func (f *FlowContext) Loop[I any, O LoopOutput](name string, action Action[I, O], input I, options LoopOptions) (output O, err error) {
+// err 只会是 nil、某次 attempt 的 *ActionError，或包装后的 ErrPollExhausted。
+func (f *FlowContext) Poll[I any, O PollOutput](name string, action Action[I, O], input I, options PollOptions) (output O, err error) {
 	path, resolved := f.claimInput(name, input)
 	if options.Interval <= 0 || options.MaxAttempts <= 0 {
 		f.must(ErrInvalid)
 	}
-	child := &FlowContext{execution: f.execution, path: path, depth: f.depth, scope: f.scope, strand: f.strand}
+	child := &FlowContext{execution: f.execution, path: path, depth: f.depth, strand: f.strand}
 	for attempt := 0; attempt < options.MaxAttempts; attempt++ {
 		if attempt > 0 {
 			child.Sleep(fmt.Sprintf("sleep_%d", attempt), options.Interval)
 		}
 		// Attempts are keyed by their own name, not by input.StepKey(): the
 		// loop namespace already carries it.
-		// 每次尝试按自身名字寻址，而不是 input.StepKey()：Loop 命名空间已带上它。
+		// 每次尝试按自身名字寻址，而不是 input.StepKey()：Poll 命名空间已带上它。
 		attemptPath, attemptKey := child.claim(fmt.Sprintf("attempt_%d", attempt), "")
 		var business *ActionError
 		var runErr error
@@ -251,7 +264,7 @@ func (f *FlowContext) Loop[I any, O LoopOutput](name string, action Action[I, O]
 			return output, nil
 		}
 	}
-	return output, fmt.Errorf("%w: %s after %d attempts", ErrLoopExhausted, resolved, options.MaxAttempts)
+	return output, fmt.Errorf("%w: %s after %d attempts", ErrPollExhausted, resolved, options.MaxAttempts)
 }
 
 // ResolveSignal atomically persists a typed callback and a durable Wake.

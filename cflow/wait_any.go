@@ -11,7 +11,7 @@ import (
 	"time"
 )
 
-// Case is one WaitAny candidate built with OnSignal, OnKind, OnSleep or
+// Case is one WaitAny candidate built with OnSignal, OnSleep or
 // OnSleepUntil. Every case carries its OWN response type. WaitAny returns the
 // winning Case itself, so compare it with the cases you passed:
 //
@@ -25,7 +25,7 @@ import (
 //	}
 //
 // A Case is single-use: build it inside the Flow for every WaitAny call.
-// Case 是 WaitAny 的一个候选项，由 OnSignal、OnKind、OnSleep 或 OnSleepUntil 构造。
+// Case 是 WaitAny 的一个候选项，由 OnSignal、OnSleep 或 OnSleepUntil 构造。
 // 每个候选项都有自己的响应类型。WaitAny 返回获胜的 Case 本身，因此直接与传入的
 // 候选项比较即可（见上例）。
 //
@@ -82,21 +82,8 @@ func (c *SignalCase[Response]) Value() Response { return c.value }
 // OnSignal 描述一个 WaitFor 候选项。Response 需显式指定，Request 自动推断：
 // OnSignal[Approval]("approval", order)。请求实现 StepKeyer 时成员地址为 name[request.StepKey()]。
 func OnSignal[Response, Request any](key string, request Request) *SignalCase[Response] {
-	return OnKind[Response](SignalKind, key, request)
-}
-
-// OnKind describes a payload-bearing candidate of a custom kind. The
-// Infrastructure must support its registration and resolution; the reference
-// memory store rejects unknown kinds with ErrSignalUnsupported instead of
-// silently treating them as WaitFor.
-// OnKind 描述一个自定义 Kind 的携带负载候选项。Infrastructure 必须支持其注册与解析；
-// 参考内存存储会以 ErrSignalUnsupported 拒绝未知 Kind，而不会静默当作 WaitFor。
-func OnKind[Response, Request any](kind Kind, key string, request Request) *SignalCase[Response] {
-	if kind == "" {
-		kind = SignalKind
-	}
 	c := &SignalCase[Response]{}
-	c.key, c.kind, c.typ = key, kind, signature[Request, Response]("signal")
+	c.key, c.kind, c.typ = key, SignalKind, signature[Request, Response]("signal")
 	c.id, c.idErr = stepID(request)
 	c.encode = func() (json.RawMessage, error) { return json.Marshal(request) }
 	c.decode = func(raw json.RawMessage) error { return decode(raw, &c.value) }
@@ -134,8 +121,9 @@ type WaitFailure struct {
 // WaitRequest 是存储适配器消费的传输层表示。成员的回放身份为 Key + Kind（+ Path）：
 // Request、Duration、Until、Type 及编码是否失败都是以首次注册为准的输入。
 type WaitRequest struct {
-	Key  string
-	Path Path `json:",omitempty"`
+	ExecutionKey string `json:",omitempty"`
+	Key          string
+	Path         Path `json:",omitempty"`
 	// Type is the member's leaf signature, kept for observation only.
 	// Type 是成员的叶子签名，仅用于观测。
 	Type     string `json:",omitempty"`
@@ -146,14 +134,6 @@ type WaitRequest struct {
 	// Error isolates an unusable request while preserving its ordered identity.
 	// Error 隔离不可用请求，同时保留其有序身份。
 	Error string `json:",omitempty"`
-}
-
-// SameWaitMember reports whether a re-submitted member matches the stored
-// one. Storage adapters use it for every member, in order.
-// SameWaitMember 判断重新提交的成员是否与已存储成员匹配。存储适配器按顺序对每个成员使用它。
-func SameWaitMember(stored, request WaitRequest) bool {
-	return request.Key == stored.Key && request.Kind == stored.Kind &&
-		(stored.Path == nil || stored.Path.Equal(request.Path))
 }
 
 // sameJSON treats an absent payload and JSON null as equal, because a nil
@@ -214,7 +194,7 @@ var ErrWaitAnyUnsupported = errors.New("infrastructure does not support WaitAny"
 var ErrSignalUnsupported = errors.New("signal kind unsupported")
 
 // WaitAny registers all candidates simultaneously. Until one completes it
-// halts the calling orchestration; Engine.Drive reports ALL pending keys. The
+// halts the calling orchestration; Start/Resume reports ALL pending keys. The
 // first accepted callback cancels losers immediately in storage. On the next
 // Drive the workflow resumes and WaitAny returns the durable winner: one of
 // the cases passed in, with its Value decoded (timers carry no value).
@@ -226,7 +206,7 @@ var ErrSignalUnsupported = errors.New("signal kind unsupported")
 // provider answer with a typed failure value, or add a timer candidate.
 // Invalid key topology and reused cases are rejected before registration.
 // WaitAny 会同时注册所有候选项。在某个候选项完成前，它会停止调用方编排；
-// Engine.Drive 会报告所有 pending key。第一个被接受的回调会立即在存储中取消失败方。
+// Start/Resume 会报告所有 pending key。第一个被接受的回调会立即在存储中取消失败方。
 // 下一次 Drive 时工作流恢复，WaitAny 返回持久化的赢家：即传入的某个 Case，
 // 其 Value 已解码（计时器不携带值）。
 //
@@ -238,8 +218,8 @@ var ErrSignalUnsupported = errors.New("signal kind unsupported")
 // WaitAny runs in a loop: f.Scope("call", call.ID).WaitAny("approve", ...).
 // 组名固定；同一个 WaitAny 在循环中运行时，用 Scope 赋予身份：
 // f.Scope("call", call.ID).WaitAny("approve", ...)。
-func (f *FlowContext) WaitAny(key string, cases ...Case) Case {
-	groupPath, group := f.claim(key, "")
+func (f *FlowContext) WaitAny(name string, cases ...Case) Case {
+	groupPath, group := f.claim(name, "")
 	api, ok := f.execution.engine.store.(WaitAnyInfrastructure)
 	if !ok {
 		f.must(ErrWaitAnyUnsupported)
@@ -263,7 +243,7 @@ func (f *FlowContext) WaitAny(key string, cases ...Case) Case {
 	}
 	// Validate every key before any external registration.
 	// 在任何外部注册发生前验证每个 key。
-	child := &FlowContext{execution: f.execution, path: groupPath, depth: f.depth, scope: f.scope, strand: f.strand}
+	child := &FlowContext{execution: f.execution, path: groupPath, depth: f.depth, strand: f.strand}
 	index := make(map[string]int, len(members))
 	for i, member := range members {
 		if member.idErr != nil {
@@ -274,7 +254,7 @@ func (f *FlowContext) WaitAny(key string, cases ...Case) Case {
 	}
 	requests := make([]WaitRequest, len(members))
 	for i, member := range members {
-		request := WaitRequest{Key: member.key, Path: member.path, Type: member.typ, Kind: member.kind,
+		request := WaitRequest{Key: member.key, Path: member.path, ExecutionKey: f.execution.flowKey, Type: member.typ, Kind: member.kind,
 			Duration: member.duration, Until: member.until}
 		if member.encode != nil {
 			raw, marshalErr := invoke(member.encode)

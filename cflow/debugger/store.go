@@ -20,7 +20,6 @@ const schema = `
 CREATE TABLE IF NOT EXISTS runs (
 	id TEXT PRIMARY KEY,
 	workflow TEXT NOT NULL DEFAULT '',
-	version TEXT NOT NULL DEFAULT '',
 	input BLOB,
 	output BLOB,
 	status TEXT NOT NULL DEFAULT 'CREATED',
@@ -91,6 +90,30 @@ CREATE TABLE IF NOT EXISTS events (
 );
 CREATE INDEX IF NOT EXISTS events_run ON events (run_id, id);
 CREATE INDEX IF NOT EXISTS messages_due ON messages (run_id, state, available_at);
+CREATE TABLE IF NOT EXISTS loops (
+	run_id TEXT NOT NULL, key TEXT NOT NULL, parent_key TEXT NOT NULL, data BLOB NOT NULL,
+	PRIMARY KEY (run_id, key)
+);
+CREATE TABLE IF NOT EXISTS flow_executions (
+	run_id TEXT NOT NULL, key TEXT NOT NULL, loop_key TEXT NOT NULL, parent_key TEXT NOT NULL,
+	item_index INTEGER NOT NULL, data BLOB NOT NULL,
+	PRIMARY KEY (run_id, key),
+	UNIQUE (run_id, loop_key, item_index)
+);
+CREATE TABLE IF NOT EXISTS execution_owners (
+	run_id TEXT NOT NULL, key TEXT NOT NULL, execution_key TEXT NOT NULL,
+	PRIMARY KEY (run_id, key)
+);
+`
+
+// boundaryIndexes let LoadExecution read one execution boundary without
+// scanning the run: records by owner, standalone children and loops by parent.
+// boundaryIndexes 让 LoadExecution 只读取一个执行边界而不扫描整个运行：
+// 记录按所属执行单元，独立子级和循环按父级。
+const boundaryIndexes = `
+CREATE INDEX IF NOT EXISTS execution_owners_owner ON execution_owners (run_id, execution_key, key);
+CREATE INDEX IF NOT EXISTS flow_executions_parent ON flow_executions (run_id, parent_key) WHERE key = loop_key;
+CREATE INDEX IF NOT EXISTS loops_parent ON loops (run_id, parent_key);
 `
 
 // Message delivery states. REMOVED means storage withdrew it (a resolved or
@@ -135,12 +158,18 @@ func OpenStore(path string) (*Store, error) {
 		db.Close()
 		return nil, err
 	}
-	// The schema is pre-release: an older database without the path column is
-	// not migrated. Delete it (or pass a new -db) to start fresh.
-	// schema 尚未发布：缺少 path 列的旧数据库不做迁移，删除它（或换一个 -db）重新开始。
-	var hasPath int
-	if err = db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('records') WHERE name = 'path'`).Scan(&hasPath); err == nil && hasPath == 0 {
-		err = fmt.Errorf("debugger database %s predates Record.Path; delete it to start fresh", path)
+	// The schema is pre-release: an older database without the path or
+	// parent_key columns is not migrated. Delete it (or pass a new -db).
+	// schema 尚未发布：缺少 path 或 parent_key 列的旧数据库不做迁移，删除它（或换一个 -db）重新开始。
+	var missing int
+	if err = db.QueryRow(`SELECT
+		(SELECT COUNT(*) = 0 FROM pragma_table_info('records') WHERE name = 'path') +
+		(SELECT COUNT(*) = 0 FROM pragma_table_info('loops') WHERE name = 'parent_key') +
+		(SELECT COUNT(*) = 0 FROM pragma_table_info('flow_executions') WHERE name = 'parent_key')`).Scan(&missing); err == nil && missing > 0 {
+		err = fmt.Errorf("debugger database %s predates the current schema; delete it to start fresh", path)
+	}
+	if err == nil {
+		_, err = db.Exec(boundaryIndexes)
 	}
 	if err != nil {
 		db.Close()
@@ -276,9 +305,10 @@ func (t *txn) record(key string) (*cflow.Record, string, error) {
 	var r cflow.Record
 	var group string
 	var until, started, ended int64
-	err := t.tx.QueryRow(`SELECT key, path, kind, status, version, type_path, input, result, error, until, started_at, ended_at, group_key
+	err := t.tx.QueryRow(`SELECT key, path, kind, status, version, type_path, input, result, error, until, started_at, ended_at, group_key,
+		COALESCE((SELECT execution_key FROM execution_owners o WHERE o.run_id=records.run_id AND o.key=records.key),'')
 		FROM records WHERE run_id = ? AND key = ?`, t.run, key).
-		Scan(&r.Key, pathColumn{&r.Path}, &r.Kind, &r.Status, &r.Version, &r.Type, blob{&r.Input}, blob{&r.Result}, &r.Error, &until, &started, &ended, &group)
+		Scan(&r.Key, pathColumn{&r.Path}, &r.Kind, &r.Status, &r.Version, &r.Type, blob{&r.Input}, blob{&r.Result}, &r.Error, &until, &started, &ended, &group, &r.ExecutionKey)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, "", nil
 	}
@@ -291,6 +321,14 @@ func (t *txn) record(key string) (*cflow.Record, string, error) {
 }
 
 func (t *txn) saveRecord(r *cflow.Record, group string) error {
+	if exists, err := t.executionKeyExists(r.Key); err != nil {
+		return err
+	} else if exists {
+		return cflow.ErrChanged
+	}
+	if err := t.saveOwner(r.Key, r.ExecutionKey); err != nil {
+		return err
+	}
 	_, err := t.exec(`INSERT OR REPLACE INTO records
 		(run_id, key, path, kind, status, version, type_path, input, result, error, until, started_at, ended_at, updated_at, group_key)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
@@ -431,8 +469,102 @@ func (s *Store) Get(ctx context.Context, run, key string) (record *cflow.Record,
 	return record, err
 }
 
+// LoadExecution returns one boundary's records, standalone children and loops;
+// terminal loops carry their outputs. Every query is driven by an owner index,
+// so the cost depends on this boundary only, not on the size of the run.
+// LoadExecution 返回某个执行边界的记录、独立子级和循环；终态循环带输出。
+// 每条查询都走所属执行单元索引，成本只取决于本边界，与整个运行的规模无关。
+func (s *Store) LoadExecution(ctx context.Context, run, owner string) (snapshot *cflow.ExecutionSnapshot, err error) {
+	err = s.tx(ctx, run, func(t *txn) error {
+		snapshot = &cflow.ExecutionSnapshot{}
+		rows, err := t.tx.Query(`SELECT r.key, r.path, r.kind, r.status, r.version, r.type_path, r.input, r.result,
+				r.error, r.until, r.started_at, r.ended_at
+			FROM execution_owners o JOIN records r ON r.run_id = o.run_id AND r.key = o.key
+			WHERE o.run_id = ? AND o.execution_key = ? AND r.kind != ?`, t.run, owner, cflow.DefinitionKind)
+		if err != nil {
+			return err
+		}
+		for rows.Next() {
+			r := &cflow.Record{ExecutionKey: owner}
+			var until, started, ended int64
+			if err = rows.Scan(&r.Key, pathColumn{&r.Path}, &r.Kind, &r.Status, &r.Version, &r.Type, blob{&r.Input}, blob{&r.Result},
+				&r.Error, &until, &started, &ended); err != nil {
+				rows.Close()
+				return err
+			}
+			r.Input, r.Result = clone(r.Input), clone(r.Result)
+			r.Until, r.StartedAt, r.EndedAt = tm(until), tm(started), tm(ended)
+			snapshot.Records = append(snapshot.Records, r)
+		}
+		rows.Close()
+		if err = rows.Err(); err != nil {
+			return err
+		}
+		err = t.scanJSON(`SELECT data FROM flow_executions WHERE run_id = ? AND parent_key = ? AND key = loop_key`,
+			[]any{t.run, owner}, func(raw []byte) error {
+				item := &cflow.FlowExecution{}
+				if err := json.Unmarshal(raw, item); err != nil {
+					return err
+				}
+				snapshot.Flows = append(snapshot.Flows, item)
+				return nil
+			})
+		if err != nil {
+			return err
+		}
+		err = t.scanJSON(`SELECT data FROM loops WHERE run_id = ? AND parent_key = ?`, []any{t.run, owner}, func(raw []byte) error {
+			loop := &cflow.LoopSnapshot{}
+			if err := json.Unmarshal(raw, &loop.LoopState); err != nil {
+				return err
+			}
+			snapshot.Loops = append(snapshot.Loops, loop)
+			return nil
+		})
+		if err != nil {
+			return err
+		}
+		for _, loop := range snapshot.Loops {
+			if loop.Status == cflow.Completed || loop.Status == cflow.Failed {
+				if loop.Outputs, err = t.loopOutputs(&loop.LoopState); err != nil {
+					return err
+				}
+			}
+		}
+		return nil
+	})
+	return snapshot, err
+}
+
+// scanJSON reads every data column first, so fn may run further queries.
+// scanJSON 先读完全部 data 列，fn 中可以继续执行查询。
+func (t *txn) scanJSON(query string, args []any, fn func([]byte) error) error {
+	rows, err := t.tx.Query(query, args...)
+	if err != nil {
+		return err
+	}
+	var payloads [][]byte
+	for rows.Next() {
+		var raw []byte
+		if err = rows.Scan(&raw); err != nil {
+			rows.Close()
+			return err
+		}
+		payloads = append(payloads, raw)
+	}
+	rows.Close()
+	if err = rows.Err(); err != nil {
+		return err
+	}
+	for _, raw := range payloads {
+		if err = fn(raw); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func (s *Store) Commit(ctx context.Context, run string, l cflow.Lease, r *cflow.Record, expected int64) (committed *cflow.Record, err error) {
-	if r == nil || l.Key != r.Key || r.Kind != cflow.ActionKind {
+	if r == nil || (l.Key != r.Key && (r.ExecutionKey == "" || l.Key != r.ExecutionKey)) || r.Kind != cflow.ActionKind {
 		return nil, cflow.ErrInvalid
 	}
 	err = s.tx(ctx, run, func(t *txn) error {
@@ -604,7 +736,9 @@ func (s *Store) Pending(ctx context.Context, run string, now time.Time) (result 
 }
 
 func (t *txn) pending(now time.Time, purpose string) ([]memory.Notification, error) {
-	query := `SELECT id, key, purpose, available_at FROM messages WHERE run_id = ? AND state = ? AND available_at <= ?`
+	query := `SELECT id, key, purpose, available_at,
+		COALESCE((SELECT execution_key FROM execution_owners o WHERE o.run_id=messages.run_id AND o.key=messages.key),'')
+		FROM messages WHERE run_id = ? AND state = ? AND available_at <= ?`
 	args := []any{t.run, msgPending, ts(now)}
 	if purpose != "" {
 		query += ` AND purpose = ?`
@@ -619,7 +753,7 @@ func (t *txn) pending(now time.Time, purpose string) ([]memory.Notification, err
 	for rows.Next() {
 		var n memory.Notification
 		var at int64
-		if err = rows.Scan(&n.ID, &n.Key, &n.Purpose, &at); err != nil {
+		if err = rows.Scan(&n.ID, &n.Key, &n.Purpose, &at, &n.ExecutionKey); err != nil {
 			return nil, err
 		}
 		n.AvailableAt = tm(at)
@@ -723,10 +857,21 @@ func (s *Store) WaitAny(ctx context.Context, run, key string, requests []cflow.W
 			seen[request.Key] = true
 		}
 		g := &storedGroup{State: cflow.WaitAnyState{Status: cflow.Suspended}}
+		if exists, err := t.executionKeyExists(key); err != nil {
+			return err
+		} else if exists {
+			return cflow.ErrChanged
+		}
+		if err := t.saveOwner(key, requests[0].ExecutionKey); err != nil {
+			return err
+		}
 		for _, request := range requests {
+			if request.ExecutionKey != requests[0].ExecutionKey {
+				return cflow.ErrInvalid
+			}
 			request.Request = clone(request.Request)
 			g.Requests = append(g.Requests, request)
-			record := &cflow.Record{Key: request.Key, Path: request.Path, Kind: request.Kind, Status: cflow.Suspended,
+			record := &cflow.Record{Key: request.Key, Path: request.Path, ExecutionKey: request.ExecutionKey, Kind: request.Kind, Status: cflow.Suspended,
 				Version: 1, Type: request.Type, Input: clone(request.Request), StartedAt: t.now}
 			if request.Error != "" {
 				record.Status, record.Error, record.EndedAt = cflow.Failed, request.Error, t.now
@@ -776,7 +921,7 @@ func (s *Store) WaitAny(ctx context.Context, run, key string, requests []cflow.W
 }
 
 func pendingOf(r *cflow.Record) cflow.Pending {
-	return cflow.Pending{Key: r.Key, Path: r.Path, Kind: r.Kind, Until: r.Until}
+	return cflow.Pending{Key: r.Key, Path: r.Path, ExecutionKey: r.ExecutionKey, Kind: r.Kind, Until: r.Until}
 }
 
 // The path column stores Record.Path as JSON, so queries and the UI get the
@@ -948,8 +1093,8 @@ func (s *Store) Register(ctx context.Context, spec RunSpec) (RunInfo, error) {
 		if err := t.tx.QueryRow(`SELECT status FROM runs WHERE id = ?`, spec.ID).Scan(&status); err != nil {
 			return err
 		}
-		_, err := t.exec(`UPDATE runs SET workflow = ?, version = ?, input = ?, updated_at = ?, last_seen = ? WHERE id = ?`,
-			spec.Workflow, spec.Version, []byte(spec.Input), ts(t.now), ts(t.now), spec.ID)
+		_, err := t.exec(`UPDATE runs SET workflow = ?, input = ?, updated_at = ?, last_seen = ? WHERE id = ?`,
+			spec.Workflow, []byte(spec.Input), ts(t.now), ts(t.now), spec.ID)
 		t.log("run.attached", spec.Workflow, map[string]any{"status": status})
 		return err
 	})
@@ -1100,7 +1245,7 @@ func (s *Store) Delete(ctx context.Context, run string) error {
 		tx.Rollback()
 		return err
 	}
-	for _, table := range []string{"records", "leases", "messages", "wait_groups", "events", "engine_event_ids"} {
+	for _, table := range []string{"records", "leases", "messages", "wait_groups", "events", "engine_event_ids", "loops", "flow_executions", "execution_owners"} {
 		if _, err = tx.Exec(`DELETE FROM `+table+` WHERE run_id = ?`, run); err != nil {
 			tx.Rollback()
 			return err
@@ -1126,7 +1271,7 @@ func scanRun(scan func(...any) error, now time.Time) (RunInfo, error) {
 	var info RunInfo
 	var pending string
 	var created, updated, seen int64
-	err := scan(&info.ID, &info.Workflow, &info.Version, blob{&info.Input}, blob{&info.Output}, &info.Status, &info.Error,
+	err := scan(&info.ID, &info.Workflow, blob{&info.Input}, blob{&info.Output}, &info.Status, &info.Error,
 		&pending, &info.Drives, &created, &updated, &seen)
 	if err != nil {
 		return info, err
@@ -1141,7 +1286,7 @@ func scanRun(scan func(...any) error, now time.Time) (RunInfo, error) {
 	return info, nil
 }
 
-const runColumns = `id, workflow, version, input, output, status, error, pending, drives, created_at, updated_at, last_seen`
+const runColumns = `id, workflow, input, output, status, error, pending, drives, created_at, updated_at, last_seen`
 
 func (s *Store) progress() (map[string]Progress, error) {
 	rows, err := s.db.Query(`SELECT run_id, status, COUNT(*) FROM records

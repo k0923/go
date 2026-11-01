@@ -19,33 +19,26 @@ import (
 // Options.MaxFlowDepth).
 // Flow 组合 Action、等待和其他 Flow（嵌套深度受 Options.MaxFlowDepth 限制）。
 type Flow[I, O any] interface {
+	FlowDefinition
 	Run(*FlowContext, I) (O, error)
 }
 
-type FlowFunc[I, O any] func(*FlowContext, I) (O, error)
-
-func (f FlowFunc[I, O]) Run(ctx *FlowContext, input I) (O, error) { return f(ctx, input) }
-
-// Workflow is a named, versioned definition rooted at ONE Flow. It does not
-// implement Flow and has no public Run: only Engine.Drive executes it. The
-// root Flow adds no namespace, so Run("charge") is stored as "charge"; it can
-// compose further Flows with RunFlow/GoFlow.
-// Workflow 是以一个 Flow 为根的具名、带版本定义。它不实现 Flow，也没有公开的 Run：
-// 只能由 Engine.Drive 执行。根 Flow 不追加命名空间，Run("charge") 存为 "charge"；
-// 它可以用 RunFlow/GoFlow 继续组合其他 Flow。
-type Workflow[I, O any] struct {
-	Name    string
-	Version string
-	root    Flow[I, O]
+// FunctionFlow adapts a function to a typed, registrable definition.
+// FunctionFlow 将函数适配为可注册的泛型定义；请通过 FlowFunc 构造。
+type FunctionFlow[I, O any] struct {
+	FlowBase[I, O]
+	body func(*FlowContext, I) (O, error)
 }
 
-// NewWorkflow defines a workflow whose entry is root. Use FlowFunc for an
-// inline entry. Engine.Drive validates name, version and root before running.
-// NewWorkflow 定义一个以 root 为入口的工作流；入口可以用 FlowFunc 内联书写。
-// Engine.Drive 会在执行前校验名称、版本和 root。
-func NewWorkflow[I, O any](name, version string, root Flow[I, O]) Workflow[I, O] {
-	return Workflow[I, O]{Name: name, Version: version, root: root}
+// FlowFunc constructs a definition with its own identity, including for closures
+// with identical signatures. Keep the returned object and register it once.
+// FlowFunc 构造具有独立身份的定义；相同签名的闭包也互不混淆。保存返回对象并注册一次。
+func FlowFunc[I, O any](body func(*FlowContext, I) (O, error)) *FunctionFlow[I, O] {
+	return &FunctionFlow[I, O]{body: body}
 }
+
+func (fn *FunctionFlow[I, O]) Run(f *FlowContext, input I) (O, error) { return fn.body(f, input) }
+func (f *FunctionFlow[I, O]) validFlow() bool                         { return f != nil && f.body != nil }
 
 type Status string
 
@@ -75,9 +68,12 @@ const (
 // Record 是带版本的快照，而不是仅追加的执行历史。Key 即 BuildKey(Path)：引擎和所有
 // Infrastructure 查找都用 Key；Path 是交给存储层持久化的结构化地址。
 type Record struct {
-	Key  string
-	Path Path `json:",omitempty"`
-	Kind Kind
+	// ExecutionKey routes wakes to an independent Flow; empty means root Drive.
+	// ExecutionKey 将唤醒路由到独立 Flow；为空表示根 Drive。
+	ExecutionKey string `json:",omitempty"`
+	Key          string
+	Path         Path `json:",omitempty"`
+	Kind         Kind
 	// Status/Version are the snapshot state.
 	// Status/Version 是快照状态。
 	Status  Status
@@ -106,17 +102,17 @@ var (
 	ErrNotFound = errors.New("workflow record not found")
 	ErrInvalid  = errors.New("invalid workflow operation")
 	// ErrChanged means replay found a record that cannot belong to the current
-	// step: the definition name/version/input changed, the step's kind changed
+	// step: the definition name/input changed, the step's kind changed
 	// (a WaitFor became a Run), or the stored Path differs from the expected one.
-	// ErrChanged 表示回放找到的记录不可能属于当前步骤：定义的名称/版本/输入变了、
+	// ErrChanged 表示回放找到的记录不可能属于当前步骤：定义的名称/输入变了、
 	// 步骤 Kind 变了（WaitFor 变成了 Run），或存储的 Path 与期望路径不同。
 	ErrChanged = errors.New("workflow definition changed")
 	// ErrWaitFailed is the terminal Drive error when every WaitAny candidate failed.
 	// ErrWaitFailed 是 WaitAny 所有候选项都失败时 Drive 返回的终态错误。
 	ErrWaitFailed = errors.New("wait group failed")
-	// ErrLoopExhausted is returned by Loop after MaxAttempts unfinished attempts.
-	// ErrLoopExhausted 在 Loop 用完 MaxAttempts 次仍未完成时返回。
-	ErrLoopExhausted = errors.New("loop attempts exhausted")
+	// ErrPollExhausted is returned by Loop after MaxAttempts unfinished attempts.
+	// ErrPollExhausted 在 Loop 用完 MaxAttempts 次仍未完成时返回。
+	ErrPollExhausted = errors.New("loop attempts exhausted")
 )
 
 type OperationError struct {
@@ -213,10 +209,11 @@ func invoke[T any](fn func() (T, error)) (output T, err error) {
 }
 
 type Pending struct {
-	Key   string
-	Path  Path `json:",omitempty"`
-	Kind  Kind
-	Until time.Time
+	ExecutionKey string `json:",omitempty"`
+	Key          string
+	Path         Path `json:",omitempty"`
+	Kind         Kind
+	Until        time.Time
 }
 
 type Result[O any] struct {

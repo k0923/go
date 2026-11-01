@@ -61,12 +61,12 @@ func TestEngineInfrastructureFailure(t *testing.T) {
 			flow := definition(FlowFunc[int, int](func(f *FlowContext, in int) (int, error) {
 				return f.Run("step", Pure(func(n int) int { return n + 1 }), in)
 			}))
-			result, err := e.Drive(context.Background(), flow, 0)
+			result, err := e.Start(context.Background(), flow, 0)
 			if !errors.Is(err, cause) || result.Status != Running {
 				t.Fatalf("%+v %v", result, err)
 			}
 			fake.getError, fake.commitError = nil, nil
-			result, err = e.Drive(context.Background(), flow, 0)
+			result, err = e.Start(context.Background(), flow, 0)
 			if err != nil || result.Output != 1 {
 				t.Fatalf("%+v %v", result, err)
 			}
@@ -83,7 +83,7 @@ func TestEngineInfrastructureFailure(t *testing.T) {
 				return 99, nil
 			}), in)
 		}))
-		result, err := e.Drive(context.Background(), flow, 0)
+		result, err := e.Start(context.Background(), flow, 0)
 		if !errors.Is(err, cause) || result.Status != Running {
 			t.Fatalf("%+v %v", result, err)
 		}
@@ -101,12 +101,12 @@ func TestEngineInfrastructureFailure(t *testing.T) {
 		flow := definition(FlowFunc[int, int](func(f *FlowContext, in int) (int, error) {
 			return f.Run("step", AsAction(func(context.Context, int) (int, error) { calls++; return 4, nil }), in)
 		}))
-		_, err := e.Drive(context.Background(), flow, 0)
+		_, err := e.Start(context.Background(), flow, 0)
 		if !errors.Is(err, cause) {
 			t.Fatal(err)
 		}
 		fake.releaseError = nil
-		result, err := e.Drive(context.Background(), flow, 0)
+		result, err := e.Start(context.Background(), flow, 0)
 		if err != nil || result.Output != 4 || calls != 1 {
 			t.Fatalf("%+v %v calls=%d", result, err, calls)
 		}
@@ -117,13 +117,13 @@ func TestEngineInfrastructureFailure(t *testing.T) {
 		flow := definition(FlowFunc[int, string](func(f *FlowContext, in int) (string, error) { return f.WaitFor[string]("signal", in), nil }))
 		// Initialize the definition first, then reject only signal writes.
 		// 先初始化定义，然后只拒绝 signal 写入。
-		first, err := e.Drive(context.Background(), flow, 0)
+		first, err := e.Start(context.Background(), flow, 0)
 		if err != nil || first.Status != Suspended {
 			t.Fatalf("%+v %v", first, err)
 		}
 		cause := errors.New("registration unavailable")
 		e = testEngine(t, &signalFailingInfrastructure{Infrastructure: store, cause: cause}, Options{})
-		result, err := e.Drive(context.Background(), flow, 0)
+		result, err := e.Start(context.Background(), flow, 0)
 		if !errors.Is(err, cause) || result.Status != Running {
 			t.Fatalf("%+v %v", result, err)
 		}

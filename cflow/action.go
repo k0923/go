@@ -13,12 +13,12 @@ type Action[I, O any] interface {
 	Run(context.Context, I) (O, error)
 }
 
-// ActionFn adapts a function to Action. Closures must not capture mutable
+// actionFn adapts a function to Action. Closures must not capture mutable
 // orchestration state or FlowContext.
-// ActionFn 将函数适配为 Action；闭包不能捕获可变编排状态或 FlowContext。
-type ActionFn[I, O any] func(context.Context, I) (O, error)
+// actionFn 将函数适配为 Action；闭包不能捕获可变编排状态或 FlowContext。
+type actionFn[I, O any] func(context.Context, I) (O, error)
 
-func (fn ActionFn[I, O]) Run(ctx context.Context, input I) (output O, err error) {
+func (fn actionFn[I, O]) Run(ctx context.Context, input I) (output O, err error) {
 	if fn == nil {
 		return output, ErrInvalid
 	}
@@ -27,23 +27,31 @@ func (fn ActionFn[I, O]) Run(ctx context.Context, input I) (output O, err error)
 
 // AsAction infers input/output types for ordinary functions and client methods.
 func AsAction[I, O any](fn func(context.Context, I) (O, error)) Action[I, O] {
-	return ActionFn[I, O](fn)
+	return actionFn[I, O](fn)
 }
 
 // Pure adapts a deterministic calculation; inexpensive calculations can simply
 // execute in Flow without creating a durable step.
 func Pure[I, O any](fn func(I) O) Action[I, O] {
 	if fn == nil {
-		return ActionFn[I, O](nil)
+		return actionFn[I, O](nil)
 	}
-	return ActionFn[I, O](func(_ context.Context, input I) (O, error) { return fn(input), nil })
+	return actionFn[I, O](func(_ context.Context, input I) (O, error) { return fn(input), nil })
 }
 
 func invalidAction[I, O any](action Action[I, O]) bool { return nilValue(action) }
 
 // invalidFlow also catches a typed nil such as FlowFunc(nil).
 // invalidFlow 同样能识别 FlowFunc(nil) 这类带类型的 nil。
-func invalidFlow[I, O any](flow Flow[I, O]) bool { return nilValue(flow) }
+func invalidFlow[I, O any](flow Flow[I, O]) bool {
+	if nilValue(flow) {
+		return true
+	}
+	if checked, ok := flow.(interface{ validFlow() bool }); ok {
+		return !checked.validFlow()
+	}
+	return false
+}
 
 func nilValue(v any) bool {
 	if v == nil {

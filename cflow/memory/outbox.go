@@ -10,10 +10,13 @@ import (
 // Notification 是持久化的投递意图。Request 和 Wake 是不同消息，
 // 因此确认一个请求不会消费后续唤醒。
 type Notification struct {
-	ID          string
-	Key         string
-	Purpose     string
-	AvailableAt time.Time
+	// ExecutionKey is the Resume target; empty means the root run.
+	// ExecutionKey 是 Resume 的目标；为空表示根运行。
+	ExecutionKey string
+	ID           string
+	Key          string
+	Purpose      string
+	AvailableAt  time.Time
 }
 
 const (
@@ -32,7 +35,7 @@ const (
 //
 //   - REQUEST: deliver the record's Input to the provider, then Ack. The
 //     provider answers with Engine.Signal / ResolveSignal / FailWait.
-//   - WAKE: Drive the run. Ack only when the result is not Running; on a
+//   - WAKE: Resume(ctx, ExecutionKey); empty is the root run. Ack only when the result is not Running; on a
 //     retryable error keep the message and retry with backoff.
 //   - CANCEL: tell the provider to stop the losing wait, then Ack.
 //
@@ -43,7 +46,7 @@ const (
 //
 //   - REQUEST：把记录的 Input 投递给提供方，然后 Ack。提供方通过
 //     Engine.Signal / ResolveSignal / FailWait 回答。
-//   - WAKE：Drive 该 run。只有结果不是 Running 时才 Ack；遇到可重试错误时保留消息，
+//   - WAKE：调用 Resume(ctx, ExecutionKey)，空串为根运行。只有结果不是 Running 时才 Ack；遇到可重试错误时保留消息，
 //     退避后重试。
 //   - CANCEL：通知提供方停止失败的等待，然后 Ack。
 //

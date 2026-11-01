@@ -20,10 +20,6 @@ func main() {
 func run() error {
 	ctx := context.Background()
 	store := memory.New()
-	engine, err := cflow.NewEngine(store, cflow.Options{})
-	if err != nil {
-		return err
-	}
 	flow := cflow.FlowFunc[string, string](func(f *cflow.FlowContext, input string) (string, error) {
 		primary := cflow.OnSignal[string]("primary", input)
 		secondary := cflow.OnSignal[string]("secondary", input)
@@ -36,10 +32,14 @@ func run() error {
 		// 下游工作会立即开始，而不会等待另一个响应。
 		return f.Run("continue", cflow.Pure(func(answer string) string { return "continued: " + answer }), answer)
 	})
-	definition := cflow.NewWorkflow("approval", "1", cflow.FlowFunc[string, string](func(f *cflow.FlowContext, input string) (string, error) {
-		return f.RunFlow("main", flow, input)
-	}))
-	waiting, err := engine.Drive(ctx, definition, "order_123")
+	definition := flow
+	engine, err := cflow.NewEngine(store, cflow.Options{
+		Flows: map[string]cflow.FlowDefinition{"approval": definition},
+	})
+	if err != nil {
+		return err
+	}
+	waiting, err := engine.Start(ctx, definition, "order_123")
 	if err != nil {
 		return err
 	}
@@ -64,7 +64,7 @@ func run() error {
 	go func() {
 		defer providers.Done()
 		<-primaryListening
-		record, err := store.Get(providerCtx, "main|providers|secondary")
+		record, err := store.Get(providerCtx, "providers|secondary")
 		if err == nil {
 			_, err = engine.ResolveSignal(providerCtx, record.Key, record.Version, "secondary approved")
 		}
@@ -75,11 +75,11 @@ func run() error {
 	}
 	cancelProviders()
 	providers.Wait()
-	result, err := engine.Drive(ctx, definition, "order_123")
+	result, err := engine.Start(ctx, definition, "order_123")
 	if err != nil {
 		return err
 	}
-	loser, err := store.Get(ctx, "main|providers|primary")
+	loser, err := store.Get(ctx, "providers|primary")
 	if err != nil {
 		return err
 	}

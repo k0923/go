@@ -16,16 +16,14 @@ import (
 func ExampleOutbox() {
 	ctx := context.Background()
 	store := memory.New()
-	engine, err := cflow.NewEngine(store, cflow.Options{})
+	definition := cflow.FlowFunc[string, string](func(f *cflow.FlowContext, order string) (string, error) {
+		return order + " " + f.WaitFor[string]("approval", order), nil
+	})
+	engine, err := cflow.NewEngine(store, cflow.Options{Flows: map[string]cflow.FlowDefinition{"approval": definition}})
 	if err != nil {
 		panic(err)
 	}
-	definition := cflow.NewWorkflow("approval", "1",
-		cflow.FlowFunc[string, string](func(f *cflow.FlowContext, order string) (string, error) {
-			return order + " " + f.WaitFor[string]("approval", order), nil
-		}),
-	)
-	result, err := engine.Drive(ctx, definition, "order_1")
+	result, err := engine.Start(ctx, definition, "order_1")
 	if err != nil {
 		panic(err)
 	}
@@ -46,7 +44,7 @@ func ExampleOutbox() {
 					panic(err)
 				}
 			case memory.WakeNotification:
-				result, err := engine.Drive(ctx, definition, "order_1")
+				result, err := engine.Start(ctx, definition, "order_1")
 				if result.Status == cflow.Running {
 					continue // retryable: keep the message and retry later
 				}

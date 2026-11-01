@@ -48,17 +48,16 @@ const (
 // 没有 ExecutionID；需要通过带作用域的 key 关联。Sequence 仅对一个 Engine 内的
 // 事件生产排序，不对并发回调投递排序。
 type Event struct {
-	SchemaVersion   int       `json:"schema_version"`
-	ID              string    `json:"id"`
-	EngineID        string    `json:"engine_id"`
-	Sequence        uint64    `json:"sequence"`
-	ExecutionID     string    `json:"execution_id,omitempty"`
-	WorkflowName    string    `json:"workflow_name,omitempty"`
-	WorkflowVersion string    `json:"workflow_version,omitempty"`
-	Type            EventType `json:"type"`
-	Key             string    `json:"key"`
-	Path            Path      `json:"path,omitempty"`
-	Kind            Kind      `json:"kind,omitempty"`
+	SchemaVersion int       `json:"schema_version"`
+	ID            string    `json:"id"`
+	EngineID      string    `json:"engine_id"`
+	Sequence      uint64    `json:"sequence"`
+	ExecutionID   string    `json:"execution_id,omitempty"`
+	WorkflowName  string    `json:"workflow_name,omitempty"`
+	Type          EventType `json:"type"`
+	Key           string    `json:"key"`
+	Path          Path      `json:"path,omitempty"`
+	Kind          Kind      `json:"kind,omitempty"`
 	// StepType is the step's leaf I/O signature in the CURRENT code, e.g.
 	// "action[main.Order,int]"; StoredType is the recorded one (type_changed).
 	// StepType 是当前代码中步骤的叶子 I/O 签名；StoredType 是记录中的签名（type_changed）。
@@ -145,7 +144,7 @@ func (e *Engine) Subscribe(listener EventListener, types ...EventType) func() {
 }
 
 type eventContextKey struct{}
-type eventContext struct{ executionID, name, version string }
+type eventContext struct{ executionID, name string }
 
 func (e *Engine) emit(ctx context.Context, event Event, err error) {
 	// Even formatting an application-defined error must not break execution.
@@ -156,7 +155,7 @@ func (e *Engine) emit(ctx context.Context, event Event, err error) {
 	event.Sequence = e.events.sequence.Add(1)
 	event.ID = fmt.Sprintf("%s:%d", e.eventID, event.Sequence)
 	metadata, _ := ctx.Value(eventContextKey{}).(eventContext)
-	event.ExecutionID, event.WorkflowName, event.WorkflowVersion = metadata.executionID, metadata.name, metadata.version
+	event.ExecutionID, event.WorkflowName = metadata.executionID, metadata.name
 	event.At = e.options.Now()
 	if event.StartedAt.IsZero() {
 		event.StartedAt = event.At

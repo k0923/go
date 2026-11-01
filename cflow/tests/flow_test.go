@@ -27,7 +27,7 @@ func TestFlowContextWaitFor(t *testing.T) {
 		return f.WaitFor[string]("callback", in), nil
 	}))
 	for i := 0; i < 3; i++ {
-		result, err := e.Drive(context.Background(), flow, 2)
+		result, err := e.Start(context.Background(), flow, 2)
 		if err != nil || result.Status != Suspended || len(result.Pending) != 1 {
 			t.Fatalf("%+v %v", result, err)
 		}
@@ -62,7 +62,7 @@ func TestFlowContextWaitFor(t *testing.T) {
 		t.Fatalf("duplicate: %t %v", ok, err)
 	}
 	for i := 0; i < 2; i++ {
-		result, err := e.Drive(context.Background(), flow, 2)
+		result, err := e.Start(context.Background(), flow, 2)
 		if err != nil || result.Status != Completed || result.Output != "approved" {
 			t.Fatalf("%+v %v", result, err)
 		}
@@ -85,13 +85,13 @@ func TestFlowContextSleep(t *testing.T) {
 			f.Sleep("delay", time.Hour)
 			return "awake", nil
 		}))
-		first, err := e.Drive(context.Background(), flow, 0)
+		first, err := e.Start(context.Background(), flow, 0)
 		if err != nil || first.Status != Suspended {
 			t.Fatalf("%+v %v", first, err)
 		}
 		original := first.Pending[0].Until
 		now = now.Add(30 * time.Minute)
-		second, err := e.Drive(context.Background(), flow, 0)
+		second, err := e.Start(context.Background(), flow, 0)
 		if err != nil || second.Status != Suspended || second.Pending[0].Until != original {
 			t.Fatalf("%+v %v", second, err)
 		}
@@ -101,7 +101,7 @@ func TestFlowContextSleep(t *testing.T) {
 		}
 		now = now.Add(30 * time.Minute)
 		for i := 0; i < 2; i++ {
-			result, err := e.Drive(context.Background(), flow, 0)
+			result, err := e.Start(context.Background(), flow, 0)
 			if err != nil || result.Status != Completed || result.Output != "awake" {
 				t.Fatalf("%+v %v", result, err)
 			}
@@ -114,7 +114,7 @@ func TestFlowContextSleep(t *testing.T) {
 			f.SleepUntil("past", time.Now().Add(-time.Hour))
 			return in, nil
 		}))
-		result, err := e.Drive(context.Background(), flow, 8)
+		result, err := e.Start(context.Background(), flow, 8)
 		if err != nil || result.Status != Completed || result.Output != 8 {
 			t.Fatalf("%+v %v", result, err)
 		}
@@ -132,12 +132,12 @@ func TestFlowContextCheckpoint(t *testing.T) {
 	flow := definition(FlowFunc[int, output](func(f *FlowContext, _ int) (output, error) {
 		return output{ID: f.UUID("id"), At: f.Now("at")}, nil
 	}))
-	first, err := e.Drive(context.Background(), flow, 0)
+	first, err := e.Start(context.Background(), flow, 0)
 	if err != nil || first.Output.ID == "" || !first.Output.At.Equal(now) {
 		t.Fatalf("%+v %v", first, err)
 	}
 	now = now.Add(time.Hour)
-	second, err := e.Drive(context.Background(), flow, 0)
+	second, err := e.Start(context.Background(), flow, 0)
 	if err != nil || second.Output != first.Output {
 		t.Fatalf("%+v %v", second, err)
 	}
@@ -159,24 +159,24 @@ func TestFlowContextLoop(t *testing.T) {
 			e := testEngine(t, store, Options{Now: func() time.Time { return now }})
 			calls := 0
 			flow := definition(FlowFunc[int, pollOutput](func(f *FlowContext, _ int) (pollOutput, error) {
-				return f.Loop("poll", AsAction(func(context.Context, int) (pollOutput, error) {
+				return f.Poll("poll", AsAction(func(context.Context, int) (pollOutput, error) {
 					calls++
 					return pollOutput{Count: calls, Finished: finish && calls == 2}, nil
-				}), 0, LoopOptions{Interval: time.Hour, MaxAttempts: 2})
+				}), 0, PollOptions{Interval: time.Hour, MaxAttempts: 2})
 			}))
 			for i := 0; i < 3; i++ {
-				result, err := e.Drive(context.Background(), flow, 0)
+				result, err := e.Start(context.Background(), flow, 0)
 				if err != nil || result.Status != Suspended || calls != 1 {
 					t.Fatalf("%+v %v calls=%d", result, err, calls)
 				}
 			}
 			now = now.Add(time.Hour)
 			for i := 0; i < 2; i++ {
-				result, err := e.Drive(context.Background(), flow, 0)
+				result, err := e.Start(context.Background(), flow, 0)
 				if finish && (err != nil || result.Output.Count != 2 || result.Status != Completed) {
 					t.Fatalf("%+v %v", result, err)
 				}
-				if !finish && (!errors.Is(err, ErrLoopExhausted) || result.Status != Failed) {
+				if !finish && (!errors.Is(err, ErrPollExhausted) || result.Status != Failed) {
 					t.Fatalf("%+v %v", result, err)
 				}
 			}
@@ -215,7 +215,7 @@ func TestFutureWait(t *testing.T) {
 		}
 		return future.Wait()
 	}))
-	result, err := e.Drive(context.Background(), flow, 0)
+	result, err := e.Start(context.Background(), flow, 0)
 	if err != nil || result.Output != 21 || calls.Load() != 1 {
 		t.Fatalf("%+v %v", result, err)
 	}
@@ -225,12 +225,13 @@ func TestRootGoFlow(t *testing.T) {
 	t.Run("all suspensions collected", func(t *testing.T) {
 		e := testEngine(t, memory.New(), Options{})
 		child := FlowFunc[int, string](func(f *FlowContext, in int) (string, error) { return f.WaitFor[string]("callback", in), nil })
-		flow := NewWorkflow("test", "1", FlowFunc[int, int](func(f *FlowContext, in int) (int, error) {
+		flow := namedDefinition("test", FlowFunc[int, int](func(f *FlowContext, in int) (int, error) {
 			f.GoFlow("left", child, in)
 			f.GoFlow("right", child, in)
 			return 99, nil
 		}))
-		result, err := e.Drive(context.Background(), flow, 0)
+		flow.Bindings = map[string]FlowDefinition{"child": child}
+		result, err := e.Start(context.Background(), flow, 0)
 		if err != nil || result.Status != Suspended || len(result.Pending) != 2 {
 			t.Fatalf("%+v %v", result, err)
 		}
@@ -254,7 +255,7 @@ func TestRootGoFlow(t *testing.T) {
 			f.Go("notify", AsAction(func(context.Context, int) (int, error) { return 0, cause }), in)
 			return 999, nil
 		}))
-		result, err := e.Drive(context.Background(), flow, 0)
+		result, err := e.Start(context.Background(), flow, 0)
 		if !errors.Is(err, cause) || result.Status == Completed {
 			t.Fatalf("%+v %v", result, err)
 		}

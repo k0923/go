@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"sort"
 	"sync"
 	"time"
 
@@ -49,7 +50,7 @@ type Options struct {
 //
 // 每次 Drive 都会发生回放，因此在时间线中看到已完成的 action 被标记为 replayed
 // 是预期行为。
-func Run[I, O any](ctx context.Context, definition cflow.Workflow[I, O], input I, options Options) (cflow.Result[O], error) {
+func Run[I, O any](ctx context.Context, definition cflow.Flow[I, O], input I, options Options) (cflow.Result[O], error) {
 	var zero cflow.Result[O]
 	logf := options.Logf
 	if logf == nil {
@@ -59,10 +60,26 @@ func Run[I, O any](ctx context.Context, definition cflow.Workflow[I, O], input I
 		options.RetryDelay = 2 * time.Second
 	}
 	runID := options.RunID
-	if runID == "" {
-		runID = definition.Name + "-" + uuid.NewString()
+	validationID := runID
+	if validationID == "" {
+		validationID = "validate"
 	}
-	client, err := NewClient(options.Server, runID)
+	client, err := NewClient(options.Server, validationID)
+	if err != nil {
+		return zero, err
+	}
+	engine, err := cflow.NewEngine(client, options.Engine)
+	if err != nil {
+		return zero, err
+	}
+	workflowName, err := engine.FlowName(definition)
+	if err != nil {
+		return zero, err
+	}
+	if runID == "" {
+		runID = workflowName + "-" + uuid.NewString()
+	}
+	client, err = NewClient(options.Server, runID)
 	if err != nil {
 		return zero, err
 	}
@@ -70,7 +87,7 @@ func Run[I, O any](ctx context.Context, definition cflow.Workflow[I, O], input I
 	if err != nil {
 		return zero, err
 	}
-	if _, err = client.register(ctx, RunSpec{Workflow: definition.Name, Version: definition.Version, Input: rawInput}); err != nil {
+	if _, err = client.register(ctx, RunSpec{Workflow: workflowName, Input: rawInput}); err != nil {
 		return zero, fmt.Errorf("attach to debugger %s: %w", client.base, err)
 	}
 	logf("[wfdebug] run %s attached: %s", runID, client.URL())
@@ -78,7 +95,7 @@ func Run[I, O any](ctx context.Context, definition cflow.Workflow[I, O], input I
 		options.OnAttach(client.URL())
 	}
 
-	engine, err := cflow.NewEngine(client, options.Engine)
+	engine, err = cflow.NewEngine(client, options.Engine)
 	if err != nil {
 		return zero, err
 	}
@@ -88,6 +105,19 @@ func Run[I, O any](ctx context.Context, definition cflow.Workflow[I, O], input I
 	defer events.close()
 
 	var wakes []memory.Notification
+	suspended := make(map[string][]cflow.Pending)
+	// pendingWaits aggregates every boundary's waits; reports must use it
+	// because the server replaces the run's pending list as a whole.
+	// pendingWaits 汇总所有执行边界的等待；服务端整体替换运行的 pending，因此上报必须使用它。
+	pendingWaits := func() []cflow.Pending {
+		var waits []cflow.Pending
+		for _, pending := range suspended {
+			waits = append(waits, pending...)
+		}
+		sort.Slice(waits, func(i, j int) bool { return waits[i].Key < waits[j].Key })
+		return waits
+	}
+	rootDriven := false
 	for {
 		due, pollErr := client.WaitWake(ctx, time.Nanosecond)
 		if errors.Is(pollErr, cflow.ErrNotFound) {
@@ -103,12 +133,67 @@ func Run[I, O any](ctx context.Context, definition cflow.Workflow[I, O], input I
 				seen[notification.ID] = true
 			}
 		}
-		result, driveErr := engine.Drive(ctx, definition, input)
+		if len(wakes) > 0 && wakes[0].ExecutionKey != "" {
+			wake := wakes[0]
+			child, childErr := engine.Resume(ctx, wake.ExecutionKey)
+			events.flush()
+			if ctx.Err() != nil {
+				return zero, ctx.Err()
+			}
+			if child.Status == cflow.Running {
+				logf("[wfdebug] item %s retryable: %v", wake.ExecutionKey, childErr)
+				select {
+				case <-ctx.Done():
+					return zero, ctx.Err()
+				case <-time.After(options.RetryDelay):
+				}
+				continue
+			}
+			if err := client.Ack(ctx, wake.ID); err != nil {
+				if errors.Is(err, cflow.ErrNotFound) {
+					return zero, err
+				}
+				select {
+				case <-ctx.Done():
+					return zero, ctx.Err()
+				case <-time.After(options.RetryDelay):
+				}
+				continue
+			}
+			wakes = wakes[1:]
+			delete(suspended, wake.ExecutionKey)
+			if child.Status == cflow.Suspended {
+				suspended[wake.ExecutionKey] = child.Pending
+			}
+			// The run stays suspended until the root finishes; report every
+			// boundary's waits so a finished child's waits disappear too.
+			// 根结束前运行保持挂起；上报全部边界的等待，已结束子级的等待也随之移除。
+			if err := client.Report(ctx, Report{Status: string(cflow.Suspended), Pending: pendingWaits()}); err != nil {
+				logf("[wfdebug] item report failed: %v", err)
+			}
+			// Child failure is a durable loop outcome; only the owner's Drive
+			// determines the root result. Completion already enqueued its wake.
+			continue
+		}
+		if rootDriven && len(wakes) == 0 {
+			wakes, err = waitForWake(ctx, client, pendingWaits())
+			if err != nil {
+				return zero, err
+			}
+			continue
+		}
+		rootDriven = true
+		result, driveErr := engine.Start(ctx, definition, input)
+		suspended[""] = result.Pending
 		events.flush()
 		var ackErr error
 		if ctx.Err() == nil && (driveErr == nil || result.Status == cflow.Failed) {
 			var remaining []memory.Notification
 			for _, notification := range wakes {
+				if notification.ExecutionKey != "" {
+					remaining = append(remaining, notification)
+					continue
+				}
 				ackCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 				err := client.Ack(ackCtx, notification.ID)
 				cancel()
@@ -120,6 +205,9 @@ func Run[I, O any](ctx context.Context, definition cflow.Workflow[I, O], input I
 			wakes = remaining
 		}
 		report := Report{Status: string(result.Status), Pending: result.Pending}
+		if result.Status == cflow.Suspended {
+			report.Pending = pendingWaits()
+		}
 		if driveErr != nil {
 			report.Error = driveErr.Error()
 			if result.Status != cflow.Failed {
@@ -159,6 +247,7 @@ func Run[I, O any](ctx context.Context, definition cflow.Workflow[I, O], input I
 		case errors.Is(driveErr, cflow.ErrNotFound):
 			return result, driveErr
 		case driveErr != nil:
+			rootDriven = false
 			logf("[wfdebug] run %s retryable error, re-driving in %s: %v", runID, options.RetryDelay, driveErr)
 			select {
 			case <-ctx.Done():
@@ -172,7 +261,10 @@ func Run[I, O any](ctx context.Context, definition cflow.Workflow[I, O], input I
 			keys[i] = string(pending.Kind) + ":" + pending.Key
 		}
 		logf("[wfdebug] run %s SUSPENDED on %v", runID, keys)
-		wakes, err = waitForWake(ctx, client, result.Pending)
+		if len(wakes) > 0 {
+			continue
+		}
+		wakes, err = waitForWake(ctx, client, pendingWaits())
 		if err != nil {
 			return result, err
 		}
@@ -186,6 +278,29 @@ func Run[I, O any](ctx context.Context, definition cflow.Workflow[I, O], input I
 func waitForWake(ctx context.Context, client *Client, pending []cflow.Pending) ([]memory.Notification, error) {
 	for {
 		for _, wait := range pending {
+			if wait.Kind == cflow.FlowKind {
+				item, err := client.GetFlow(ctx, wait.Key)
+				if ctx.Err() != nil {
+					return nil, ctx.Err()
+				}
+				if errors.Is(err, cflow.ErrNotFound) {
+					return nil, err
+				}
+				if err == nil && item != nil && (item.Status == cflow.Completed || item.Status == cflow.Failed) {
+					return []memory.Notification{{Key: wait.Key, ExecutionKey: item.ParentKey}}, nil
+				}
+				continue
+			}
+			if wait.Kind == cflow.LoopKind {
+				loop, err := client.GetLoop(ctx, wait.Key)
+				if errors.Is(err, cflow.ErrNotFound) || ctx.Err() != nil {
+					return nil, err
+				}
+				if err == nil && loop != nil && loop.Status != cflow.Suspended {
+					return []memory.Notification{{Key: wait.Key, ExecutionKey: loop.ParentKey}}, nil
+				}
+				continue
+			}
 			record, err := client.Get(ctx, wait.Key)
 			if ctx.Err() != nil {
 				return nil, ctx.Err()
@@ -194,7 +309,7 @@ func waitForWake(ctx context.Context, client *Client, pending []cflow.Pending) (
 				return nil, err
 			}
 			if err == nil && record != nil && record.Status != cflow.Suspended {
-				return nil, nil
+				return []memory.Notification{{Key: wait.Key, ExecutionKey: wait.ExecutionKey}}, nil
 			}
 		}
 		notifications, err := client.WaitWake(ctx, 2*time.Second)

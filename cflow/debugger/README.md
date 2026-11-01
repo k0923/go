@@ -56,6 +56,9 @@ import "github.com/k0923/go/cflow/debugger"
 
 result, err := debugger.Run(ctx, definition, input, debugger.Options{
     RunID: "order-1", // 可选；复用同一 ID 可在进程重启后恢复
+    Engine: cflow.Options{Flows: map[string]cflow.FlowDefinition{
+        "order": definition, // 还需注册所有会被调用的子 Flow
+    }},
 })
 ```
 
@@ -68,7 +71,7 @@ result, err := debugger.Run(ctx, definition, input, debugger.Options{
 | 可重试错误 | 按 `RetryDelay` 间隔重新 Drive，页面状态显示为 RETRYING |
 | ctx 取消 | 返回 `ctx.Err()`，之后可以用同一 RunID 恢复 |
 
-`Options` 常用字段（零值即可使用）：
+`Options` 常用字段（已注册定义需配置 Engine.Flows）：
 
 | 字段 | 说明 |
 | --- | --- |
@@ -79,7 +82,9 @@ result, err := debugger.Run(ctx, definition, input, debugger.Options{
 | `Logf` | 进度日志，默认 `log.Printf`；传一个空函数即可静默 |
 | `OnAttach` | 注册成功后回调，参数是该 run 的页面 URL，可以用来自动打开浏览器 |
 
-**自己控制 Drive**：只需要存储时，用 `debugger.NewClient(server, runID)`。它实现了 `cflow.Infrastructure`、`cflow.WaitAnyInfrastructure` 和 `memory.Outbox`，可以直接传给 `cflow.NewEngine`。另外还提供了几个调试辅助方法：`Submit(ctx, key, resp)`、`FireSleep(ctx, key)`、`Detail(ctx)`、`URL()`。
+**自己控制 Drive**：只需要存储时，用 `debugger.NewClient(server, runID)`。它实现了 `cflow.Infrastructure`、`cflow.WaitAnyInfrastructure`、实验性的 `cflow.FlowInfrastructure` 和 `memory.Outbox`，可以直接传给 `cflow.NewEngine`。另外还提供了几个调试辅助方法：`Submit(ctx, key, resp)`、`FireSleep(ctx, key)`、`Detail(ctx)`、`URL()`。
+
+**独立子 Flow（实验性、不稳定）**：通过 `Options.Engine.Flows` 的 map 注册根与子定义，注册名即定义身份。`RunFlow` / `GoFlow` 的回调只恢复对应子级，子级结束后唤醒父级。`ForEach` / `ForItems` 按 `Concurrency` 滑动窗口激活元素（默认顺序），批次结束后恢复父级汇总；父级可处理 `ForEachError`。SQLite 原子持久化结果、计数和下一次唤醒，重启服务与 worker 后可复用相同 `RunID` 恢复。
 
 ## 页面说明
 
@@ -125,12 +130,13 @@ curl localhost:7788/api/runs/order-1
 
 ## 需要知道的行为
 
-- **每次 Drive 都会从头回放**，时间线里大量 `action_replayed` 是正常的，表示已完成的步骤直接用了持久化结果。
+- **`Resume("")` 从根入口回放，`Resume(key)` 从指定子级或元素入口回放**。时间线中的 `action_replayed` 表示已完成的步骤使用了持久化结果；ForEach 元素的等待恢复只回放该元素，不回放其他元素。
 - **只有第一次提交生效**：重复提交，或者给 WaitAny 里已取消、已失败的成员提交，都会被忽略。
 - **“立即唤醒”**会把 Sleep 的截止时间改为当前时间再解析，这是调试专用操作，生产中没有对应能力。
 - **时间以服务端时钟为准**（租约有效期、Sleep 到期）。worker 和服务在同一台机器上时不存在时钟偏差。
-- **修改了代码再恢复旧 run**：如果改动了步骤的类型或 key，或者定义的版本，恢复时 run 会变为 FAILED（`workflow definition changed`）。这时换一个新的 `-run` ID 即可。只改输入构造方式时，会看到 `input_changed` 告警。
+- **修改了代码再恢复旧 run**：如果改动了步骤的 Kind 或 key（地址），恢复时 run 会变为 FAILED（`workflow definition changed`）。这时换一个新的 `-run` ID 即可。只改输入构造方式时，会看到 `input_changed` 告警。
 - **删除后 ID 不能复用**：删除会留下一个禁止复用该 ID 的标记，旧 worker 的后续请求会返回 not found 并退出。新的 run 请使用新 ID。
+- **旧数据库不迁移**：schema 尚未发布，打开缺少新列（如 `path`、`parent_key`）的旧库会直接报错，删除该文件或换一个 `-db` 即可。
 - **可以同时运行多个 worker**：不同 `-run` 是相互隔离的 run；对同一个 run 启动多个 worker 也是安全的，租约保证每个步骤只有一个执行者。
 - **事件可能不完整**：事件推送失败会重试，并在内存中最多缓存 4096 条。持续失败或进程退出可能导致时间线缺事件，worker 日志会提示。这只影响观测，不影响执行。
 

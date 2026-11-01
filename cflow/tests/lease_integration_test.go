@@ -51,7 +51,7 @@ func TestEngineLeaseIntegration(t *testing.T) {
 	}))
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	result, err := engine.Drive(ctx, flow, 10)
+	result, err := engine.Start(ctx, flow, 10)
 	if err != nil || result.Status != Completed || result.Output != 11 {
 		t.Fatalf("renewal did not protect commit: %+v %v", result, err)
 	}

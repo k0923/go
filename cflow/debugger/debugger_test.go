@@ -48,7 +48,23 @@ func (f *fixture) advance(d time.Duration) {
 	f.mu.Unlock()
 }
 
-func (f *fixture) engine(t *testing.T, run string) (*cflow.Engine, *Client) {
+type fixtureEngine struct {
+	*cflow.Engine
+	client  *Client
+	options cflow.Options
+}
+
+func (e *fixtureEngine) Start[I, O any](ctx context.Context, flow cflow.Flow[I, O], input I) (cflow.Result[O], error) {
+	opts := e.options
+	opts.Flows = map[string]cflow.FlowDefinition{"test": flow}
+	engine, err := cflow.NewEngine(e.client, opts)
+	if err != nil {
+		return cflow.Result[O]{Status: cflow.Failed}, err
+	}
+	return engine.Start(ctx, flow, input)
+}
+
+func (f *fixture) engine(t *testing.T, run string) (*fixtureEngine, *Client) {
 	t.Helper()
 	client, err := NewClient(f.server.URL, run)
 	if err != nil {
@@ -58,13 +74,13 @@ func (f *fixture) engine(t *testing.T, run string) (*cflow.Engine, *Client) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return engine, client
+	return &fixtureEngine{Engine: engine, client: client, options: cflow.Options{Now: f.clock, LeaseTTL: time.Minute}}, client
 }
 
-func definition[I, O any](flow cflow.FlowFunc[I, O]) cflow.Workflow[I, O] {
-	return cflow.NewWorkflow("test", "v2", cflow.FlowFunc[I, O](func(w *cflow.FlowContext, input I) (O, error) {
-		return w.RunFlow("main", flow, input)
-	}))
+func definition[I, O any](flow func(*cflow.FlowContext, I) (O, error)) cflow.Flow[I, O] {
+	return cflow.FlowFunc[I, O](func(w *cflow.FlowContext, input I) (O, error) {
+		return flow(w.Scope("main", ""), input)
+	})
 }
 
 func TestWaitForSubmitOverHTTP(t *testing.T) {
@@ -80,7 +96,7 @@ func TestWaitForSubmitOverHTTP(t *testing.T) {
 		answer := fc.WaitFor[map[string]string]("approval", map[string]int{"n": n})
 		return answer["by"], nil
 	})
-	result, err := engine.Drive(ctx, flow, 21)
+	result, err := engine.Start(ctx, flow, 21)
 	if err != nil || result.Status != cflow.Suspended || result.Pending[0].Key != "main|approval" {
 		t.Fatalf("%+v %v", result, err)
 	}
@@ -109,11 +125,11 @@ func TestWaitForSubmitOverHTTP(t *testing.T) {
 	if err != nil || len(wakes) != 1 || wakes[0].Key != "main|approval" {
 		t.Fatalf("wake %+v %v", wakes, err)
 	}
-	result, err = engine.Drive(ctx, flow, 21)
+	result, err = engine.Start(ctx, flow, 21)
 	if err != nil || result.Status != cflow.Completed || result.Output != "alice" || calls != 1 {
 		t.Fatalf("%+v %v calls=%d", result, err, calls)
 	}
-	if _, err = engine.Drive(ctx, flow, 22); !errors.Is(err, cflow.ErrChanged) {
+	if _, err = engine.Start(ctx, flow, 22); !errors.Is(err, cflow.ErrChanged) {
 		t.Fatalf("changed definition input must be rejected: %v", err)
 	}
 }
@@ -128,11 +144,11 @@ func TestLoopSleepAndFireOverHTTP(t *testing.T) {
 	ctx := context.Background()
 	calls := 0
 	flow := definition(func(fc *cflow.FlowContext, _ int) (poll, error) {
-		return fc.Loop("poll", cflow.AsAction(func(context.Context, int) (poll, error) { calls++; return poll{N: calls}, nil }),
-			0, cflow.LoopOptions{Interval: time.Hour, MaxAttempts: 3})
+		return fc.Poll("poll", cflow.AsAction(func(context.Context, int) (poll, error) { calls++; return poll{N: calls}, nil }),
+			0, cflow.PollOptions{Interval: time.Hour, MaxAttempts: 3})
 	})
 	for i := 0; i < 3; i++ {
-		result, err := engine.Drive(ctx, flow, 0)
+		result, err := engine.Start(ctx, flow, 0)
 		if err != nil || result.Status != cflow.Suspended || calls != 1 {
 			t.Fatalf("%+v %v calls=%d", result, err, calls)
 		}
@@ -146,7 +162,7 @@ func TestLoopSleepAndFireOverHTTP(t *testing.T) {
 	if wakes, _ := client.WaitWake(ctx, time.Second); len(wakes) == 0 {
 		t.Fatal("fired sleep must wake")
 	}
-	result, err := engine.Drive(ctx, flow, 0)
+	result, err := engine.Start(ctx, flow, 0)
 	if err != nil || result.Status != cflow.Completed || result.Output.N != 2 || calls != 2 {
 		t.Fatalf("%+v %v calls=%d", result, err, calls)
 	}
@@ -157,7 +173,7 @@ func TestSleepMaturesByClock(t *testing.T) {
 	engine, client := f.engine(t, "run-sleep")
 	ctx := context.Background()
 	flow := definition(func(fc *cflow.FlowContext, in int) (int, error) { fc.Sleep("nap", time.Minute); return in, nil })
-	if result, _ := engine.Drive(ctx, flow, 7); result.Status != cflow.Suspended {
+	if result, _ := engine.Start(ctx, flow, 7); result.Status != cflow.Suspended {
 		t.Fatal(result)
 	}
 	f.advance(time.Minute)
@@ -165,7 +181,7 @@ func TestSleepMaturesByClock(t *testing.T) {
 	if err != nil || len(wakes) != 1 || wakes[0].Key != "main|nap" {
 		t.Fatalf("%+v %v", wakes, err)
 	}
-	if result, err := engine.Drive(ctx, flow, 7); err != nil || result.Output != 7 {
+	if result, err := engine.Start(ctx, flow, 7); err != nil || result.Output != 7 {
 		t.Fatalf("%+v %v", result, err)
 	}
 }
@@ -179,7 +195,7 @@ func TestWaitAnyOverHTTP(t *testing.T) {
 		winner := fc.WaitAny("race", a, b, cflow.OnSleep("timeout", time.Hour))
 		return []string{winner.Key(), b.Value(), a.Failure()}, nil
 	})
-	result, err := engine.Drive(ctx, flow, 1)
+	result, err := engine.Start(ctx, flow, 1)
 	if err != nil || len(result.Pending) != 3 {
 		t.Fatalf("%+v %v", result, err)
 	}
@@ -189,7 +205,7 @@ func TestWaitAnyOverHTTP(t *testing.T) {
 	if ok, err := client.Submit(ctx, "main|race|b", "yes"); !ok || err != nil {
 		t.Fatalf("submit %t %v", ok, err)
 	}
-	result, err = engine.Drive(ctx, flow, 1)
+	result, err = engine.Start(ctx, flow, 1)
 	if err != nil || len(result.Output) != 3 || result.Output[0] != "main|race|b" || result.Output[1] != "yes" || result.Output[2] != "provider down" {
 		t.Fatalf("%+v %v", result, err)
 	}
@@ -213,7 +229,7 @@ func TestIdleWakePollDoesNotNotify(t *testing.T) {
 		return fc.WaitFor[string]("approval", in), nil
 	})
 	engine, client := f.engine(t, "idle")
-	if _, err := engine.Drive(ctx, flow, "x"); err != nil {
+	if _, err := engine.Start(ctx, flow, "x"); err != nil {
 		t.Fatal(err)
 	}
 	updates, unsubscribe := f.store.hub.subscribe()
@@ -249,10 +265,10 @@ func TestRunsAreIsolated(t *testing.T) {
 	})
 	a, clientA := f.engine(t, "iso-a")
 	b, clientB := f.engine(t, "iso-b")
-	if _, err := a.Drive(ctx, flow, "A"); err != nil {
+	if _, err := a.Start(ctx, flow, "A"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := b.Drive(ctx, flow, "B"); err != nil {
+	if _, err := b.Start(ctx, flow, "B"); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := clientA.Submit(ctx, "main|approval", "for-a"); err != nil {
@@ -261,8 +277,8 @@ func TestRunsAreIsolated(t *testing.T) {
 	if wakes, _ := clientB.WaitWake(ctx, 10*time.Millisecond); len(wakes) != 0 {
 		t.Fatalf("run b must not see run a wakes: %+v", wakes)
 	}
-	ra, _ := a.Drive(ctx, flow, "A")
-	rb, _ := b.Drive(ctx, flow, "B")
+	ra, _ := a.Start(ctx, flow, "A")
+	rb, _ := b.Start(ctx, flow, "B")
 	if ra.Output != "for-a" || rb.Status != cflow.Suspended {
 		t.Fatalf("%+v %+v", ra, rb)
 	}
@@ -292,7 +308,7 @@ func TestConcurrentEnginesExecuteActionOnce(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			_, err := engine.Drive(ctx, flow, 1)
+			_, err := engine.Start(ctx, flow, 1)
 			errs <- err
 		}()
 	}
@@ -312,7 +328,7 @@ func TestConcurrentEnginesExecuteActionOnce(t *testing.T) {
 		t.Fatalf("calls=%d conflicts=%d", calls.Load(), conflicts)
 	}
 	engine, _ := f.engine(t, "shared")
-	if result, err := engine.Drive(ctx, flow, 1); err != nil || result.Output != 2 || calls.Load() != 1 {
+	if result, err := engine.Start(ctx, flow, 1); err != nil || result.Output != 2 || calls.Load() != 1 {
 		t.Fatalf("%+v %v", result, err)
 	}
 }
@@ -328,7 +344,8 @@ func TestRunDrivesUntilCompleted(t *testing.T) {
 	})
 	done := make(chan cflow.Result[string], 1)
 	go func() {
-		result, err := Run(ctx, flow, "hi", Options{Server: f.server.URL, RunID: "auto", Logf: func(string, ...any) {}})
+		result, err := Run(ctx, flow, "hi", Options{Server: f.server.URL, RunID: "auto",
+			Engine: cflow.Options{Flows: map[string]cflow.FlowDefinition{"test": flow}}, Logf: func(string, ...any) {}})
 		if err != nil {
 			t.Error(err)
 		}
@@ -397,22 +414,27 @@ func TestEndToEndTwoIsolatedRuns(t *testing.T) {
 		}
 		return id, nil
 	})
-	flow := cflow.NewWorkflow("test", "v2", cflow.FlowFunc[string, string](func(w *cflow.FlowContext, id string) (string, error) {
+	notify := cflow.FlowFunc[string, string](func(fc *cflow.FlowContext, id string) (string, error) {
+		email, sms := cflow.OnSignal[string]("email_ack", id), cflow.OnSignal[string]("sms_ack", id)
+		winner := fc.WaitAny("channel", email, sms, cflow.OnSleep("give_up", time.Hour))
+		return winner.Key() + "=" + email.Value() + sms.Value(), nil
+	})
+	shipping := cflow.FlowFunc[string, shipment](func(fc *cflow.FlowContext, id string) (shipment, error) {
+		return fc.Poll("ship", cflow.AsAction(func(context.Context, string) (shipment, error) {
+			value, _ := polls.LoadOrStore(id, new(atomic.Int32))
+			n := int(value.(*atomic.Int32).Add(1))
+			return shipment{Attempt: n, Done_: n == 3}, nil
+		}), id, cflow.PollOptions{Interval: time.Hour, MaxAttempts: 5})
+	})
+	cooldown := cflow.FlowFunc[string, string](func(fc *cflow.FlowContext, output string) (string, error) {
+		fc.Sleep("cooldown", time.Hour)
+		return output, nil
+	})
+	flow := cflow.FlowFunc[string, string](func(w *cflow.FlowContext, id string) (string, error) {
 		if _, err := w.RunFlow("prepare", prepare, id); err != nil {
 			return "", err
 		}
-		notice := w.GoFlow("notify", cflow.FlowFunc[string, string](func(fc *cflow.FlowContext, id string) (string, error) {
-			email, sms := cflow.OnSignal[string]("email_ack", id), cflow.OnSignal[string]("sms_ack", id)
-			winner := fc.WaitAny("channel", email, sms, cflow.OnSleep("give_up", time.Hour))
-			return winner.Key() + "=" + email.Value() + sms.Value(), nil
-		}), id)
-		shipping := cflow.FlowFunc[string, shipment](func(fc *cflow.FlowContext, id string) (shipment, error) {
-			return fc.Loop("ship", cflow.AsAction(func(context.Context, string) (shipment, error) {
-				value, _ := polls.LoadOrStore(id, new(atomic.Int32))
-				n := int(value.(*atomic.Int32).Add(1))
-				return shipment{Attempt: n, Done_: n == 3}, nil
-			}), id, cflow.LoopOptions{Interval: time.Hour, MaxAttempts: 5})
-		})
+		notice := w.GoFlow("notify", notify, id)
 		ship, err := w.RunFlow("shipping", shipping, id)
 		if err != nil {
 			return "", err
@@ -421,12 +443,8 @@ func TestEndToEndTwoIsolatedRuns(t *testing.T) {
 		if err != nil {
 			return "", err
 		}
-		cooldown := cflow.FlowFunc[string, string](func(fc *cflow.FlowContext, output string) (string, error) {
-			fc.Sleep("cooldown", time.Hour)
-			return output, nil
-		})
 		return w.RunFlow("finish", cooldown, fmt.Sprintf("%s shipped@%d %s", id, ship.Attempt, text))
-	}))
+	})
 	type outcome struct {
 		result cflow.Result[string]
 		err    error
@@ -434,7 +452,10 @@ func TestEndToEndTwoIsolatedRuns(t *testing.T) {
 	start := func(id string) chan outcome {
 		done := make(chan outcome, 1)
 		go func() {
-			result, err := Run(ctx, flow, id, Options{Server: f.server.URL, RunID: id, RetryDelay: 50 * time.Millisecond, Logf: func(string, ...any) {}})
+			result, err := Run(ctx, flow, id, Options{Server: f.server.URL, RunID: id,
+				Engine: cflow.Options{Flows: map[string]cflow.FlowDefinition{
+					"test": flow, "prepare": prepare, "notify": notify, "shipping": shipping, "cooldown": cooldown,
+				}}, RetryDelay: 50 * time.Millisecond, Logf: func(string, ...any) {}})
 			done <- outcome{result, err}
 		}()
 		return done

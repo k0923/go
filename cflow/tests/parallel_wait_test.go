@@ -17,19 +17,22 @@ import (
 	"github.com/k0923/go/cflow/memory"
 )
 
-// One context remains: Flows compose Actions, waits and Flows. What stays
-// forbidden at compile time is executing a Workflow as a step or outside Drive.
-// 只保留一种上下文：Flow 组合 Action、等待与 Flow。编译期仍禁止的是把 Workflow
-// 当作步骤执行，或在 Drive 之外执行它。
+// Registration erases I/O only at the storage boundary; business calls retain
+// their generic signature, and definitions must implement the registration bridge.
 func TestFlowCallHierarchy(t *testing.T) {
 	// Compile external business code, rather than merely inspecting private flags.
 	source := `package boundary
 import "github.com/k0923/go/cflow"
-func forbidden(f *cflow.FlowContext, root cflow.Workflow[int, int]) {
-	root.Run(f, 1)
-	f.RunFlow[int, int]("root", root, 1)
-	var _ cflow.Flow[int, int] = root
+type Payment struct { cflow.FlowBase[int, string] }
+func (*Payment) Run(*cflow.FlowContext, int) (string, error) { return "", nil }
+type Unregistered struct{}
+func (*Unregistered) Run(*cflow.FlowContext, int) (int, error) { return 0, nil }
+func forbidden(f *cflow.FlowContext) {
+	var _ cflow.Flow[int, int] = &Payment{}
+	var _ cflow.FlowDefinition = &Unregistered{}
 	_ = cflow.WorkflowContext{}
+	_ = cflow.Workflow[int, int]{}
+	_ = cflow.NewWorkflow("old", "1", &Payment{})
 }
 `
 	path := filepath.Join(t.TempDir(), "boundary.go")
@@ -43,7 +46,8 @@ func forbidden(f *cflow.FlowContext, root cflow.Workflow[int, int]) {
 		t.Fatalf("expected compile-time rejection, got %v: %s", err, output)
 	}
 	for _, want := range []string{
-		"root.Run undefined", "missing method Run", "undefined: cflow.WorkflowContext",
+		"wrong type for method Run", "missing method bindFlow", "undefined: cflow.WorkflowContext",
+		"undefined: cflow.Workflow", "undefined: cflow.NewWorkflow",
 	} {
 		if !strings.Contains(string(output), want) {
 			t.Errorf("missing compiler rejection %q:\n%s", want, output)
@@ -61,8 +65,8 @@ func TestParallelFlowWaitRecovery(t *testing.T) {
 		const runs, branches = 12, 8
 		type run struct {
 			store         *memory.Infrastructure
-			engine        *Engine
-			flow          Workflow[int, int]
+			engine        *testDriver
+			flow          *flowFixture[int, int]
 			before, after atomic.Int32
 		}
 		all := make([]*run, runs)
@@ -70,27 +74,32 @@ func TestParallelFlowWaitRecovery(t *testing.T) {
 			r := &run{store: memory.New()}
 			r.store.SetClock(now)
 			r.engine = testEngine(t, r.store, Options{Now: now})
-			r.flow = NewWorkflow("test", "1", FlowFunc[int, int](func(f *FlowContext, input int) (int, error) {
+			children := make([]Flow[int, int], branches)
+			bindings := make(map[string]FlowDefinition)
+			for index := range branches {
+				children[index] = FlowFunc[int, int](func(child *FlowContext, input int) (int, error) {
+					if _, err := child.Run("before", AsAction(func(context.Context, int) (int, error) {
+						r.before.Add(1)
+						return input, nil
+					}), input); err != nil {
+						return 0, err
+					}
+					if index%2 == 0 {
+						child.WaitFor[string]("reply", input)
+					} else {
+						child.Sleep("sleep", time.Hour)
+					}
+					return child.Run("after", AsAction(func(context.Context, int) (int, error) {
+						r.after.Add(1)
+						return 1, nil
+					}), input)
+				})
+				bindings[fmt.Sprintf("branch_%d", index)] = children[index]
+			}
+			r.flow = namedDefinition("test", FlowFunc[int, int](func(f *FlowContext, input int) (int, error) {
 				futures := make([]*Future[int], branches)
 				for index := range branches {
-					child := FlowFunc[int, int](func(child *FlowContext, input int) (int, error) {
-						if _, err := child.Run("before", AsAction(func(context.Context, int) (int, error) {
-							r.before.Add(1)
-							return input, nil
-						}), input); err != nil {
-							return 0, err
-						}
-						if index%2 == 0 {
-							child.WaitFor[string]("reply", input)
-						} else {
-							child.Sleep("sleep", time.Hour)
-						}
-						return child.Run("after", AsAction(func(context.Context, int) (int, error) {
-							r.after.Add(1)
-							return 1, nil
-						}), input)
-					})
-					futures[index] = f.GoFlow(fmt.Sprintf("branch_%d", index), child, input)
+					futures[index] = f.GoFlow(fmt.Sprintf("branch_%d", index), children[index], input)
 				}
 				total := 0
 				for _, future := range futures {
@@ -102,6 +111,7 @@ func TestParallelFlowWaitRecovery(t *testing.T) {
 				}
 				return total, nil
 			}))
+			r.flow.Bindings = bindings
 			all[i] = r
 		}
 		for stage := range 4 {
@@ -110,7 +120,7 @@ func TestParallelFlowWaitRecovery(t *testing.T) {
 				wg.Add(1)
 				go func(index int, r *run) {
 					defer wg.Done()
-					result, err := r.engine.Drive(ctx, r.flow, index)
+					result, err := r.engine.Start(ctx, r.flow, index)
 					if err != nil {
 						t.Errorf("drive: %v", err)
 						return
@@ -187,14 +197,14 @@ func TestParallelFlowWaitRecovery(t *testing.T) {
 		defer engine.Subscribe(func(context.Context, Event) { changed.Add(1) }, InputChanged)()
 		request := 1
 		flow := definition(FlowFunc[int, string](func(f *FlowContext, _ int) (string, error) { return f.WaitFor[string]("reply", request), nil }))
-		first, err := engine.Drive(context.Background(), flow, 0)
+		first, err := engine.Start(context.Background(), flow, 0)
 		if err != nil || first.Status != Suspended {
 			t.Fatalf("%+v %v", first, err)
 		}
 		// The changed request is observed but not re-sent: the wait stays the same.
 		// 变化的请求会被观测但不会重发：等待保持不变。
 		request = 2
-		second, err := engine.Drive(context.Background(), flow, 0)
+		second, err := engine.Start(context.Background(), flow, 0)
 		record, _ := store.Get(context.Background(), "reply")
 		if err != nil || second.Status != Suspended || record == nil || string(record.Input) != "1" || changed.Load() != 1 {
 			t.Fatalf("%+v %v %+v changed=%d", second, err, record, changed.Load())
@@ -204,7 +214,7 @@ func TestParallelFlowWaitRecovery(t *testing.T) {
 		typed := definition(FlowFunc[int, string](func(f *FlowContext, _ int) (string, error) {
 			return fmt.Sprint(f.WaitFor[int]("reply", request)), nil
 		}))
-		if result, err := engine.Drive(context.Background(), typed, 0); err != nil || result.Status != Suspended || typeChanged.Load() != 1 {
+		if result, err := engine.Start(context.Background(), typed, 0); err != nil || result.Status != Suspended || typeChanged.Load() != 1 {
 			t.Fatalf("%+v %v type_changed=%d", result, err, typeChanged.Load())
 		}
 	})
@@ -218,7 +228,7 @@ func TestParallelFlowWaitRecovery(t *testing.T) {
 				wg.Add(1)
 				go func() {
 					defer wg.Done()
-					result, err := engine.Drive(context.Background(), flow, 1)
+					result, err := engine.Start(context.Background(), flow, 1)
 					if err != nil {
 						t.Errorf("drive: %v", err)
 						return
@@ -269,7 +279,7 @@ func TestFlowScopeJoinsActions(t *testing.T) {
 				return 1, nil
 			})
 			var continued atomic.Int32
-			root := NewWorkflow("test", "1", FlowFunc[int, int](func(f *FlowContext, input int) (int, error) {
+			root := namedDefinition("test", FlowFunc[int, int](func(f *FlowContext, input int) (int, error) {
 				var value int
 				var err error
 				if mode == "RunFlow" {
@@ -283,7 +293,8 @@ func TestFlowScopeJoinsActions(t *testing.T) {
 				continued.Add(1)
 				return value, nil
 			}))
-			result, err := engine.Drive(context.Background(), root, 1)
+			root.Bindings = map[string]FlowDefinition{"child": child}
+			result, err := engine.Start(context.Background(), root, 1)
 			if !errors.Is(err, cause) || result.Status != Running || continued.Load() != 0 {
 				t.Fatalf("%+v %v", result, err)
 			}
@@ -307,8 +318,9 @@ func TestFlowScopeJoinsActions(t *testing.T) {
 			f.WaitFor[string]("reply", input)
 			return 0, nil
 		})
-		root := NewWorkflow("test", "1", FlowFunc[int, int](func(f *FlowContext, input int) (int, error) { return f.GoFlow("child", child, input).Wait() }))
-		result, err := engine.Drive(ctx, root, 1)
+		root := namedDefinition("test", FlowFunc[int, int](func(f *FlowContext, input int) (int, error) { return f.GoFlow("child", child, input).Wait() }))
+		root.Bindings = map[string]FlowDefinition{"child": child}
+		result, err := engine.Start(ctx, root, 1)
 		if !errors.Is(err, context.Canceled) || result.Status != Running {
 			t.Fatalf("%+v %v", result, err)
 		}
@@ -335,7 +347,7 @@ func TestParallelFlowWaitAny(t *testing.T) {
 		winner := f.WaitAny("race", OnSignal[string]("reply", input), OnSleep("timeout", time.Hour))
 		return string(winner.Kind()), nil
 	})
-	root := NewWorkflow("test", "1", FlowFunc[int, string](func(f *FlowContext, input int) (string, error) {
+	root := namedDefinition("test", FlowFunc[int, string](func(f *FlowContext, input int) (string, error) {
 		left := f.GoFlow("left", candidate, input)
 		right := f.GoFlow("right", candidate, input)
 		l, err := left.Wait()
@@ -345,8 +357,9 @@ func TestParallelFlowWaitAny(t *testing.T) {
 		r, err := right.Wait()
 		return l + "+" + r, err
 	}))
+	root.Bindings = map[string]FlowDefinition{"candidate": candidate}
 	ctx := context.Background()
-	result, err := engine.Drive(ctx, root, 1)
+	result, err := engine.Start(ctx, root, 1)
 	if err != nil || result.Status != Suspended || len(result.Pending) != 4 {
 		t.Fatalf("%+v %v", result, err)
 	}
@@ -355,13 +368,13 @@ func TestParallelFlowWaitAny(t *testing.T) {
 	if ok, err := engine.ResolveSignal(ctx, left.Key, left.Version, "approved"); err != nil || !ok {
 		t.Fatalf("%t %v", ok, err)
 	}
-	result, err = engine.Drive(ctx, root, 1)
+	result, err = engine.Start(ctx, root, 1)
 	if err != nil || result.Status != Suspended || len(result.Pending) != 2 {
 		t.Fatalf("%+v %v", result, err)
 	}
 	clock.Add(int64(time.Hour))
 	for range 2 {
-		result, err = engine.Drive(ctx, root, 1)
+		result, err = engine.Start(ctx, root, 1)
 		if err != nil || result.Status != Completed || result.Output != "SIGNAL+SLEEP" {
 			t.Fatalf("%+v %v", result, err)
 		}

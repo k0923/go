@@ -127,38 +127,41 @@ func orchestrateOrder(root *cflow.FlowContext, order Order) (Summary, error) {
 	}
 	// Shipment polling and customer notification progress concurrently.
 	// 物流轮询和客户通知会并发推进。
-	notice := root.GoFlow("notify", cflow.FlowFunc[string, string](func(f *cflow.FlowContext, id string) (string, error) {
-		// Acks are typed in by hand in the debugger, so accept any JSON shape.
-		// ack 是在 debugger 中手动输入的，因此接受任意 JSON 形状。
-		email := cflow.OnSignal[json.RawMessage]("email_ack", map[string]string{"order": id, "channel": "email"})
-		sms := cflow.OnSignal[json.RawMessage]("sms_ack", map[string]string{"order": id, "channel": "sms"})
-		winner := f.WaitAny("channel", email, sms, cflow.OnSleep("give_up", 2*time.Minute))
-		switch winner {
-		case email:
-			return winner.Key() + ": " + string(email.Value()), nil
-		case sms:
-			return winner.Key() + ": " + string(sms.Value()), nil
-		}
-		return "no acknowledgement", nil
-	}), order.ID)
-
-	shipping := cflow.FlowFunc[string, Shipment](func(f *cflow.FlowContext, id string) (Shipment, error) {
-		return f.Loop("ship", cflow.AsAction(pollShipment), id, cflow.LoopOptions{
-			Interval: 15 * time.Second, MaxAttempts: 5,
-		})
-	})
-	if summary.Shipment, err = root.RunFlow("shipping", shipping, order.ID); err != nil {
+	notice := root.GoFlow("notify", noticeFlow, order.ID)
+	if summary.Shipment, err = root.RunFlow("shipping", shippingFlow, order.ID); err != nil {
 		return summary, err
 	}
 	if summary.Notice, err = notice.Wait(); err != nil {
 		return summary, err
 	}
-	cooldown := cflow.FlowFunc[Summary, Summary](func(f *cflow.FlowContext, summary Summary) (Summary, error) {
-		f.Sleep("cooldown", 5*time.Second)
-		return summary, nil
-	})
-	return root.RunFlow("finish", cooldown, summary)
+	return root.RunFlow("finish", cooldownFlow, summary)
 }
+
+var noticeFlow = cflow.FlowFunc[string, string](func(f *cflow.FlowContext, id string) (string, error) {
+	// Acks are typed in by hand in the debugger, so accept any JSON shape.
+	// ack 是在 debugger 中手动输入的，因此接受任意 JSON 形状。
+	email := cflow.OnSignal[json.RawMessage]("email_ack", map[string]string{"order": id, "channel": "email"})
+	sms := cflow.OnSignal[json.RawMessage]("sms_ack", map[string]string{"order": id, "channel": "sms"})
+	winner := f.WaitAny("channel", email, sms, cflow.OnSleep("give_up", 2*time.Minute))
+	switch winner {
+	case email:
+		return winner.Key() + ": " + string(email.Value()), nil
+	case sms:
+		return winner.Key() + ": " + string(sms.Value()), nil
+	}
+	return "no acknowledgement", nil
+})
+
+var shippingFlow = cflow.FlowFunc[string, Shipment](func(f *cflow.FlowContext, id string) (Shipment, error) {
+	return f.Poll("ship", cflow.AsAction(pollShipment), id, cflow.PollOptions{
+		Interval: 15 * time.Second, MaxAttempts: 5,
+	})
+})
+
+var cooldownFlow = cflow.FlowFunc[Summary, Summary](func(f *cflow.FlowContext, summary Summary) (Summary, error) {
+	f.Sleep("cooldown", 5*time.Second)
+	return summary, nil
+})
 
 func main() {
 	server := flag.String("server", debugger.DefaultServer, "debugger server URL")
@@ -168,13 +171,17 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer stop()
 
-	definition := cflow.NewWorkflow("order", "v2", cflow.FlowFunc[Order, Summary](orchestrateOrder))
+	definition := cflow.FlowFunc[Order, Summary](orchestrateOrder)
 	id := *run
 	if id == "" {
 		id = "order-" + uuid.NewString()
 	}
 	result, err := debugger.Run(ctx, definition, Order{ID: id, Amount: *amount}, debugger.Options{
 		Server: *server, RunID: id,
+		Engine: cflow.Options{Flows: map[string]cflow.FlowDefinition{
+			"order": definition, "prepare": prepareFlow, "notice": noticeFlow,
+			"shipping": shippingFlow, "cooldown": cooldownFlow,
+		}},
 	})
 	if err != nil {
 		log.Fatalf("workflow ended: %v", err)

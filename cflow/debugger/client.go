@@ -31,6 +31,7 @@ var (
 	_ cflow.Infrastructure        = (*Client)(nil)
 	_ memory.Outbox               = (*Client)(nil)
 	_ cflow.WaitAnyInfrastructure = (*Client)(nil)
+	_ cflow.ExecutionLoader       = (*Client)(nil)
 )
 
 // NewClient binds to an existing or new run ID. An empty server uses DefaultServer.
@@ -139,6 +140,14 @@ func (c *Client) Get(ctx context.Context, key string) (*cflow.Record, error) {
 		return nil, err
 	}
 	return fromView(out.Record), nil
+}
+
+func (c *Client) LoadExecution(ctx context.Context, owner string) (*cflow.ExecutionSnapshot, error) {
+	var out executionResponse
+	if err := c.infra(ctx, "load_execution", keyRequest{Key: owner}, &out); err != nil {
+		return nil, err
+	}
+	return fromSnapshotView(out.Snapshot), nil
 }
 
 func (c *Client) Commit(ctx context.Context, lease cflow.Lease, record *cflow.Record, expected int64) (*cflow.Record, error) {

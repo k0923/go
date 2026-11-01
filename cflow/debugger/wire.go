@@ -50,7 +50,6 @@ const (
 type RunSpec struct {
 	ID       string          `json:"id"`
 	Workflow string          `json:"workflow"`
-	Version  string          `json:"version"`
 	Input    json.RawMessage `json:"input,omitempty"`
 }
 
@@ -64,20 +63,19 @@ type Progress struct {
 }
 
 type RunInfo struct {
-	ID        string             `json:"id"`
-	Workflow  string             `json:"workflow"`
-	Version   string             `json:"version"`
-	Input     json.RawMessage    `json:"input,omitempty"`
-	Output    json.RawMessage    `json:"output,omitempty"`
-	Status    string             `json:"status"`
-	Error     string             `json:"error,omitempty"`
+	ID        string          `json:"id"`
+	Workflow  string          `json:"workflow"`
+	Input     json.RawMessage `json:"input,omitempty"`
+	Output    json.RawMessage `json:"output,omitempty"`
+	Status    string          `json:"status"`
+	Error     string          `json:"error,omitempty"`
 	Pending   []cflow.Pending `json:"pending"`
-	Drives    int                `json:"drives"`
-	CreatedAt time.Time          `json:"created_at"`
-	UpdatedAt time.Time          `json:"updated_at"`
-	LastSeen  time.Time          `json:"last_seen"`
-	Online    bool               `json:"online"`
-	Progress  Progress           `json:"progress"`
+	Drives    int             `json:"drives"`
+	CreatedAt time.Time       `json:"created_at"`
+	UpdatedAt time.Time       `json:"updated_at"`
+	LastSeen  time.Time       `json:"last_seen"`
+	Online    bool            `json:"online"`
+	Progress  Progress        `json:"progress"`
 }
 
 // RecordView is both the RPC encoding of cflow.Record and the UI view.
@@ -85,24 +83,25 @@ type RunInfo struct {
 // RecordView 既是 cflow.Record 的 RPC 编码，也是 UI 视图。
 // 空负载会被省略，因此 nil 可以在往返中保留，而不是变成 "null"。
 type RecordView struct {
-	Key       string          `json:"key"`
-	Path      cflow.Path   `json:"path,omitempty"`
-	Kind      cflow.Kind   `json:"kind"`
-	Status    cflow.Status `json:"status"`
-	Version   int64           `json:"version"`
-	Type      string          `json:"type,omitempty"`
-	Input     json.RawMessage `json:"input,omitempty"`
-	Result    json.RawMessage `json:"result,omitempty"`
-	Error     string          `json:"error,omitempty"`
-	Until     time.Time       `json:"until"`
-	StartedAt time.Time       `json:"started_at"`
-	EndedAt   time.Time       `json:"ended_at"`
-	UpdatedAt time.Time       `json:"updated_at"`
-	Group     string          `json:"group,omitempty"`
+	ExecutionKey string          `json:"execution_key,omitempty"`
+	Key          string          `json:"key"`
+	Path         cflow.Path      `json:"path,omitempty"`
+	Kind         cflow.Kind      `json:"kind"`
+	Status       cflow.Status    `json:"status"`
+	Version      int64           `json:"version"`
+	Type         string          `json:"type,omitempty"`
+	Input        json.RawMessage `json:"input,omitempty"`
+	Result       json.RawMessage `json:"result,omitempty"`
+	Error        string          `json:"error,omitempty"`
+	Until        time.Time       `json:"until"`
+	StartedAt    time.Time       `json:"started_at"`
+	EndedAt      time.Time       `json:"ended_at"`
+	UpdatedAt    time.Time       `json:"updated_at"`
+	Group        string          `json:"group,omitempty"`
 }
 
 type GroupView struct {
-	Key      string                 `json:"key"`
+	Key      string              `json:"key"`
 	Requests []cflow.WaitRequest `json:"requests"`
 	State    cflow.WaitAnyState  `json:"state"`
 }
@@ -135,9 +134,9 @@ type EventView struct {
 // Report is posted by the worker after every Drive.
 // Report 由 worker 在每次 Drive 后提交。
 type Report struct {
-	Status  string             `json:"status"`
-	Output  json.RawMessage    `json:"output,omitempty"`
-	Error   string             `json:"error,omitempty"`
+	Status  string          `json:"status"`
+	Output  json.RawMessage `json:"output,omitempty"`
+	Error   string          `json:"error,omitempty"`
 	Pending []cflow.Pending `json:"pending"`
 }
 
@@ -181,6 +180,7 @@ type (
 		Message string
 	}
 	recordResponse        struct{ Record *RecordView }
+	executionResponse     struct{ Snapshot *snapshotView }
 	leaseResponse         struct{ Lease *cflow.Lease }
 	boolResponse          struct{ OK bool }
 	notificationsResponse struct{ Notifications []memory.Notification }
@@ -192,7 +192,7 @@ func toView(r *cflow.Record, group string) *RecordView {
 		return nil
 	}
 	return &RecordView{
-		Key: r.Key, Path: append(cflow.Path(nil), r.Path...), Kind: r.Kind, Status: r.Status, Version: r.Version, Type: r.Type,
+		Key: r.Key, Path: append(cflow.Path(nil), r.Path...), ExecutionKey: r.ExecutionKey, Kind: r.Kind, Status: r.Status, Version: r.Version, Type: r.Type,
 		Input: clone(r.Input), Result: clone(r.Result), Error: r.Error,
 		Until: r.Until, StartedAt: r.StartedAt, EndedAt: r.EndedAt, Group: group,
 	}
@@ -203,7 +203,7 @@ func fromView(v *RecordView) *cflow.Record {
 		return nil
 	}
 	return &cflow.Record{
-		Key: v.Key, Path: append(cflow.Path(nil), v.Path...), Kind: v.Kind, Status: v.Status, Version: v.Version, Type: v.Type,
+		Key: v.Key, Path: append(cflow.Path(nil), v.Path...), ExecutionKey: v.ExecutionKey, Kind: v.Kind, Status: v.Status, Version: v.Version, Type: v.Type,
 		Input: clone(v.Input), Result: clone(v.Result), Error: v.Error,
 		Until: v.Until, StartedAt: v.StartedAt, EndedAt: v.EndedAt,
 	}
@@ -214,4 +214,34 @@ func clone(raw []byte) json.RawMessage {
 		return nil
 	}
 	return append(json.RawMessage(nil), raw...)
+}
+
+// snapshotView encodes records as RecordView so nil payloads and owners survive.
+// snapshotView 以 RecordView 编码记录，使 nil 负载和所属执行单元在往返中保留。
+type snapshotView struct {
+	Records []RecordView
+	Flows   []*cflow.FlowExecution
+	Loops   []*cflow.LoopSnapshot
+}
+
+func toSnapshotView(s *cflow.ExecutionSnapshot) *snapshotView {
+	if s == nil {
+		return nil
+	}
+	v := &snapshotView{Records: make([]RecordView, len(s.Records)), Flows: s.Flows, Loops: s.Loops}
+	for i, r := range s.Records {
+		v.Records[i] = *toView(r, "")
+	}
+	return v
+}
+
+func fromSnapshotView(v *snapshotView) *cflow.ExecutionSnapshot {
+	if v == nil {
+		return nil
+	}
+	s := &cflow.ExecutionSnapshot{Records: make([]*cflow.Record, len(v.Records)), Flows: v.Flows, Loops: v.Loops}
+	for i := range v.Records {
+		s.Records[i] = fromView(&v.Records[i])
+	}
+	return s
 }

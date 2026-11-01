@@ -23,6 +23,7 @@ import (
 // 每次 Drive 都从头回放，因此必须确定、不能打印、不能访问外部世界。
 // 下面所有步骤名都是固定文本，身份来自数据（见上表）。
 type TurnFlow struct {
+	cflow.FlowBase[TurnInput, TurnOutput]
 	Agent           Agent
 	Research        cflow.Flow[ResearchTask, ResearchReport]
 	ApprovalTimeout time.Duration
@@ -154,7 +155,10 @@ func (c TurnFlow) act(s *cflow.FlowContext, calls []ToolCall, out *TurnOutput) [
 // ResearchFlow 是子 Agent：拥有只读工具的独立 ReAct 循环，由 TurnFlow 通过 GoFlow 挂载。
 // 多个子 Agent 可并行运行，各自位于 sub_agent[<call id>] 之下。它也可以继续挂载子 Agent，
 // 嵌套深度受 Options.MaxFlowDepth 限制。
-type ResearchFlow struct{ Agent Agent }
+type ResearchFlow struct {
+	cflow.FlowBase[ResearchTask, ResearchReport]
+	Agent Agent
+}
 
 func (r ResearchFlow) Run(f *cflow.FlowContext, task ResearchTask) (ResearchReport, error) {
 	history := []Message{

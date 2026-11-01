@@ -42,7 +42,7 @@ func (c *recoveryCalls) check(t *testing.T, key string, want int32) {
 	}
 }
 
-func nestedRecoveryDefinition(calls *recoveryCalls) Workflow[int, []string] {
+func nestedRecoveryDefinition(calls *recoveryCalls) *flowFixture[int, []string] {
 	wait := FlowFunc[string, string](func(f *FlowContext, request string) (string, error) {
 		return f.WaitFor[string]("reply", request), nil
 	})
@@ -69,7 +69,7 @@ func nestedRecoveryDefinition(calls *recoveryCalls) Workflow[int, []string] {
 		av, err := a.Wait()
 		return []string{av, bv}, err
 	})
-	return NewWorkflow("nested_recovery", "1", FlowFunc[int, []string](func(f *FlowContext, _ int) ([]string, error) {
+	root := namedDefinition("nested_recovery", FlowFunc[int, []string](func(f *FlowContext, _ int) ([]string, error) {
 		x := f.GoFlow("group", group, recoveryBranch{"x"})
 		y := f.GoFlow("group", group, recoveryBranch{"y"})
 		xv, err := x.Wait()
@@ -79,6 +79,8 @@ func nestedRecoveryDefinition(calls *recoveryCalls) Workflow[int, []string] {
 		yv, err := y.Wait()
 		return append(xv, yv...), err
 	}))
+	root.Bindings = map[string]FlowDefinition{"group": group, "leaf": leaf, "wait": wait}
+	return root
 }
 
 func checkRecoveryPending(t *testing.T, result Result[[]string], keys ...string) {
@@ -95,7 +97,7 @@ func checkRecoveryPending(t *testing.T, result Result[[]string], keys ...string)
 	}
 }
 
-func signalRecovery(t *testing.T, e *Engine, ctx context.Context, key, answer string) {
+func signalRecovery(t *testing.T, e *testDriver, ctx context.Context, key, answer string) {
 	t.Helper()
 	accepted, err := e.Signal(ctx, key, answer)
 	if err != nil || !accepted {
@@ -111,7 +113,7 @@ func TestNestedFlowRecovery(t *testing.T) {
 		wait := FlowFunc[int, string](func(f *FlowContext, n int) (string, error) {
 			return f.WaitFor[string]("reply", n), nil
 		})
-		root := NewWorkflow("sequential", "1", FlowFunc[int, string](func(f *FlowContext, n int) (string, error) {
+		root := namedDefinition("sequential", FlowFunc[int, string](func(f *FlowContext, n int) (string, error) {
 			a, err := f.RunFlow("a", wait, n)
 			if err != nil {
 				return "", err
@@ -119,7 +121,8 @@ func TestNestedFlowRecovery(t *testing.T) {
 			b, err := f.RunFlow("b", wait, n)
 			return a + b, err
 		}))
-		first, err := engine.Drive(ctx, root, 0)
+		root.Bindings = map[string]FlowDefinition{"wait": wait}
+		first, err := engine.Start(ctx, root, 0)
 		if err != nil || first.Status != Suspended || len(first.Pending) != 1 || first.Pending[0].Key != "a|reply" {
 			t.Fatalf("%+v %v", first, err)
 		}
@@ -127,12 +130,12 @@ func TestNestedFlowRecovery(t *testing.T) {
 			t.Fatalf("second synchronous Flow registered too early: %+v %v", record, err)
 		}
 		signalRecovery(t, engine, ctx, "a|reply", "A")
-		second, err := engine.Drive(ctx, root, 0)
+		second, err := engine.Start(ctx, root, 0)
 		if err != nil || second.Status != Suspended || len(second.Pending) != 1 || second.Pending[0].Key != "b|reply" {
 			t.Fatalf("%+v %v", second, err)
 		}
 		signalRecovery(t, engine, ctx, "b|reply", "B")
-		last, err := engine.Drive(ctx, root, 0)
+		last, err := engine.Start(ctx, root, 0)
 		if err != nil || last.Status != Completed || last.Output != "AB" {
 			t.Fatalf("%+v %v", last, err)
 		}
@@ -149,7 +152,7 @@ func TestNestedFlowRecovery(t *testing.T) {
 			"group[x]|leaf[a]|wait|reply", "group[x]|leaf[b]|wait|reply",
 			"group[y]|leaf[a]|wait|reply", "group[y]|leaf[b]|wait|reply",
 		}
-		first, err := engine.Drive(ctx, root, 0)
+		first, err := engine.Start(ctx, root, 0)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -161,7 +164,7 @@ func TestNestedFlowRecovery(t *testing.T) {
 		}
 		// x/a finishes while x/b (waited first) is still suspended.
 		signalRecovery(t, engine, ctx, keys[0], "XA")
-		partial, err := testEngine(t, store, Options{}).Drive(ctx, root, 0)
+		partial, err := testEngine(t, store, Options{}).Start(ctx, root, 0)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -193,7 +196,7 @@ func TestNestedFlowRecovery(t *testing.T) {
 		if accepted.Load() != 3 {
 			t.Fatalf("accepted callbacks=%d, want one per remaining leaf", accepted.Load())
 		}
-		result, err := testEngine(t, store, Options{}).Drive(ctx, root, 0)
+		result, err := testEngine(t, store, Options{}).Start(ctx, root, 0)
 		want := []string{"XA", "XB", "YA", "YB"}
 		if err != nil || result.Status != Completed || !reflect.DeepEqual(result.Output, want) {
 			t.Fatalf("%+v %v", result, err)
@@ -205,7 +208,7 @@ func TestNestedFlowRecovery(t *testing.T) {
 			drives.Add(1)
 			go func() {
 				defer drives.Done()
-				result, err := e.Drive(ctx, root, 0)
+				result, err := e.Start(ctx, root, 0)
 				if err != nil || result.Status != Completed || !reflect.DeepEqual(result.Output, want) {
 					t.Errorf("replay: %+v %v", result, err)
 				}
@@ -241,7 +244,7 @@ func TestNestedFlowRecovery(t *testing.T) {
 		agent := FlowFunc[recoveryBranch, string](func(f *FlowContext, _ recoveryBranch) (string, error) {
 			return f.RunFlow("decision", decision, 0)
 		})
-		root := NewWorkflow("races", "1", FlowFunc[int, string](func(f *FlowContext, _ int) (string, error) {
+		root := namedDefinition("races", FlowFunc[int, string](func(f *FlowContext, _ int) (string, error) {
 			left := f.GoFlow("agent", agent, recoveryBranch{"left"})
 			right := f.GoFlow("agent", agent, recoveryBranch{"right"})
 			lv, err := left.Wait()
@@ -251,14 +254,15 @@ func TestNestedFlowRecovery(t *testing.T) {
 			rv, err := right.Wait()
 			return lv + "/" + rv, err
 		}))
-		first, err := engine.Drive(ctx, root, 0)
+		root.Bindings = map[string]FlowDefinition{"agent": agent, "decision": decision}
+		first, err := engine.Start(ctx, root, 0)
 		if err != nil || first.Status != Suspended || len(first.Pending) != 4 {
 			t.Fatalf("%+v %v", first, err)
 		}
 		left := "agent[left]|decision|race|"
 		right := "agent[right]|decision|race|"
 		signalRecovery(t, engine, ctx, left+"reply", "approved")
-		partial, err := engine.Drive(ctx, root, 0)
+		partial, err := engine.Start(ctx, root, 0)
 		if err != nil || partial.Status != Suspended || len(partial.Pending) != 2 {
 			t.Fatalf("%+v %v", partial, err)
 		}
@@ -268,7 +272,7 @@ func TestNestedFlowRecovery(t *testing.T) {
 			}
 		}
 		clock.Add(int64(time.Hour))
-		last, err := engine.Drive(ctx, root, 0)
+		last, err := engine.Start(ctx, root, 0)
 		if err != nil || last.Status != Completed || last.Output != "approved/timeout" {
 			t.Fatalf("%+v %v", last, err)
 		}
@@ -300,10 +304,11 @@ func TestNestedFlowRecovery(t *testing.T) {
 		middle := FlowFunc[int, string](func(f *FlowContext, n int) (string, error) {
 			return f.RunFlow("leaf", leaf, n)
 		})
-		root := NewWorkflow("late_snapshot", "1", FlowFunc[int, string](func(f *FlowContext, n int) (string, error) {
+		root := namedDefinition("late_snapshot", FlowFunc[int, string](func(f *FlowContext, n int) (string, error) {
 			return f.GoFlow("middle", middle, n).Wait()
 		}))
-		first, err := engine.Drive(ctx, root, 0)
+		root.Bindings = map[string]FlowDefinition{"middle": middle, "leaf": leaf}
+		first, err := engine.Start(ctx, root, 0)
 		if err != nil || resolveErr != nil || first.Status != Suspended || len(first.Pending) != 1 {
 			t.Fatalf("%+v drive=%v signal=%v", first, err, resolveErr)
 		}
@@ -324,7 +329,7 @@ func TestNestedFlowRecovery(t *testing.T) {
 		if wakes != 1 {
 			t.Fatalf("wake count=%d", wakes)
 		}
-		last, err := testEngine(t, store, Options{}).Drive(ctx, root, 0)
+		last, err := testEngine(t, store, Options{}).Start(ctx, root, 0)
 		if err != nil || last.Status != Completed || last.Output != "arrived" {
 			t.Fatalf("%+v %v", last, err)
 		}
@@ -354,10 +359,11 @@ func TestNestedFlowRecovery(t *testing.T) {
 		middle := FlowFunc[int, string](func(f *FlowContext, n int) (string, error) {
 			return f.RunFlow("leaf", leaf, n)
 		})
-		root := NewWorkflow("overlap", "1", FlowFunc[int, string](func(f *FlowContext, n int) (string, error) {
+		root := namedDefinition("overlap", FlowFunc[int, string](func(f *FlowContext, n int) (string, error) {
 			return f.GoFlow("middle", middle, n).Wait()
 		}))
-		first, err := engine.Drive(ctx, root, 0)
+		root.Bindings = map[string]FlowDefinition{"middle": middle, "leaf": leaf}
+		first, err := engine.Start(ctx, root, 0)
 		if err != nil || first.Status != Suspended {
 			t.Fatalf("%+v %v", first, err)
 		}
@@ -368,7 +374,7 @@ func TestNestedFlowRecovery(t *testing.T) {
 		}
 		done := make(chan outcome, 1)
 		go func() {
-			result, err := engine.Drive(ctx, root, 0)
+			result, err := engine.Start(ctx, root, 0)
 			done <- outcome{result, err}
 		}()
 		select {
@@ -378,7 +384,7 @@ func TestNestedFlowRecovery(t *testing.T) {
 		}
 		// A different engine loses this Action's lease, not the whole run's
 		// lease. Its cancellation must not cancel the first engine's Action.
-		competing, err := testEngine(t, store, Options{}).Drive(ctx, root, 0)
+		competing, err := testEngine(t, store, Options{}).Start(ctx, root, 0)
 		if competing.Status != Running || !errors.Is(err, ErrConflict) || calls.Load() != 1 {
 			t.Fatalf("competing=%+v err=%v calls=%d", competing, err, calls.Load())
 		}
@@ -387,7 +393,7 @@ func TestNestedFlowRecovery(t *testing.T) {
 		if winner.err != nil || winner.result.Status != Completed || winner.result.Output != "accepted:done" {
 			t.Fatalf("winner=%+v %v", winner.result, winner.err)
 		}
-		last, err := testEngine(t, store, Options{}).Drive(ctx, root, 0)
+		last, err := testEngine(t, store, Options{}).Start(ctx, root, 0)
 		if err != nil || last.Status != Completed || last.Output != "accepted:done" || calls.Load() != 1 {
 			t.Fatalf("retry=%+v %v calls=%d", last, err, calls.Load())
 		}
@@ -423,12 +429,13 @@ func TestNestedFlowRecovery(t *testing.T) {
 			f.GoFlow("leaf", leaf, n)
 			return n, nil
 		})
-		root := NewWorkflow("join", "1", FlowFunc[int, int](func(f *FlowContext, n int) (int, error) {
+		root := namedDefinition("join", FlowFunc[int, int](func(f *FlowContext, n int) (int, error) {
 			return f.RunFlow("middle", middle, n)
 		}))
+		root.Bindings = map[string]FlowDefinition{"middle": middle, "leaf": leaf}
 		done := make(chan error, 1)
 		go func() {
-			result, err := engine.Drive(ctx, root, 7)
+			result, err := engine.Start(ctx, root, 7)
 			select {
 			case <-stopped:
 			default:
@@ -458,48 +465,85 @@ func TestNestedFlowRecovery(t *testing.T) {
 		}
 	})
 
-	t.Run("nested framework failure cancels descendants and keeps waits", func(t *testing.T) {
+	t.Run("sibling failure leaves independent child IO and waits intact", func(t *testing.T) {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		store := memory.New()
 		engine := testEngine(t, store, Options{})
-		started, waiting, stopped := make(chan struct{}), make(chan struct{}), make(chan struct{})
-		var once sync.Once
-		engine.Subscribe(func(context.Context, Event) { once.Do(func() { close(waiting) }) }, WaitSuspended)
+		started, release, stopped := make(chan struct{}), make(chan struct{}), make(chan struct{})
 		long := FlowFunc[int, int](func(f *FlowContext, n int) (int, error) {
 			return f.Run("io", AsAction(func(ctx context.Context, _ int) (int, error) {
 				close(started)
 				defer close(stopped)
-				<-ctx.Done()
-				return 0, ctx.Err()
+				select {
+				case <-release:
+					return 1, nil
+				case <-ctx.Done():
+					return 0, ctx.Err()
+				}
 			}), n)
 		})
 		wait := FlowFunc[int, int](func(f *FlowContext, n int) (int, error) {
 			return f.WaitFor[int]("reply", n), nil
 		})
-		cause := errors.New("transient provider failure")
+		cause := errors.New("provider failure")
 		middle := FlowFunc[int, int](func(f *FlowContext, n int) (int, error) {
+			return 0, cause
+		})
+		root := namedDefinition("failure", FlowFunc[int, int](func(f *FlowContext, n int) (int, error) {
 			f.GoFlow("long", long, n)
 			f.GoFlow("waiting", wait, n)
-			<-started
-			<-waiting
-			return f.Run("fail", AsAction(func(context.Context, int) (int, error) { return 0, cause }), n)
-		})
-		root := NewWorkflow("failure", "1", FlowFunc[int, int](func(f *FlowContext, n int) (int, error) {
 			return f.GoFlow("middle", middle, n).Wait()
 		}))
-		result, err := engine.Drive(ctx, root, 0)
-		if result.Status != Running || !errors.Is(err, cause) {
+		// Use direct boundaries here to observe the sibling still running.
+		root.Bindings = nil
+		engine = testEngine(t, store, Options{Flows: map[string]FlowDefinition{
+			"failure": root, "long": long, "wait": wait, "middle": middle,
+		}})
+		if r, err := engine.Engine.Start(ctx, root, 0); err != nil || r.Status != Suspended {
+			t.Fatalf("register: %+v %v", r, err)
+		}
+		done := make(chan error, 1)
+		go func() {
+			_, err := engine.Resume(ctx, "long")
+			done <- err
+		}()
+		select {
+		case <-started:
+		case <-ctx.Done():
+			t.Fatal(ctx.Err())
+		}
+		if r, err := engine.Resume(ctx, "waiting"); err != nil || r.Status != Suspended {
+			t.Fatalf("wait: %+v %v", r, err)
+		}
+		if r, err := engine.Resume(ctx, "middle"); err == nil || r.Status != Failed {
+			t.Fatalf("failure: %+v %v", r, err)
+		}
+		result, err := engine.Engine.Start(ctx, root, 0)
+		if result.Status != Suspended || err != nil {
 			t.Fatalf("%+v %v", result, err)
 		}
 		select {
 		case <-stopped:
+			t.Fatal("sibling IO was cancelled by parent failure")
 		default:
-			t.Fatal("cancelled descendant IO was not joined")
 		}
-		record, err := store.Get(ctx, "middle|waiting|reply")
+		record, err := store.Get(ctx, "waiting|reply")
 		if err != nil || record == nil || record.Status != Suspended {
 			t.Fatalf("wait lost after sibling failure: %+v %v", record, err)
+		}
+		close(release)
+		if err := <-done; err != nil {
+			t.Fatal(err)
+		}
+		if ok, err := engine.Signal(ctx, "waiting|reply", 1); !ok || err != nil {
+			t.Fatalf("%t %v", ok, err)
+		}
+		if r, err := engine.Resume(ctx, "waiting"); err != nil || r.Status != Completed {
+			t.Fatalf("wait completion: %+v %v", r, err)
+		}
+		if r, err := engine.Engine.Start(ctx, root, 0); err == nil || r.Status != Failed {
+			t.Fatalf("joined failure: %+v %v", r, err)
 		}
 		if leases, _, _, _ := store.Stats(); leases != 0 {
 			t.Fatal("lease leaked after nested cancellation")

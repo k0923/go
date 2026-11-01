@@ -40,7 +40,7 @@ func (m *Infrastructure) WaitAny(ctx context.Context, key string, requests []cfl
 		m.advanceWaitGroup(key)
 		return copyWaitAnyState(existing.state), nil
 	}
-	if m.records[key] != nil {
+	if m.records[key] != nil || m.loops[key] != nil || m.flows[key] != nil {
 		return nil, cflow.ErrChanged
 	}
 	seen := map[string]bool{key: true}
@@ -57,19 +57,21 @@ func (m *Infrastructure) WaitAny(ctx context.Context, key string, requests []cfl
 		default:
 			return nil, fmt.Errorf("%w: %s", cflow.ErrSignalUnsupported, request.Kind)
 		}
-		if m.records[request.Key] != nil || m.waitGroups[request.Key] != nil || m.waitOwners[request.Key] != "" {
+		if m.records[request.Key] != nil || m.waitGroups[request.Key] != nil || m.waitOwners[request.Key] != "" ||
+			m.loops[request.Key] != nil || m.flows[request.Key] != nil || request.ExecutionKey != requests[0].ExecutionKey {
 			return nil, cflow.ErrChanged
 		}
 		seen[request.Key] = true
 	}
 	group := &memoryWaitGroup{state: cflow.WaitAnyState{Status: cflow.Suspended}}
+	m.owners[key] = requests[0].ExecutionKey
 	for _, request := range requests {
 		raw := append(json.RawMessage(nil), request.Request...)
 		storedRequest := request
 		storedRequest.Request = raw
 		storedRequest.Path = append(cflow.Path(nil), request.Path...)
 		group.requests = append(group.requests, storedRequest)
-		record := &cflow.Record{Key: request.Key, Path: append(cflow.Path(nil), request.Path...), Kind: request.Kind, Status: cflow.Suspended, Version: 1, Type: request.Type,
+		record := &cflow.Record{Key: request.Key, Path: append(cflow.Path(nil), request.Path...), ExecutionKey: request.ExecutionKey, Kind: request.Kind, Status: cflow.Suspended, Version: 1, Type: request.Type,
 			Input: raw, StartedAt: m.now()}
 		if request.Error != "" {
 			record.Status, record.Error, record.EndedAt = cflow.Failed, request.Error, m.now()
@@ -80,7 +82,7 @@ func (m *Infrastructure) WaitAny(ctx context.Context, key string, requests []cfl
 				record.Until = m.now().Add(request.Duration)
 			}
 		}
-		m.records[request.Key] = record
+		m.setRecord(record)
 		m.waitOwners[request.Key] = key
 		if record.Status == cflow.Failed {
 			group.state.Failures = append(group.state.Failures, cflow.WaitFailure{Key: record.Key, Message: record.Error})
@@ -97,7 +99,7 @@ func (m *Infrastructure) WaitAny(ctx context.Context, key string, requests []cfl
 	if len(group.state.Pending) == 0 {
 		group.state.Status = cflow.Failed
 		id := fmt.Sprintf("%s|%s|failed", key, WakeNotification)
-		m.messages[id] = Notification{ID: id, Key: key, Purpose: WakeNotification, AvailableAt: m.now()}
+		m.messages[id] = Notification{ID: id, Key: key, ExecutionKey: m.owners[key], Purpose: WakeNotification, AvailableAt: m.now()}
 	}
 	m.advanceWaitGroup(key)
 	return copyWaitAnyState(group.state), nil
@@ -132,7 +134,7 @@ func (m *Infrastructure) settleWaitGroup(groupKey string, winner *cflow.Record) 
 			cancelled.Status = cflow.Cancelled
 			cancelled.Version++
 			cancelled.EndedAt = m.now()
-			m.records[request.Key] = cancelled
+			m.setRecord(cancelled)
 			m.enqueue(cancelled, CancelNotification, m.now())
 		}
 	}
@@ -170,7 +172,7 @@ func (m *Infrastructure) FailWait(ctx context.Context, key string, version int64
 	failed.Version++
 	failed.Error = message
 	failed.EndedAt = m.now()
-	m.records[key] = failed
+	m.setRecord(failed)
 	m.removeWaitMessages(key)
 	group.state.Failures = append(group.state.Failures, cflow.WaitFailure{Key: key, Message: message})
 	group.state.Pending = nil
@@ -184,13 +186,13 @@ func (m *Infrastructure) FailWait(ctx context.Context, key string, version int64
 		// Preserve a durable wake even when every member failed.
 		// 即使每个成员都失败，也保留一个持久化 wake。
 		id := fmt.Sprintf("%s|%s|failed", groupKey, WakeNotification)
-		m.messages[id] = Notification{ID: id, Key: groupKey, Purpose: WakeNotification, AvailableAt: m.now()}
+		m.messages[id] = Notification{ID: id, Key: groupKey, ExecutionKey: m.owners[groupKey], Purpose: WakeNotification, AvailableAt: m.now()}
 	}
 	return true, nil
 }
 
 func pendingRecord(record *cflow.Record) cflow.Pending {
-	return cflow.Pending{Key: record.Key, Path: append(cflow.Path(nil), record.Path...), Kind: record.Kind, Until: record.Until}
+	return cflow.Pending{Key: record.Key, Path: append(cflow.Path(nil), record.Path...), ExecutionKey: record.ExecutionKey, Kind: record.Kind, Until: record.Until}
 }
 
 // A due timer is resolved under the same lock used by callbacks. Among due

@@ -2,6 +2,7 @@ package cflow
 
 import (
 	"context"
+	"encoding/json"
 	"time"
 
 	"github.com/k0923/go/lease"
@@ -23,8 +24,12 @@ type Infrastructure interface {
 	Get(context.Context, string) (*Record, error)
 	// Commit checks CURRENT lease generation and expiry and record version in
 	// one atomic write. expected=0 means insert-only. Success increments version.
+	// The lease is either the Action's own (Lease.Key == Record.Key, root run)
+	// or its owner's (Lease.Key == Record.ExecutionKey, resumed child); an existing
+	// record must keep its ExecutionKey.
 	// Commit 在一次原子写入中检查当前租约 generation、过期时间和记录版本。
-	// expected=0 表示仅插入。成功后递增版本。
+	// expected=0 表示仅插入。成功后递增版本。租约可以是 Action 自身的（Key 等于记录 key，根运行），
+	// 也可以是所属执行单元的（Key 等于 Record.ExecutionKey，恢复子级时）；已有记录的 ExecutionKey 不得改变。
 	Commit(context.Context, Lease, *Record, int64) (*Record, error)
 	// Put inserts a checkpoint, definition or waiting record if absent, or
 	// returns the existing record. It never overwrites a resolved signal.
@@ -34,7 +39,7 @@ type Infrastructure interface {
 	Put(context.Context, *Record) (*Record, error)
 	// Resolve checks suspended status, kind and version; commits the response
 	// AND a distinct wake-up intent atomically, so the caller's dispatcher can
-	// Drive the run again. Already resolved is a no-op returning false. A stale
+	// Resume the run again. Already resolved is a no-op returning false. A stale
 	// version returns ErrConflict. How delivery is exposed (an outbox, MQ, ...)
 	// is the adapter's choice; see package memory for a reference outbox.
 	// Resolve 检查 suspended 状态、kind 和版本；并原子地提交响应以及一个独立的唤醒意图，
@@ -43,13 +48,44 @@ type Infrastructure interface {
 	Resolve(context.Context, string, int64, []byte) (bool, error)
 }
 
-// RecordLister is OPTIONAL. When implemented, Drive loads the run's records in
-// one call and replays terminal outcomes (finished Actions, resolved waits,
-// checkpoints) without a per-step Get. Returned records must be deep copies.
-// RecordLister 是可选接口。实现后，Drive 会一次性加载 run 的记录，并在不逐步 Get
-// 的情况下回放终态结果（已结束的 Action、已解析的等待、检查点）。返回的记录必须是深拷贝。
+// RecordLister is an optional observation interface. Drive and DriveFlow read
+// only the steps in their own execution boundary. Records must be deep copies.
+// RecordLister 是可选观测接口；Drive 与 DriveFlow 按需读取各自执行边界中的步骤。
+// 返回的记录必须是深拷贝。
 type RecordLister interface {
 	Records(context.Context) ([]*Record, error)
+}
+
+// ExecutionLoader is OPTIONAL. When implemented, Drive and DriveFlow load
+// everything one boundary replays from in one call: the records it owns
+// (Record.ExecutionKey; "" is the root), and the standalone children and loops
+// it started (ParentKey). Terminal entries replay without further reads.
+// Nothing of other boundaries may be returned. Values must be deep copies.
+// It runs before every Start/Resume of every boundary, so index ownership:
+// the cost must depend on that boundary's own data, not on the whole run.
+// ExecutionLoader 是可选接口。实现后，Drive 与 DriveFlow 一次性加载某个执行边界回放所需的全部数据：
+// 它拥有的记录（Record.ExecutionKey，根为空），以及它启动的独立子级和循环（ParentKey）。
+// 终态项回放时不再读取存储。不得返回其他边界的数据；返回值必须是深拷贝。
+// 每个执行边界每次 Start/Resume 前都会调用它，因此需按归属建立索引：成本只应取决于该边界自身的数据，
+// 而不是整个运行。
+type ExecutionLoader interface {
+	LoadExecution(context.Context, string) (*ExecutionSnapshot, error)
+}
+
+// ExecutionSnapshot is the replay state of one boundary. Flows holds standalone
+// children (LoopKey == ""); each loop carries its successful outputs in index
+// order once terminal.
+// ExecutionSnapshot 是一个执行边界的回放状态。Flows 为独立子级（LoopKey 为空）；
+// 循环终态后按下标携带成功前缀的输出。
+type ExecutionSnapshot struct {
+	Records []*Record
+	Flows   []*FlowExecution
+	Loops   []*LoopSnapshot
+}
+
+type LoopSnapshot struct {
+	LoopState
+	Outputs []json.RawMessage `json:",omitempty"`
 }
 
 // Clock is OPTIONAL. When Options.Now is nil, NewEngine uses the store's clock

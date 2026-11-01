@@ -341,12 +341,49 @@ func (s *Server) infra(w http.ResponseWriter, r *http.Request, run string) {
 		err      error
 	)
 	switch op := r.PathValue("op"); op {
+	case "get_loop":
+		var body keyRequest
+		if err = decode(r, &body); err == nil {
+			response, err = s.store.GetLoop(ctx, run, body.Key)
+		}
+	case "start_loop":
+		var body startLoopRequest
+		if err = decode(r, &body); err == nil {
+			response, err = s.store.StartLoop(ctx, run, body.Spec, body.Items)
+		}
+	case "get_flow":
+		var body keyRequest
+		if err = decode(r, &body); err == nil {
+			response, err = s.store.GetFlow(ctx, run, body.Key)
+		}
+	case "start_flow":
+		var body cflow.FlowExecution
+		if err = decode(r, &body); err == nil {
+			response, err = s.store.StartFlow(ctx, run, body)
+		}
+	case "commit_flow":
+		var body commitFlowRequest
+		if err = decode(r, &body); err == nil {
+			response, err = s.store.CommitFlow(ctx, run, body.Lease, body.Item, body.Expected)
+		}
+	case "loop_results":
+		var body keyRequest
+		if err = decode(r, &body); err == nil {
+			response, err = s.store.LoopResults(ctx, run, body.Key)
+		}
 	case "get":
 		var body keyRequest
 		if err = decode(r, &body); err == nil {
 			var record *cflow.Record
 			record, err = s.store.Get(ctx, run, body.Key)
 			response = recordResponse{Record: toView(record, "")}
+		}
+	case "load_execution":
+		var body keyRequest
+		if err = decode(r, &body); err == nil {
+			var snapshot *cflow.ExecutionSnapshot
+			snapshot, err = s.store.LoadExecution(ctx, run, body.Key)
+			response = executionResponse{Snapshot: toSnapshotView(snapshot)}
 		}
 	case "claim":
 		var body claimRequest

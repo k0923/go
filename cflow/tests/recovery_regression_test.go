@@ -44,12 +44,12 @@ func TestPermanentFailureCommitRecovery(t *testing.T) {
 					return 0, Permanent(domain)
 				}), input)
 			}))
-			result, err := engine.Drive(context.Background(), flow, 1)
+			result, err := engine.Start(context.Background(), flow, 1)
 			if result.Status != Running || !errors.Is(err, outage) || !errors.Is(err, domain) {
 				t.Fatalf("unconfirmed commit terminated: %+v %v", result, err)
 			}
 			store.failure = nil
-			result, err = engine.Drive(context.Background(), flow, 1)
+			result, err = engine.Start(context.Background(), flow, 1)
 			if result.Status != Failed || err == nil {
 				t.Fatalf("recovery did not converge to committed failure: %+v %v", result, err)
 			}
@@ -86,7 +86,7 @@ func TestPermanentTimeoutAndPanicRemainRetryable(t *testing.T) {
 					return 7, nil
 				}), input, ActionOptions{Timeout: time.Millisecond})
 			}))
-			result, err := engine.Drive(context.Background(), flow, 1)
+			result, err := engine.Start(context.Background(), flow, 1)
 			if mode == "flow_panic" {
 				// Orchestration panics are definition bugs: terminal, fixed by a new version.
 				// 编排 panic 属于定义缺陷：终态，通过新版本修复。
@@ -114,7 +114,7 @@ func TestPermanentTimeoutAndPanicRemainRetryable(t *testing.T) {
 				t.Fatalf("fault persisted as failure: %+v", record)
 			}
 			broken = false
-			result, err = engine.Drive(context.Background(), flow, 1)
+			result, err = engine.Start(context.Background(), flow, 1)
 			if result.Status != Completed || err != nil || result.Output != 7 {
 				t.Fatalf("fault cannot recover: %+v %v", result, err)
 			}
@@ -137,7 +137,7 @@ func TestSequentialWaitsHaltStrand(t *testing.T) {
 		f.WaitFor[int]("right", input)
 		return 0, cause
 	}))
-	result, err := engine.Drive(context.Background(), flow, 1)
+	result, err := engine.Start(context.Background(), flow, 1)
 	if err != nil || result.Status != Suspended || len(result.Pending) != 1 || result.Pending[0].Key != "left" {
 		t.Fatalf("%+v %v", result, err)
 	}
@@ -154,17 +154,15 @@ func TestAbortWinsOverSiblingSuspension(t *testing.T) {
 	engine := testEngine(t, memory.New(), Options{})
 	cause := errors.New("503")
 	waiting := make(chan struct{})
-	root := NewWorkflow("test", "1", FlowFunc[int, int](func(w *FlowContext, input int) (int, error) {
-		w.GoFlow("wait", FlowFunc[int, int](func(f *FlowContext, input int) (int, error) {
-			defer close(waiting)
-			return f.WaitFor[int]("reply", input), nil
-		}), input)
-		return w.RunFlow("fail", FlowFunc[int, int](func(f *FlowContext, input int) (int, error) {
+	root := namedDefinition("test", FlowFunc[int, int](func(w *FlowContext, input int) (int, error) {
+		w.Go("fail", AsAction(func(context.Context, int) (int, error) {
 			<-waiting
-			return f.Run("io", AsAction(func(context.Context, int) (int, error) { return 0, cause }), input)
+			return 0, cause
 		}), input)
+		defer close(waiting)
+		return w.WaitFor[int]("reply", input), nil
 	}))
-	result, err := engine.Drive(context.Background(), root, 1)
+	result, err := engine.Start(context.Background(), root, 1)
 	if !errors.Is(err, cause) || result.Status != Running || len(result.Pending) != 1 {
 		t.Fatalf("%+v %v", result, err)
 	}
@@ -181,7 +179,7 @@ func TestActionOutputNormalizedBeforeCommit(t *testing.T) {
 		return fmt.Sprintf("%T:%v", result["n"], result["n"]), err
 	}))
 	for range 2 {
-		result, err := engine.Drive(context.Background(), flow, 1)
+		result, err := engine.Start(context.Background(), flow, 1)
 		if err != nil || result.Output != "float64:1" {
 			t.Fatalf("first execution and replay disagree: %+v %v", result, err)
 		}
@@ -200,7 +198,7 @@ func TestTypedJSONNumberPreservesLargeInteger(t *testing.T) {
 		}), input)
 	}))
 	for range 2 {
-		result, err := engine.Drive(context.Background(), flow, 1)
+		result, err := engine.Start(context.Background(), flow, 1)
 		if err != nil || result.Output.Number.String() != "9007199254740993" {
 			t.Fatalf("numeric precision changed: %+v %v", result, err)
 		}
@@ -214,24 +212,12 @@ func TestWaitAnyFailedCandidateIdentity(t *testing.T) {
 	flow := definition(FlowFunc[int, waitOutcome](func(f *FlowContext, input int) (waitOutcome, error) {
 		return waitAnyOutcome(f, "race", OnSignal[string](key, make(chan int)), OnSignal[string]("good", input))
 	}))
-	result, err := engine.Drive(context.Background(), flow, 1)
+	result, err := engine.Start(context.Background(), flow, 1)
 	if result.Status != Suspended || err != nil || len(result.Pending) != 1 {
 		t.Fatalf("%+v %v", result, err)
 	}
 	key = "renamed"
-	if _, err = engine.Drive(context.Background(), flow, 1); !errors.Is(err, ErrChanged) {
+	if _, err = engine.Start(context.Background(), flow, 1); !errors.Is(err, ErrChanged) {
 		t.Fatal("failed candidate rename not rejected", err)
-	}
-	fresh := memory.New()
-	engine = testEngine(t, fresh, Options{})
-	invalid := definition(FlowFunc[int, waitOutcome](func(f *FlowContext, input int) (waitOutcome, error) {
-		return waitAnyOutcome(f, "race", OnKind[string]("CUSTOM", "bad", make(chan int)), OnSignal[string]("good", input))
-	}))
-	if _, err = engine.Drive(context.Background(), invalid, 1); !errors.Is(err, ErrSignalUnsupported) {
-		t.Fatal("unsupported kind bypassed by encoding error", err)
-	}
-	messages, _ := fresh.Pending(context.Background(), time.Now())
-	if len(messages) != 0 {
-		t.Fatal("invalid group registered a provider request", messages)
 	}
 }

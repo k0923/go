@@ -20,6 +20,14 @@ import (
 // Infrastructure 是并发安全的参考实现。每次运行使用一个实例。
 // 它不是生产级持久化数据库。
 type Infrastructure struct {
+	loops     map[string]*cflow.LoopState
+	flows     map[string]*cflow.FlowExecution
+	loopItems map[string][]string
+	owners    map[string]string
+	// boundaries indexes immutable ownership so LoadExecution reads one
+	// boundary without scanning the run.
+	// boundaries 索引不可变的归属关系，使 LoadExecution 只读取一个执行边界而不扫描整个运行。
+	boundaries  map[string]*boundary
 	mu          sync.Mutex
 	records     map[string]*cflow.Record
 	leases      map[string]cflow.Lease
@@ -30,11 +38,36 @@ type Infrastructure struct {
 	now         func() time.Time
 }
 
+// boundary holds the keys one execution boundary owns: its records
+// (Record.ExecutionKey), standalone children and loops (ParentKey).
+// boundary 保存一个执行边界拥有的 key：记录（Record.ExecutionKey）、独立子级和循环（ParentKey）。
+type boundary struct{ records, flows, loops map[string]bool }
+
+func (m *Infrastructure) boundary(owner string) *boundary {
+	b := m.boundaries[owner]
+	if b == nil {
+		b = &boundary{records: map[string]bool{}, flows: map[string]bool{}, loops: map[string]bool{}}
+		m.boundaries[owner] = b
+	}
+	return b
+}
+
+// setRecord stores r and indexes its owner. Callers hold m.mu.
+// setRecord 保存 r 并索引其所属执行单元。调用方持有 m.mu。
+func (m *Infrastructure) setRecord(r *cflow.Record) {
+	if previous := m.records[r.Key]; previous != nil && previous.ExecutionKey != r.ExecutionKey {
+		delete(m.boundary(previous.ExecutionKey).records, r.Key)
+	}
+	m.records[r.Key] = r
+	m.boundary(r.ExecutionKey).records[r.Key] = true
+}
+
 var (
 	_ cflow.Infrastructure        = (*Infrastructure)(nil)
-	_ Outbox                         = (*Infrastructure)(nil)
+	_ Outbox                      = (*Infrastructure)(nil)
 	_ cflow.WaitAnyInfrastructure = (*Infrastructure)(nil)
 	_ cflow.RecordLister          = (*Infrastructure)(nil)
+	_ cflow.ExecutionLoader       = (*Infrastructure)(nil)
 	_ cflow.Clock                 = (*Infrastructure)(nil)
 )
 
@@ -44,7 +77,9 @@ func New() *Infrastructure {
 	return &Infrastructure{
 		records: make(map[string]*cflow.Record), leases: make(map[string]cflow.Lease),
 		generations: make(map[string]int64), messages: make(map[string]Notification),
-		now:        time.Now,
+		now:   time.Now,
+		loops: make(map[string]*cflow.LoopState), flows: make(map[string]*cflow.FlowExecution),
+		loopItems: make(map[string][]string), owners: make(map[string]string), boundaries: make(map[string]*boundary),
 		waitGroups: make(map[string]*memoryWaitGroup), waitOwners: make(map[string]string),
 	}
 }
@@ -65,7 +100,7 @@ func (m *Infrastructure) SetClock(now func() time.Time) {
 func (m *Infrastructure) Seed(r *cflow.Record) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.records[r.Key] = copyRecord(r)
+	m.setRecord(copyRecord(r))
 }
 
 // Stats reports live leases, records, WaitAny groups and grouped members, for
@@ -111,6 +146,41 @@ func (m *Infrastructure) Records(ctx context.Context) ([]*cflow.Record, error) {
 	}
 	sort.Slice(result, func(i, j int) bool { return result[i].Key < result[j].Key })
 	return result, nil
+}
+
+// LoadExecution returns deep copies of one boundary's records, standalone
+// children and loops ("" is the root Drive); terminal loops carry outputs.
+// Only the boundary's own index is visited.
+// LoadExecution 以深拷贝返回某个执行边界（根 Drive 为空）的记录、独立子级和循环；终态循环带输出。
+// 只访问该边界自己的索引。
+func (m *Infrastructure) LoadExecution(ctx context.Context, owner string) (*cflow.ExecutionSnapshot, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	snapshot := &cflow.ExecutionSnapshot{}
+	b := m.boundaries[owner]
+	if b == nil {
+		return snapshot, nil
+	}
+	for key := range b.records {
+		if r := m.records[key]; r.Kind != cflow.DefinitionKind {
+			snapshot.Records = append(snapshot.Records, copyRecord(r))
+		}
+	}
+	for key := range b.flows {
+		snapshot.Flows = append(snapshot.Flows, copyFlow(m.flows[key]))
+	}
+	for key := range b.loops {
+		loop := m.loops[key]
+		view := &cflow.LoopSnapshot{LoopState: *copyLoop(loop)}
+		if loop.Status == cflow.Completed || loop.Status == cflow.Failed {
+			view.Outputs = m.loopOutputs(loop)
+		}
+		snapshot.Loops = append(snapshot.Loops, view)
+	}
+	return snapshot, nil
 }
 
 // Now is the store clock that also decides lease expiry.
@@ -178,10 +248,10 @@ func (m *Infrastructure) Commit(ctx context.Context, l cflow.Lease, r *cflow.Rec
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	if r == nil || l.Key != r.Key || r.Kind != cflow.ActionKind {
+	if r == nil || (l.Key != r.Key && (r.ExecutionKey == "" || l.Key != r.ExecutionKey)) || r.Kind != cflow.ActionKind {
 		return nil, cflow.ErrInvalid
 	}
-	if m.waitGroups[r.Key] != nil {
+	if m.waitGroups[r.Key] != nil || m.loops[r.Key] != nil || m.flows[r.Key] != nil {
 		return nil, cflow.ErrChanged
 	}
 	if !m.valid(l) {
@@ -194,12 +264,15 @@ func (m *Infrastructure) Commit(ctx context.Context, l cflow.Lease, r *cflow.Rec
 	if current != nil && (current.Kind != cflow.ActionKind || current.Status == cflow.Completed || current.Status == cflow.Failed) {
 		return nil, cflow.ErrConflict
 	}
+	if current != nil && current.ExecutionKey != r.ExecutionKey {
+		return nil, cflow.ErrChanged
+	}
 	if r.Status != cflow.Running && r.Status != cflow.Completed && r.Status != cflow.Failed {
 		return nil, cflow.ErrInvalid
 	}
 	c := copyRecord(r)
 	c.Version = expected + 1
-	m.records[r.Key] = c
+	m.setRecord(c)
 	return copyRecord(c), nil
 }
 
@@ -212,7 +285,7 @@ func (m *Infrastructure) Put(ctx context.Context, r *cflow.Record) (*cflow.Recor
 	if r == nil || (r.Kind != cflow.CheckpointKind && r.Kind != cflow.DefinitionKind && r.Kind != cflow.SignalKind && r.Kind != cflow.SleepKind) {
 		return nil, cflow.ErrInvalid
 	}
-	if m.waitGroups[r.Key] != nil {
+	if m.waitGroups[r.Key] != nil || m.loops[r.Key] != nil || m.flows[r.Key] != nil {
 		return nil, cflow.ErrChanged
 	}
 	if existing := m.records[r.Key]; existing != nil {
@@ -227,7 +300,8 @@ func (m *Infrastructure) Put(ctx context.Context, r *cflow.Record) (*cflow.Recor
 	}
 	c := copyRecord(r)
 	c.Version = 1
-	m.records[r.Key] = c
+	m.setRecord(c)
+	m.owners[r.Key] = r.ExecutionKey
 	if c.Kind == cflow.SignalKind {
 		m.enqueue(c, RequestNotification, m.now())
 	}
@@ -239,7 +313,11 @@ func (m *Infrastructure) Put(ctx context.Context, r *cflow.Record) (*cflow.Recor
 
 func (m *Infrastructure) enqueue(r *cflow.Record, purpose string, at time.Time) {
 	id := fmt.Sprintf("%s|%s|%d", r.Key, purpose, r.Version)
-	m.messages[id] = Notification{ID: id, Key: r.Key, Purpose: purpose, AvailableAt: at}
+	owner := r.ExecutionKey
+	if owner == "" {
+		owner = m.owners[r.Key]
+	}
+	m.messages[id] = Notification{ID: id, Key: r.Key, ExecutionKey: owner, Purpose: purpose, AvailableAt: at}
 }
 
 func (m *Infrastructure) Resolve(ctx context.Context, key string, version int64, response []byte) (bool, error) {
@@ -287,7 +365,7 @@ func (m *Infrastructure) completeWaitRecord(r *cflow.Record, response []byte) {
 	c.Version++
 	c.EndedAt = m.now()
 	c.Result = append(json.RawMessage(nil), response...)
-	m.records[key] = c
+	m.setRecord(c)
 	if groupKey := m.waitOwners[key]; groupKey != "" {
 		m.settleWaitGroup(groupKey, c)
 	}

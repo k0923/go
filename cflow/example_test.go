@@ -9,7 +9,7 @@ import (
 	"github.com/k0923/go/cflow/memory"
 )
 
-type OrderFlow struct{}
+type OrderFlow struct{ cflow.FlowBase[string, string] }
 
 // SubmitOrder is an ordinary named function and can be tested independently.
 // A real HTTP implementation would forward a stable run ID + ActionKey(ctx)
@@ -20,30 +20,30 @@ func SubmitOrder(ctx context.Context, orderID string) (string, error) {
 	return "submitted_" + orderID, nil
 }
 
-func (OrderFlow) Run(ctx *cflow.FlowContext, orderID string) (string, error) {
-	submitted, err := ctx.Run("submit", cflow.AsAction(SubmitOrder), orderID)
+func (OrderFlow) Run(f *cflow.FlowContext, orderID string) (string, error) {
+	submitted, err := f.Run("submit", cflow.AsAction(SubmitOrder), orderID)
 	if err != nil {
 		return "", err
 	}
-	return ctx.WaitFor[string]("approval", submitted), nil
+	return f.WaitFor[string]("approval", submitted), nil
 }
 
-func ExampleEngine_Drive() {
+func ExampleEngine_Start() {
 	store := memory.New()
-	engine, err := cflow.NewEngine(store, cflow.Options{})
+	order := OrderFlow{}
+	engine, err := cflow.NewEngine(store, cflow.Options{
+		Flows: map[string]cflow.FlowDefinition{"order": order},
+	})
 	if err != nil {
 		panic(err)
 	}
-	order := cflow.NewWorkflow("order", "1", cflow.FlowFunc[string, string](func(f *cflow.FlowContext, id string) (string, error) {
-		return f.RunFlow("order", OrderFlow{}, id)
-	}))
 	ctx := context.Background()
-	first, err := engine.Drive(ctx, order, "order_123")
+	first, err := engine.Start(ctx, order, "order_123")
 	if err != nil {
 		panic(err)
 	}
 	fmt.Println(first.Status, first.Pending[0].Key)
-	request, err := store.Get(ctx, "order|approval")
+	request, err := store.Get(ctx, "approval")
 	if err != nil {
 		panic(err)
 	}
@@ -51,24 +51,24 @@ func ExampleEngine_Drive() {
 	if err != nil {
 		panic(err)
 	}
-	second, err := engine.Drive(ctx, order, "order_123")
+	// The callback's WAKE resumes the root; Flow and input are already stored.
+	second, err := engine.Resume(ctx, "")
 	if err != nil {
 		panic(err)
 	}
-	fmt.Println(second.Status, second.Output)
+	fmt.Println(second.Status, string(second.Output))
 	// Output:
-	// SUSPENDED order|approval
-	// COMPLETED approved
-}
-
-func exampleDefinition[I, O any](name, version string, flow cflow.Flow[I, O]) cflow.Workflow[I, O] {
-	return cflow.NewWorkflow(name, version, cflow.FlowFunc[I, O](func(f *cflow.FlowContext, input I) (O, error) {
-		return f.RunFlow("main", flow, input)
-	}))
+	// SUSPENDED approval
+	// COMPLETED "approved"
 }
 
 func ExampleEngine_Subscribe() {
-	engine, err := cflow.NewEngine(memory.New(), cflow.Options{})
+	definition := cflow.FlowFunc[int, int](func(f *cflow.FlowContext, input int) (int, error) {
+		return f.Run("increment", cflow.Pure(func(n int) int { return n + 1 }), input)
+	})
+	engine, err := cflow.NewEngine(memory.New(), cflow.Options{
+		Flows: map[string]cflow.FlowDefinition{"demo": definition},
+	})
 	if err != nil {
 		panic(err)
 	}
@@ -77,16 +77,11 @@ func ExampleEngine_Subscribe() {
 	}, cflow.ActionFinished, cflow.DriveFinished)
 	defer unsubscribe()
 
-	definition := exampleDefinition("demo", "1",
-		cflow.FlowFunc[int, int](func(ctx *cflow.FlowContext, input int) (int, error) {
-			return ctx.Run("increment", cflow.Pure(func(n int) int { return n + 1 }), input)
-		}),
-	)
-	if _, err := engine.Drive(context.Background(), definition, 1); err != nil {
+	if _, err := engine.Start(context.Background(), definition, 1); err != nil {
 		panic(err)
 	}
 	// Output:
-	// action_finished main|increment COMPLETED
+	// action_finished increment COMPLETED
 	// drive_finished demo COMPLETED
 }
 
@@ -96,38 +91,38 @@ func ExampleOnSignal() {
 	type reply struct{ Text string }
 	ctx := context.Background()
 	store := memory.New()
-	engine, err := cflow.NewEngine(store, cflow.Options{})
+	flow := cflow.FlowFunc[string, string](func(f *cflow.FlowContext, request string) (string, error) {
+		answer := cflow.OnSignal[reply]("reply", request)
+		timeout := cflow.OnSleep("timeout", time.Hour)
+		winner := f.WaitAny("signals", answer, timeout)
+		if winner == timeout {
+			return "timeout", nil
+		}
+		return answer.Value().Text, nil
+	})
+	engine, err := cflow.NewEngine(store, cflow.Options{
+		Flows: map[string]cflow.FlowDefinition{"reply_or_timeout": flow},
+	})
 	if err != nil {
 		panic(err)
 	}
-	flow := exampleDefinition("reply_or_timeout", "1",
-		cflow.FlowFunc[string, string](func(f *cflow.FlowContext, request string) (string, error) {
-			answer := cflow.OnSignal[reply]("reply", request)
-			timeout := cflow.OnSleep("timeout", time.Hour)
-			winner := f.WaitAny("signals", answer, timeout)
-			if winner == timeout {
-				return "timeout", nil
-			}
-			return answer.Value().Text, nil
-		}),
-	)
-	waiting, err := engine.Drive(ctx, flow, "request")
+	waiting, err := engine.Start(ctx, flow, "request")
 	if err != nil {
 		panic(err)
 	}
 	fmt.Println("waiting signals:", len(waiting.Pending))
-	record, err := store.Get(ctx, "main|signals|reply")
+	record, err := store.Get(ctx, "signals|reply")
 	if err != nil {
 		panic(err)
 	}
 	if _, err = engine.ResolveSignal(ctx, record.Key, record.Version, reply{Text: "answer"}); err != nil {
 		panic(err)
 	}
-	completed, err := engine.Drive(ctx, flow, "request")
+	completed, err := engine.Start(ctx, flow, "request")
 	if err != nil {
 		panic(err)
 	}
-	timeout, err := store.Get(ctx, "main|signals|timeout")
+	timeout, err := store.Get(ctx, "signals|timeout")
 	if err != nil {
 		panic(err)
 	}
@@ -142,43 +137,43 @@ func ExampleOnSignal() {
 func ExampleFlowContext_WaitAny() {
 	ctx := context.Background()
 	store := memory.New()
-	engine, err := cflow.NewEngine(store, cflow.Options{})
+	definition := cflow.FlowFunc[string, string](func(f *cflow.FlowContext, input string) (string, error) {
+		primary := cflow.OnSignal[string]("primary", input)
+		secondary := cflow.OnSignal[string]("secondary", input)
+		winner := f.WaitAny("providers", primary, secondary)
+		switch winner {
+		case primary:
+			return winner.Key() + ": " + primary.Value(), nil
+		default:
+			return winner.Key() + ": " + secondary.Value(), nil
+		}
+	})
+	engine, err := cflow.NewEngine(store, cflow.Options{
+		Flows: map[string]cflow.FlowDefinition{"approval": definition},
+	})
 	if err != nil {
 		panic(err)
 	}
-	definition := exampleDefinition("approval", "1",
-		cflow.FlowFunc[string, string](func(f *cflow.FlowContext, input string) (string, error) {
-			primary := cflow.OnSignal[string]("primary", input)
-			secondary := cflow.OnSignal[string]("secondary", input)
-			winner := f.WaitAny("providers", primary, secondary)
-			switch winner {
-			case primary:
-				return winner.Key() + ": " + primary.Value(), nil
-			default:
-				return winner.Key() + ": " + secondary.Value(), nil
-			}
-		}),
-	)
-	waiting, err := engine.Drive(ctx, definition, "order_123")
+	waiting, err := engine.Start(ctx, definition, "order_123")
 	if err != nil {
 		panic(err)
 	}
 	fmt.Println(waiting.Status, len(waiting.Pending))
 	// Both requests are durable and available for independent providers.
 	// 两个请求都是持久化的，并且可供独立提供方使用。
-	secondary, err := store.Get(ctx, "main|providers|secondary")
+	secondary, err := store.Get(ctx, "providers|secondary")
 	if err != nil {
 		panic(err)
 	}
 	if _, err = engine.ResolveSignal(ctx, secondary.Key, secondary.Version, "approved"); err != nil {
 		panic(err)
 	}
-	primary, err := store.Get(ctx, "main|providers|primary")
+	primary, err := store.Get(ctx, "providers|primary")
 	if err != nil {
 		panic(err)
 	}
 	fmt.Println("primary:", primary.Status)
-	completed, err := engine.Drive(ctx, definition, "order_123")
+	completed, err := engine.Start(ctx, definition, "order_123")
 	if err != nil {
 		panic(err)
 	}
@@ -186,5 +181,5 @@ func ExampleFlowContext_WaitAny() {
 	// Output:
 	// SUSPENDED 2
 	// primary: CANCELLED
-	// COMPLETED main|providers|secondary: approved
+	// COMPLETED providers|secondary: approved
 }
