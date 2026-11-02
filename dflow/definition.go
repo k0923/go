@@ -3,269 +3,173 @@ package dflow
 import (
 	"context"
 	"fmt"
-	"maps"
 	"reflect"
 	"slices"
 )
 
-type NodeSpec struct {
-	ID     string
-	Node   Node
-	Inputs Parameters
+type Edge interface {
+	GetSourceNodeID() string
+	GetTargetNodeID() string
 }
 
-type Edge struct {
-	SourceNodeID string
-	TargetNodeID string
-	SourcePortID string
+// Definition has one root and may have multiple sinks. V is used only while
+// compiling, R only while executing.
+type Definition[V any, R any] interface {
+	GetNodes() []NodeSpec[V, R]
+	GetEdges() []Edge
 }
 
-// Definition has exactly one root/start node and may have multiple sinks. All
-// nodes participate in the run. Version must change when application-provided
-// node implementations change.
-//
-// Definition 恰好有一个 root/start 节点，并且可以有多个 sink。所有节点都会
-// 参与执行。当应用提供的节点实现发生变化时，Version 必须随之变化。
-type Definition struct {
-	Version string
-	Nodes   []NodeSpec
-	Edges   []Edge
+// PublishedNode exposes a validated runtime record without prescribing its
+// business representation or storage format. Implementations must be immutable
+// and safe for concurrent reads. Returned slices and nodes are read-only.
+type PublishedNode[R any] interface {
+	GetID() string
+	GetNode() RuntimeNode[R]
+	GetIncoming() []string
+	GetOutgoing() []string
+	// GetDependencies is the complete, duplicate-free list of output sources
+	// this node may read. It is independent of direct control-flow predecessors.
+	GetDependencies() []string
 }
 
-// Graph is compiled, immutable and reusable across run-scoped infrastructures.
-//
-// Graph 是已编译、不可变的结构，可在多个 run 作用域的 Infrastructure 中复用。
-type Graph struct {
-	definition Definition
-	hash       string
-	order      []string
-	specs      map[string]NodeSpec
-	incoming   map[string][]Edge
-	outgoing   map[string][]Edge
+// DefinitionProvider is bound to one validated immutable publication. LoadNode
+// loads one executable record.
+type DefinitionProvider[R any] interface {
+	LoadNode(context.Context, string) (PublishedNode[R], error)
 }
 
-// Compile validates topology, references and node configurations without running
-// nodes.
-//
-// Compile 在不运行节点的情况下校验拓扑、引用和节点配置。
-func Compile(definition Definition) (*Graph, error) {
-	if definition.Version == "" {
-		return nil, fmt.Errorf("%w: immutable definition version required", ErrInvalidDefinition)
-	}
-	def := definition
-	def.Nodes = slices.Clone(definition.Nodes)
-	def.Edges = slices.Clone(definition.Edges)
-	for index := range def.Nodes {
-		def.Nodes[index].Inputs = maps.Clone(def.Nodes[index].Inputs)
-	}
-	g := &Graph{
-		definition: def, specs: map[string]NodeSpec{},
-		incoming: map[string][]Edge{}, outgoing: map[string][]Edge{},
-	}
-	fail := func(id, detail string, cause error) (*Graph, error) {
+// Compile validates topology and business-built publications, returning the
+// original business objects in topological order. It does not run nodes, wrap
+// publications or supply a storage/provider implementation.
+func Compile[V any, R any](ctx context.Context, definition Definition[V, R], vc V) ([]PublishedNode[R], error) {
+	fail := func(id, detail string, cause error) ([]PublishedNode[R], error) {
 		return nil, &ValidationError{NodeID: id, Detail: detail, Cause: cause}
 	}
-	if len(def.Nodes) == 0 {
-		return fail("", "at least one node is required", ErrInvalidDefinition)
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
-	for _, spec := range def.Nodes {
-		if spec.ID == "" || spec.ID == InputSource {
-			return fail(spec.ID, "empty or reserved node ID", ErrInvalidDefinition)
-		}
-		if _, exists := g.specs[spec.ID]; exists {
-			return fail(spec.ID, "duplicate node ID", ErrInvalidDefinition)
-		}
-		g.specs[spec.ID] = spec
+	if isNil(definition) {
+		return fail("", "nil definition", ErrInvalidDefinition)
 	}
-	seen := map[Edge]bool{}
+	nodes := definition.GetNodes()
+	edges := definition.GetEdges()
+	if len(nodes) == 0 {
+		return fail("", "at least one node required", ErrInvalidDefinition)
+	}
+	specs := make(map[string]NodeSpec[V, R], len(nodes))
+	incoming := make(map[string][]string, len(nodes))
+	outgoing := make(map[string][]string, len(nodes))
+	ids := make([]string, 0, len(nodes))
+	for _, spec := range nodes {
+		if isNil(spec) {
+			return fail("", "nil node spec", ErrInvalidDefinition)
+		}
+		id := spec.GetID()
+		if id == "" {
+			return fail(id, "empty node ID", ErrInvalidDefinition)
+		}
+		if _, exists := specs[id]; exists {
+			return fail(id, "duplicate node ID", ErrInvalidDefinition)
+		}
+		ids = append(ids, id)
+		specs[id] = spec
+	}
+	seen := map[[2]string]bool{}
 	degrees := map[string]int{}
-	for _, edge := range def.Edges {
-		if _, ok := g.specs[edge.SourceNodeID]; !ok {
-			return fail(edge.SourceNodeID, "edge source not found", ErrInvalidDefinition)
+	for _, edge := range edges {
+		if isNil(edge) {
+			return fail("", "nil edge", ErrInvalidDefinition)
 		}
-		if _, ok := g.specs[edge.TargetNodeID]; !ok {
-			return fail(edge.TargetNodeID, "edge target not found", ErrInvalidDefinition)
+		key := [2]string{edge.GetSourceNodeID(), edge.GetTargetNodeID()}
+		source, target := key[0], key[1]
+		_, sourceOK := specs[source]
+		_, targetOK := specs[target]
+		if !sourceOK || !targetOK || seen[key] {
+			return fail(target, "invalid or duplicate edge", ErrInvalidDefinition)
 		}
-		if seen[edge] {
-			return fail(edge.TargetNodeID, "duplicate edge", ErrInvalidDefinition)
-		}
-		seen[edge] = true
-		g.incoming[edge.TargetNodeID] = append(g.incoming[edge.TargetNodeID], edge)
-		g.outgoing[edge.SourceNodeID] = append(g.outgoing[edge.SourceNodeID], edge)
-		degrees[edge.TargetNodeID]++
+		seen[key] = true
+		outgoing[source] = append(outgoing[source], target)
+		incoming[target] = append(incoming[target], source)
+		degrees[target]++
 	}
-	for _, spec := range def.Nodes {
-		if degrees[spec.ID] == 0 {
-			g.order = append(g.order, spec.ID)
+	order := make([]string, 0, len(ids))
+	for _, id := range ids {
+		if degrees[id] == 0 {
+			order = append(order, id)
 		}
 	}
-	for i := 0; i < len(g.order); i++ {
-		for _, edge := range g.outgoing[g.order[i]] {
-			degrees[edge.TargetNodeID]--
-			if degrees[edge.TargetNodeID] == 0 {
-				g.order = append(g.order, edge.TargetNodeID)
+	if len(order) != 1 {
+		return fail("", "exactly one root required", ErrInvalidDefinition)
+	}
+	for i := 0; i < len(order); i++ {
+		for _, id := range outgoing[order[i]] {
+			degrees[id]--
+			if degrees[id] == 0 {
+				order = append(order, id)
 			}
 		}
 	}
-	if len(g.order) != len(def.Nodes) {
+	if len(order) != len(ids) {
 		return fail("", "graph contains a cycle", ErrInvalidDefinition)
 	}
-	roots := 0
-	for _, id := range g.order {
-		if len(g.incoming[id]) == 0 {
-			roots++
-		}
-	}
-	if roots != 1 {
-		return fail("", "exactly one start node is required", ErrInvalidDefinition)
-	}
 	ancestors := map[string]map[string]bool{}
-	for _, id := range g.order {
+	publication := make([]PublishedNode[R], 0, len(order))
+	for _, id := range order {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		ancestors[id] = map[string]bool{}
-		for _, edge := range g.incoming[id] {
-			ancestors[id][edge.SourceNodeID] = true
-			for ancestor := range ancestors[edge.SourceNodeID] {
+		for _, predecessor := range incoming[id] {
+			ancestors[id][predecessor] = true
+			for ancestor := range ancestors[predecessor] {
 				ancestors[id][ancestor] = true
 			}
 		}
-		for key, parameter := range g.specs[id].Inputs {
-			if isNil(parameter) {
-				return fail(id, "input "+key, ErrInvalidReference)
-			}
-			refs, err := parameter.References()
-			if err != nil {
-				return fail(id, "input "+key, err)
-			}
-			for _, path := range refs {
-				if err := validatePath(path); err != nil {
-					return fail(id, "input "+key, err)
-				}
-				if path[0] != InputSource && !ancestors[id][path[0]] {
-					return fail(id, fmt.Sprintf("input %q references non-ancestor %q", key, path[0]), ErrInvalidReference)
-				}
-			}
+		spec := specs[id]
+		if err := spec.Validate(ctx, vc); err != nil {
+			return fail(id, "node configuration", err)
 		}
-	}
-	for _, spec := range def.Nodes {
-		if isNil(spec.Node) {
-			return fail(spec.ID, "node required", ErrInvalidDefinition)
-		}
-		if validator, ok := spec.Node.(NodeValidator); ok {
-			if err := validator.Validate(); err != nil {
-				return fail(spec.ID, "node configuration", err)
-			}
-		}
-	}
-	g.hash = def.Version
-	return g, nil
-}
-
-// Manifest is the small immutable header needed to start or recover execution.
-//
-// Manifest 是启动或恢复执行所需的小型不可变头信息。
-type Manifest struct {
-	Hash  string
-	Start string
-}
-
-// PublishedNode contains an executable node plus validated topology. Incoming
-// contains UNIQUE predecessor IDs, not the number of incoming ports.
-//
-// PublishedNode 包含可执行节点和已校验的拓扑。Incoming 保存唯一的前驱节点
-// ID，而不是入端口数量。
-type PublishedNode struct {
-	Spec     NodeSpec
-	Incoming []string
-	Outgoing []Edge
-}
-
-// DefinitionProvider binds to ONE immutable, already validated publication.
-// Implementations load individual database records, not the whole definition.
-// Return independent metadata copies with immutable nodes and parameters.
-// Manifest.Hash is an application-supplied version; change it when definitions
-// change.
-//
-// DefinitionProvider 绑定到一个不可变且已经校验过的发布版本。实现应加载单条
-// 数据库记录，而不是整份定义。返回的元数据副本应彼此独立，并包含不可变节点
-// 和参数。Manifest.Hash 是应用提供的版本；定义变化时应同步更新它。
-type DefinitionProvider interface {
-	Manifest(context.Context) (Manifest, error)
-	LoadNode(context.Context, string) (*PublishedNode, error)
-	// Incoming loads only a target's predecessor index, not its config.
-	//
-	// Incoming 只加载目标节点的前驱索引，而不加载它的配置。
-	Incoming(context.Context, string) ([]string, error)
-}
-
-func (g *Graph) Incoming(ctx context.Context, id string) ([]string, error) {
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
-	if _, exists := g.specs[id]; !exists {
-		return nil, ErrInvalidDefinition
-	}
-	var result []string
-	seen := map[string]bool{}
-	for _, edge := range g.incoming[id] {
-		if !seen[edge.SourceNodeID] {
-			seen[edge.SourceNodeID] = true
-			result = append(result, edge.SourceNodeID)
-		}
-	}
-	return result, nil
-}
-func (g *Graph) Manifest(ctx context.Context) (Manifest, error) {
-	if err := ctx.Err(); err != nil {
-		return Manifest{}, err
-	}
-	m := Manifest{Hash: g.hash}
-	for _, id := range g.order {
-		if len(g.incoming[id]) == 0 {
-			m.Start = id
-			return m, nil
-		}
-	}
-	return Manifest{}, ErrInvalidDefinition
-}
-
-func (g *Graph) LoadNode(ctx context.Context, id string) (*PublishedNode, error) {
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
-	spec, exists := g.specs[id]
-	if !exists {
-		return nil, fmt.Errorf("%w: node %q", ErrInvalidDefinition, id)
-	}
-	spec.Inputs = maps.Clone(spec.Inputs)
-	node := PublishedNode{Spec: spec, Outgoing: slices.Clone(g.outgoing[id])}
-	seen := map[string]bool{}
-	for _, edge := range g.incoming[id] {
-		if !seen[edge.SourceNodeID] {
-			seen[edge.SourceNodeID] = true
-			node.Incoming = append(node.Incoming, edge.SourceNodeID)
-		}
-	}
-	return &node, nil
-}
-
-// Publication exports executable records. The application decides how to store
-// configuration and rebuild nodes and dependencies.
-//
-// Publication 导出可执行记录。应用自行决定如何存储配置，以及如何重建节点和依赖。
-func (g *Graph) Publication() (Manifest, []PublishedNode, error) {
-	m, err := g.Manifest(context.Background())
-	if err != nil {
-		return m, nil, err
-	}
-	nodes := make([]PublishedNode, 0, len(g.order))
-	for _, id := range g.order {
-		node, err := g.LoadNode(context.Background(), id)
+		record, err := spec.Build(ctx, vc)
 		if err != nil {
-			return m, nil, err
+			return fail(id, "build node", err)
 		}
-		nodes = append(nodes, *node)
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		if isNil(record) || record.GetID() != id {
+			return fail(id, "invalid publication", ErrInvalidDefinition)
+		}
+		if isNil(record.GetNode()) {
+			return fail(id, "invalid runtime node", ErrInvalidDefinition)
+		}
+		if !sameIDs(record.GetIncoming(), incoming[id]) || !sameIDs(record.GetOutgoing(), outgoing[id]) {
+			return fail(id, "publication topology does not match definition edges", ErrInvalidDefinition)
+		}
+		deps := record.GetDependencies()
+		if err := validateIDs(deps); err != nil {
+			return fail(id, "dependencies", ErrInvalidReference)
+		}
+		for _, dep := range deps {
+			if !ancestors[id][dep] {
+				return fail(id, fmt.Sprintf("dependency %q is not an ancestor", dep), ErrInvalidReference)
+			}
+		}
+		publication = append(publication, record)
 	}
-	return m, nodes, nil
+	return publication, nil
+}
+
+// sameIDs compares unordered, duplicate-free topology lists.
+func sameIDs(actual, expected []string) bool {
+	if validateIDs(actual) != nil || len(actual) != len(expected) {
+		return false
+	}
+	for _, id := range actual {
+		if !slices.Contains(expected, id) {
+			return false
+		}
+	}
+	return true
 }
 
 func isNil(value any) bool {

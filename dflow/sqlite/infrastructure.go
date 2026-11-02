@@ -1,15 +1,17 @@
-// Package sqlite provides durable, run-scoped dflow storage and an outbox.
-//
-// Package sqlite 提供持久化的 run 作用域 dflow 存储和 outbox。
+// Package sqlite implements a durable, run-scoped dflow Infrastructure.
 package sqlite
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
+	"encoding/gob"
 	"errors"
 	"fmt"
+	"maps"
 	"net/url"
 	"path/filepath"
+	"slices"
 	"time"
 
 	"github.com/k0923/go/dflow"
@@ -19,46 +21,56 @@ import (
 
 var _ dflow.Infrastructure = (*Infrastructure)(nil)
 
-// Outbox is the durable delivery capability provided by the SQLite
-// implementation. Ack Request after external acceptance; Ack Wake after the
-// token-specific Resume call is safely handled.
-//
-// Outbox 是 SQLite 实现提供的持久投递能力。Request 应在外部接受后 Ack；Wake 应在
-// token 特定的 Resume 调用被安全处理后 Ack。
-type Outbox interface {
-	Pending(context.Context) ([]dflow.Notification, error)
-	Ack(context.Context, int64) error
+func init() {
+	gob.Register(map[string]any{})
+	gob.Register([]any{})
 }
 
-var _ Outbox = (*Infrastructure)(nil)
+type Publication[R any] struct {
+	records map[string]dflow.PublishedNode[R]
+	order   []string
+}
+
+func Publish[R any](records []dflow.PublishedNode[R]) (*Publication[R], error) {
+	if len(records) == 0 {
+		return nil, dflow.ErrInvalidDefinition
+	}
+	p := &Publication[R]{records: map[string]dflow.PublishedNode[R]{}, order: make([]string, 0, len(records))}
+	for _, record := range records {
+		if record == nil || record.GetID() == "" {
+			return nil, dflow.ErrInvalidDefinition
+		}
+		id := record.GetID()
+		if _, exists := p.records[id]; exists {
+			return nil, dflow.ErrInvalidDefinition
+		}
+		p.records[id] = record
+		p.order = append(p.order, id)
+	}
+	return p, nil
+}
+
+func (p *Publication[R]) LoadNode(ctx context.Context, id string) (dflow.PublishedNode[R], error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	record, ok := p.records[id]
+	if !ok {
+		return nil, dflow.ErrInvalidDefinition
+	}
+	return record, nil
+}
+
+func (p *Publication[R]) IDs() []string { return slices.Clone(p.order) }
 
 type Infrastructure struct {
 	db    *sql.DB
 	scope string
-	codec Codec
 }
 
-// Codec is supplied by the application. It must preserve concrete Node,
-// Parameter, Suspension and response types, and reject unsupported values.
-// SQLite owns transactions and indexes, not the application's wire format.
-//
-// Codec 由应用提供。它必须保留具体的 Node、Parameter、Suspension 和响应类型，
-// 并拒绝不支持的值。SQLite 负责事务和索引，而不负责应用的线格式。
-type Codec interface {
-	Encode(any) ([]byte, error)
-	Decode([]byte, any) error
-}
-
-// Open creates the schema and binds this handle to scope (e.g. tenant/run ID).
-// Multiple handles/processes can share the file. The directory must exist.
-// WAL + synchronous FULL protects committed checkpoints across process crashes.
-//
-// Open 创建 schema，并将此 handle 绑定到 scope（例如 tenant/run ID）。多个 handle
-// 或进程可以共享同一文件。目录必须已经存在。WAL + synchronous FULL 保护已提交的
-// checkpoint，使其跨进程崩溃仍然可靠。
-func Open(ctx context.Context, path, scope string, codec Codec) (*Infrastructure, error) {
-	if path == "" || scope == "" || codec == nil {
-		return nil, fmt.Errorf("sqlite dflow: path, scope and application codec are required")
+func Open(ctx context.Context, path, scope string) (*Infrastructure, error) {
+	if path == "" || scope == "" {
+		return nil, fmt.Errorf("sqlite dflow: path and scope are required")
 	}
 	absolute, err := filepath.Abs(path)
 	if err != nil {
@@ -71,72 +83,261 @@ func Open(ctx context.Context, path, scope string, codec Codec) (*Infrastructure
 		return nil, err
 	}
 	db.SetMaxOpenConns(1)
-	var legacy int
-	err = db.QueryRowContext(ctx, `SELECT count(*) FROM sqlite_master WHERE type='table' AND name='dflow_records'`).Scan(&legacy)
-	if err != nil || legacy != 0 {
-		db.Close()
-		if err != nil {
-			return nil, err
-		}
-		return nil, fmt.Errorf("sqlite dflow: legacy operation-checkpoint schema requires an explicit migration or a new database")
-	}
 	_, err = db.ExecContext(ctx, `
-CREATE TABLE IF NOT EXISTS dflow_runs (
- scope TEXT PRIMARY KEY, state BLOB, version INTEGER NOT NULL DEFAULT 0
-);
-CREATE TABLE IF NOT EXISTS dflow_waits (
- scope TEXT NOT NULL, node TEXT NOT NULL, token TEXT NOT NULL, response BLOB,
- PRIMARY KEY(scope,node,token)
-);
 CREATE TABLE IF NOT EXISTS dflow_nodes (
- scope TEXT NOT NULL, node TEXT NOT NULL, state BLOB NOT NULL,
- ready INTEGER NOT NULL, status TEXT NOT NULL, generation INTEGER NOT NULL,
+ scope TEXT NOT NULL,
+ node TEXT NOT NULL,
+ state BLOB NOT NULL,
+ incoming BLOB NOT NULL,
+ ready INTEGER NOT NULL,
+ status TEXT NOT NULL,
+ generation INTEGER NOT NULL,
  lease_expires INTEGER NOT NULL DEFAULT 0,
  PRIMARY KEY(scope,node)
 );
-CREATE INDEX IF NOT EXISTS dflow_nodes_ready ON dflow_nodes(scope,ready,status,generation);
-CREATE TABLE IF NOT EXISTS dflow_publications (
- id TEXT PRIMARY KEY, manifest BLOB NOT NULL
-);
-CREATE TABLE IF NOT EXISTS dflow_definitions (
- publication TEXT NOT NULL,node TEXT NOT NULL,definition BLOB NOT NULL,incoming BLOB NOT NULL,
- PRIMARY KEY(publication,node)
-);
-CREATE TABLE IF NOT EXISTS dflow_outbox (
- id INTEGER PRIMARY KEY AUTOINCREMENT, scope TEXT NOT NULL,
- kind TEXT NOT NULL, node TEXT NOT NULL, token TEXT NOT NULL, request BLOB
-);
-CREATE INDEX IF NOT EXISTS dflow_outbox_scope ON dflow_outbox(scope,id);
+CREATE INDEX IF NOT EXISTS dflow_nodes_ready ON dflow_nodes(scope,ready,status,lease_expires);
 `)
-	if err == nil {
-		err = addNodeLeaseColumn(ctx, db)
-	}
-	if err == nil {
-		_, err = db.ExecContext(ctx, `INSERT OR IGNORE INTO dflow_runs(scope) VALUES (?)`, scope)
-	}
 	if err != nil {
 		db.Close()
 		return nil, err
 	}
-	return &Infrastructure{db: db, scope: scope, codec: codec}, nil
+	return &Infrastructure{db: db, scope: scope}, nil
 }
 
-// addNodeLeaseColumn upgrades databases created before per-node leases. The
-// former run-lease columns of dflow_runs are left in place and ignored.
-//
-// addNodeLeaseColumn 升级在引入按节点租约之前创建的数据库。dflow_runs 中原来的
-// run-lease 列会保留但被忽略。
-func addNodeLeaseColumn(ctx context.Context, db *sql.DB) error {
-	var present int
-	err := db.QueryRowContext(ctx, `SELECT count(*) FROM pragma_table_info('dflow_nodes') WHERE name='lease_expires'`).Scan(&present)
-	if err != nil || present != 0 {
-		return err
+func NewRun[R any](ctx context.Context, path, scope string, records []dflow.PublishedNode[R], root string) (*Infrastructure, *Publication[R], error) {
+	publication, err := Publish(records)
+	if err != nil {
+		return nil, nil, err
 	}
-	_, err = db.ExecContext(ctx, `ALTER TABLE dflow_nodes ADD COLUMN lease_expires INTEGER NOT NULL DEFAULT 0`)
-	return err
+	infra, err := Open(ctx, path, scope)
+	if err != nil {
+		return nil, nil, err
+	}
+	if err := infra.Initialize(ctx, publication, root); err != nil {
+		infra.Close()
+		return nil, nil, err
+	}
+	return infra, publication, nil
 }
 
 func (i *Infrastructure) Close() error { return i.db.Close() }
+
+func (i *Infrastructure) Initialize[R any](ctx context.Context, publication *Publication[R], root string) error {
+	if publication == nil || root == "" {
+		return dflow.ErrInvalidDefinition
+	}
+	return i.transaction(ctx, func(tx *sql.Tx) error {
+		for _, id := range publication.order {
+			record := publication.records[id]
+			state := dflow.NodeState{Status: dflow.Pending}
+			if id == root {
+				state.Version, state.Ready, state.Enabled = 1, true, true
+			}
+			if err := putNode(ctx, tx, i.scope, id, state, record.GetIncoming(), 0); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
+func (i *Infrastructure) ReadyNodes(ctx context.Context) ([]string, error) {
+	rows, err := i.db.QueryContext(ctx, `SELECT node FROM dflow_nodes WHERE scope=?
+AND (ready=1 OR status IN ('running','failed')) AND lease_expires<=? ORDER BY node`, i.scope, time.Now().UnixNano())
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var ready []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ready = append(ready, id)
+	}
+	return ready, rows.Err()
+}
+
+func (i *Infrastructure) ClaimNode(ctx context.Context, id string, ttl time.Duration) (task *dflow.NodeTask, err error) {
+	if id == "" {
+		return nil, dflow.ErrInvalidDefinition
+	}
+	if ttl <= 0 {
+		return nil, lease.ErrInvalid
+	}
+	err = i.transaction(ctx, func(tx *sql.Tx) error {
+		state, incoming, expires, err := getNode(ctx, tx, i.scope, id)
+		if err != nil || state == nil {
+			return err
+		}
+		if time.Now().UnixNano() < expires || !claimable(*state) {
+			return nil
+		}
+		state.Version++
+		state.Generation++
+		state.Status = dflow.Running
+		state.Ready = false
+		state.Error = ""
+		token := lease.Token{Key: id, Generation: state.Generation, ExpiresAt: time.Now().Add(ttl)}
+		if err := putNode(ctx, tx, i.scope, id, *state, incoming, token.ExpiresAt.UnixNano()); err != nil {
+			return err
+		}
+		task = &dflow.NodeTask{NodeID: id, State: *state, Lease: token}
+		return nil
+	})
+	return task, err
+}
+
+func (i *Infrastructure) RenewNode(ctx context.Context, token lease.Token, ttl time.Duration) (*lease.Token, error) {
+	if ttl <= 0 {
+		return nil, lease.ErrInvalid
+	}
+	now := time.Now()
+	token.ExpiresAt = now.Add(ttl)
+	result, err := i.db.ExecContext(ctx, `UPDATE dflow_nodes SET lease_expires=?
+WHERE scope=? AND node=? AND generation=? AND lease_expires>?`,
+		token.ExpiresAt.UnixNano(), i.scope, token.Key, token.Generation, now.UnixNano())
+	if err := affected(result, err); err != nil {
+		return nil, err
+	}
+	return &token, nil
+}
+
+func (i *Infrastructure) ReleaseNode(ctx context.Context, token lease.Token) error {
+	result, err := i.db.ExecContext(ctx, `UPDATE dflow_nodes SET lease_expires=0
+WHERE scope=? AND node=? AND generation=? AND lease_expires<>0`, i.scope, token.Key, token.Generation)
+	return affected(result, err)
+}
+
+func (i *Infrastructure) Commit(ctx context.Context, token lease.Token, commit dflow.NodeCommit) (ready []string, err error) {
+	err = i.transaction(ctx, func(tx *sql.Tx) error {
+		ready = nil
+		if token.Key != commit.NodeID {
+			return lease.ErrConflict
+		}
+		current, incoming, expires, err := getNode(ctx, tx, i.scope, commit.NodeID)
+		if err != nil {
+			return err
+		}
+		if current == nil || current.Generation != token.Generation || expires <= time.Now().UnixNano() {
+			return lease.ErrConflict
+		}
+		if err := dflow.ValidateCommit(*current, commit, token.Generation); err != nil {
+			return err
+		}
+		if err := putNode(ctx, tx, i.scope, commit.NodeID, dflow.ApplyCommitResult(*current, commit), incoming, 0); err != nil {
+			return err
+		}
+		for targetID, active := range commit.Arrivals {
+			before, targetIncoming, targetExpires, err := getNode(ctx, tx, i.scope, targetID)
+			if err != nil {
+				return err
+			}
+			if before == nil {
+				return dflow.ErrInvalidDefinition
+			}
+			after, err := dflow.ApplyArrival(*before, commit.NodeID, targetIncoming, active)
+			if err != nil {
+				return err
+			}
+			if err := putNode(ctx, tx, i.scope, targetID, after, targetIncoming, targetExpires); err != nil {
+				return err
+			}
+			if !before.Ready && after.Ready {
+				ready = append(ready, targetID)
+			}
+		}
+		slices.Sort(ready)
+		return nil
+	})
+	return ready, err
+}
+
+func (i *Infrastructure) Node(ctx context.Context, id string) (dflow.NodeState, bool, error) {
+	state, _, _, err := getNode(ctx, i.db, i.scope, id)
+	if err != nil || state == nil {
+		return dflow.NodeState{}, false, err
+	}
+	return *state, true, nil
+}
+
+func (i *Infrastructure) Snapshot(ctx context.Context) (map[string]dflow.NodeState, error) {
+	rows, err := i.db.QueryContext(ctx, `SELECT node,state FROM dflow_nodes WHERE scope=? ORDER BY node`, i.scope)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	result := map[string]dflow.NodeState{}
+	for rows.Next() {
+		var id string
+		var raw []byte
+		if err := rows.Scan(&id, &raw); err != nil {
+			return nil, err
+		}
+		var state dflow.NodeState
+		if err := decode(raw, &state); err != nil {
+			return nil, err
+		}
+		result[id] = state
+	}
+	return result, rows.Err()
+}
+
+func (i *Infrastructure) Output(ctx context.Context, id string) (map[string]any, error) {
+	state, ok, err := i.Node(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	if !ok || state.Status != dflow.Succeeded {
+		return nil, dflow.ErrInvalidReference
+	}
+	return maps.Clone(state.Output), nil
+}
+
+type queryer interface {
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+}
+
+func getNode(ctx context.Context, q queryer, scope, id string) (*dflow.NodeState, []string, int64, error) {
+	var rawState, rawIncoming []byte
+	var expires int64
+	err := q.QueryRowContext(ctx, `SELECT state,incoming,lease_expires FROM dflow_nodes WHERE scope=? AND node=?`, scope, id).
+		Scan(&rawState, &rawIncoming, &expires)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil, 0, nil
+	}
+	if err != nil {
+		return nil, nil, 0, err
+	}
+	var state dflow.NodeState
+	var incoming []string
+	if err := decode(rawState, &state); err != nil {
+		return nil, nil, 0, err
+	}
+	if err := decode(rawIncoming, &incoming); err != nil {
+		return nil, nil, 0, err
+	}
+	return &state, incoming, expires, nil
+}
+
+func putNode(ctx context.Context, tx *sql.Tx, scope, id string, state dflow.NodeState, incoming []string, expires int64) error {
+	rawState, err := encode(state)
+	if err != nil {
+		return err
+	}
+	rawIncoming, err := encode(incoming)
+	if err != nil {
+		return err
+	}
+	_, err = tx.ExecContext(ctx, `INSERT INTO dflow_nodes(scope,node,state,incoming,ready,status,generation,lease_expires)
+VALUES(?,?,?,?,?,?,?,?)
+ON CONFLICT(scope,node) DO UPDATE SET
+ state=excluded.state,incoming=excluded.incoming,ready=excluded.ready,status=excluded.status,
+ generation=excluded.generation,lease_expires=excluded.lease_expires`,
+		scope, id, rawState, rawIncoming, boolInt(state.Ready), string(state.Status), state.Generation, expires)
+	return err
+}
 
 func (i *Infrastructure) transaction(ctx context.Context, fn func(*sql.Tx) error) error {
 	tx, err := i.db.BeginTx(ctx, nil)
@@ -150,28 +351,7 @@ func (i *Infrastructure) transaction(ctx context.Context, fn func(*sql.Tx) error
 	return tx.Commit()
 }
 
-func (i *Infrastructure) RenewNode(ctx context.Context, token lease.Token, ttl time.Duration) (*lease.Token, error) {
-	if ttl <= 0 {
-		return nil, lease.ErrInvalid
-	}
-	now := time.Now()
-	token.ExpiresAt = now.Add(ttl)
-	result, err := i.db.ExecContext(ctx, `UPDATE dflow_nodes SET lease_expires=?
-WHERE scope=? AND node=? AND generation=? AND lease_expires>?`,
-		token.ExpiresAt.UnixNano(), i.scope, token.Key, token.Generation, now.UnixNano())
-	if err := affected(result, err, lease.ErrConflict); err != nil {
-		return nil, err
-	}
-	return &token, nil
-}
-
-func (i *Infrastructure) ReleaseNode(ctx context.Context, token lease.Token) error {
-	result, err := i.db.ExecContext(ctx, `UPDATE dflow_nodes SET lease_expires=0
-WHERE scope=? AND node=? AND generation=? AND lease_expires<>0`, i.scope, token.Key, token.Generation)
-	return affected(result, err, lease.ErrConflict)
-}
-
-func affected(result sql.Result, err, conflict error) error {
+func affected(result sql.Result, err error) error {
 	if err != nil {
 		return err
 	}
@@ -180,165 +360,35 @@ func affected(result sql.Result, err, conflict error) error {
 		return err
 	}
 	if n != 1 {
-		return conflict
-	}
-	return nil
-}
-
-// checkNodeLease fences a writer inside tx: the node generation must match the
-// token and the stored lease must not have expired.
-//
-// checkNodeLease 在 tx 内对 writer 做 fencing：节点 generation 必须匹配 token，
-// 且存储中的租约不能已经过期。
-func (i *Infrastructure) checkNodeLease(ctx context.Context, tx *sql.Tx, token lease.Token) error {
-	var generation, expires int64
-	err := tx.QueryRowContext(ctx, `SELECT generation,lease_expires FROM dflow_nodes WHERE scope=? AND node=?`,
-		i.scope, token.Key).Scan(&generation, &expires)
-	if errors.Is(err, sql.ErrNoRows) {
-		return lease.ErrConflict
-	}
-	if err != nil {
-		return err
-	}
-	if generation != token.Generation || expires <= time.Now().UnixNano() {
 		return lease.ErrConflict
 	}
 	return nil
 }
 
-func (i *Infrastructure) Load(ctx context.Context) (*dflow.State, error) {
-	state, err := i.LoadMetadata(ctx)
-	if err != nil || state == nil {
-		return state, err
+func claimable(state dflow.NodeState) bool {
+	switch state.Status {
+	case dflow.Pending:
+		return state.Ready
+	case dflow.Running, dflow.Failed, dflow.Suspended:
+		return true
+	default:
+		return false
 	}
-	state.Nodes = map[string]dflow.NodeState{}
-	rows, err := i.db.QueryContext(ctx, `SELECT node,state FROM dflow_nodes WHERE scope=?`, i.scope)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	for rows.Next() {
-		var id string
-		var raw []byte
-		if err := rows.Scan(&id, &raw); err != nil {
-			return nil, err
-		}
-		var node dflow.NodeState
-		if err := i.codec.Decode(raw, &node); err != nil {
-			return nil, err
-		}
-		state.Nodes[id] = node
-	}
-	return state, rows.Err()
 }
 
-type reader interface {
-	QueryRowContext(context.Context, string, ...any) *sql.Row
+func boolInt(value bool) int {
+	if value {
+		return 1
+	}
+	return 0
 }
 
-func (i *Infrastructure) getResponse(ctx context.Context, query reader, nodeID, token string) (*dflow.Response, error) {
-	var data []byte
-	err := query.QueryRowContext(ctx, `SELECT response FROM dflow_waits WHERE scope=? AND node=? AND token=?`,
-		i.scope, nodeID, token).Scan(&data)
-	if errors.Is(err, sql.ErrNoRows) {
-		return nil, dflow.ErrWaitNotFound
-	}
-	if err != nil {
-		return nil, err
-	}
-	if data == nil {
-		return nil, nil
-	}
-	var response dflow.Response
-	if err := i.codec.Decode(data, &response); err != nil {
-		return nil, err
-	}
-	return &response, nil
+func encode(value any) ([]byte, error) {
+	var buffer bytes.Buffer
+	err := gob.NewEncoder(&buffer).Encode(value)
+	return buffer.Bytes(), err
 }
 
-func (i *Infrastructure) GetResponse(ctx context.Context, nodeID, token string) (*dflow.Response, error) {
-	return i.getResponse(ctx, i.db, nodeID, token)
-}
-
-func (i *Infrastructure) notify(ctx context.Context, tx *sql.Tx, notification dflow.Notification) error {
-	var raw []byte
-	if notification.Request != nil {
-		var err error
-		raw, err = i.codec.Encode(notification.Request)
-		if err != nil {
-			return err
-		}
-	}
-	_, err := tx.ExecContext(ctx, `INSERT INTO dflow_outbox(scope,kind,node,token,request) VALUES(?,?,?,?,?)`,
-		i.scope, string(notification.Kind), notification.NodeID, notification.Token, raw)
-	return err
-}
-
-func (i *Infrastructure) Resolve(ctx context.Context, nodeID, token string, value any) (accepted bool, err error) {
-	err = i.transaction(ctx, func(tx *sql.Tx) error {
-		response, err := i.getResponse(ctx, tx, nodeID, token)
-		if err != nil {
-			return err
-		}
-		if response != nil {
-			return nil
-		}
-		node, err := i.getNode(ctx, tx, nodeID)
-		if err != nil {
-			return err
-		}
-		if node == nil || node.Suspension == nil || node.Suspension.Token != token {
-			return nil
-		}
-		raw, err := i.codec.Encode(dflow.Response{Value: value})
-		if err != nil {
-			return err
-		}
-		if _, err := tx.ExecContext(ctx, `UPDATE dflow_waits SET response=? WHERE scope=? AND node=? AND token=?`,
-			raw, i.scope, nodeID, token); err != nil {
-			return err
-		}
-		if err := i.notify(ctx, tx, dflow.Notification{Kind: dflow.WakeNotification, NodeID: nodeID, Token: token}); err != nil {
-			return err
-		}
-		node.Ready = true
-		node.Version++
-		if err := i.putNode(ctx, tx, nodeID, *node); err != nil {
-			return err
-		}
-		accepted = true
-		return nil
-	})
-	if err != nil {
-		return false, err
-	}
-	return accepted, nil
-}
-
-func (i *Infrastructure) Pending(ctx context.Context) ([]dflow.Notification, error) {
-	rows, err := i.db.QueryContext(ctx, `SELECT id,kind,node,token,request FROM dflow_outbox WHERE scope=? ORDER BY id`, i.scope)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var result []dflow.Notification
-	for rows.Next() {
-		var item dflow.Notification
-		var request []byte
-		if err := rows.Scan(&item.ID, &item.Kind, &item.NodeID, &item.Token, &request); err != nil {
-			return nil, err
-		}
-		if request != nil {
-			if err := i.codec.Decode(request, &item.Request); err != nil {
-				return nil, err
-			}
-		}
-		result = append(result, item)
-	}
-	return result, rows.Err()
-}
-
-func (i *Infrastructure) Ack(ctx context.Context, id int64) error {
-	_, err := i.db.ExecContext(ctx, `DELETE FROM dflow_outbox WHERE scope=? AND id=?`, i.scope, id)
-	return err
+func decode(raw []byte, target any) error {
+	return gob.NewDecoder(bytes.NewReader(raw)).Decode(target)
 }

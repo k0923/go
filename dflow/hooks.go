@@ -28,22 +28,19 @@ type Hooks struct {
 	// 节点租约 generation，每次 claim 都会递增，因此同一节点的 Attempt 增长表示
 	// 发生了重试或接管。
 	OnClaim func(context.Context, NodeEvent)
-	// OnStart fires immediately before Run or Resume is invoked. Resume reports
-	// IsResume true and carries the suspension token.
+	// OnStart fires immediately before Run.
 	//
-	// OnStart 在调用 Run 或 Resume 前立即触发。Resume 会报告 IsResume true，并携带
-	// suspension token。
+	// OnStart 在调用 Run 前立即触发。
 	OnStart func(context.Context, NodeEvent)
-	// OnFinish fires once per invoked Run/Resume, after panic recovery, timeout
+	// OnFinish fires once per invoked Run, after panic recovery, timeout
 	// and result validation, before Commit. Outcome classifies the validated
-	// result; Err is set for Failed. Duration measures Run/Resume only. This is
-	// not a durable-commit event. Skipped/input-resolution failures don't invoke
-	// Run/Resume and therefore produce no OnStart/OnFinish pair.
+	// result; Err is set for Failed. Duration includes Run and result normalization.
+	// This is not a durable-commit event. Skipped nodes don't invoke Run.
 	//
-	// OnFinish 对每次实际调用的 Run/Resume 触发一次，发生在 panic recovery、超时和
+	// OnFinish 对每次实际调用的 Run 触发一次，发生在 panic recovery、超时和
 	// 结果校验之后、Commit 之前。Outcome 对已校验结果分类；Failed 时会设置 Err。
-	// Duration 只统计 Run/Resume。本事件不是持久化 commit 事件。Skipped 或输入解析
-	// 失败不会调用 Run/Resume，因此不会产生 OnStart/OnFinish 对。
+	// Duration 包含 Run 和结果规范化。本事件不是持久化 commit 事件。Skipped
+	// 不会调用 Run，因此不会产生 OnStart/OnFinish 对。
 	OnFinish func(context.Context, NodeEvent)
 }
 
@@ -55,8 +52,6 @@ type Hooks struct {
 type NodeEvent struct {
 	NodeID   string
 	Attempt  int64
-	IsResume bool
-	Token    string
 	Duration time.Duration
 	Outcome  Status
 	Err      error

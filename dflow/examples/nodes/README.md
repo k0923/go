@@ -1,6 +1,6 @@
 # 参考节点
 
-本包供示例和业务实现参考。业务可以复制代码或实现自己的 `dflow.Node`／`dflow.ResumableNode`；dflow 核心不依赖本包，也不识别任何具体节点类型。
+本包供示例和业务实现参考。业务可以复制代码或实现自己的 `InputNode`，再通过 `Spec` 适配到 dflow 核心；dflow 核心不依赖本包，也不识别任何具体节点类型。
 
 | 实现 | 行为 |
 | --- | --- |
@@ -15,14 +15,14 @@
 起始节点由图中的唯一 root 决定，与 Go 类型无关。需要完整输入时显式绑定：
 
 ```go
-dflow.NodeSpec{
+nodes.Spec{
     ID: "start",
     Node: &nodes.StartNode{},
-    Inputs: dflow.Parameters{"input": dflow.Input()},
+    Inputs: map[string]nodes.Param{"input": nodes.Input()},
 }
 ```
 
-业务也可以使用普通节点逐字段绑定 `dflow.Input("price")`，无需 StartNode 或 EndNode。原来的 `dflow.StartNode` 等类型已移至本包；采用 StartNode 的定义需补上上述输入绑定。
+业务也可以使用普通节点逐字段绑定 `nodes.Input("price")`，无需 StartNode 或 EndNode。原来的内置参考节点已移至本包；采用 StartNode 的定义需补上上述输入绑定。
 
 JS 定义 `main({params})`（也支持 `run(params)`）；没有文件、网络或事件循环。脚本执行和输出转换均受超时约束，不支持 pending Promise。HTTP 默认 GET、30 秒、8 MiB 响应上限；重试要求幂等方法、Idempotency-Key 或显式 RetryNonIdempotent。非 2xx 响应交给业务判断，可设置 `Client` 自定义 transport 或 redirect 策略。
 

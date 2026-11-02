@@ -23,29 +23,30 @@ func TestCodeNode(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			def := dflow.Definition{
-				Version: "code-v1",
-				Nodes: []dflow.NodeSpec{
-					{ID: "js", Node: node, Inputs: dflow.Parameters{"x": dflow.Input("number")}},
-					{ID: "end", Node: &nodes.EndNode{}, Inputs: dflow.Parameters{"result": dflow.Ref("js", "value")}},
+			records, err := nodes.Compile(context.Background(), nodes.Definition{
+				Nodes: []nodes.Spec{
+					{ID: "js", Node: node, Inputs: map[string]nodes.Param{"x": nodes.Input("number")}},
+					{ID: "end", Node: &nodes.EndNode{}, Inputs: map[string]nodes.Param{"result": nodes.Ref("js", "value")}},
 				},
-				Edges: []dflow.Edge{{SourceNodeID: "js", TargetNodeID: "end"}},
-			}
-			graph, err := dflow.Compile(def)
+				Edges: []nodes.Edge{{Source: "js", Target: "end"}},
+			})
 			if err != nil {
 				t.Fatal(err)
 			}
-			store := memory.New()
-			engine, err := dflow.NewEngine(graph, store, dflow.Options{})
+			store, publication, err := memory.NewRun(records, "js")
 			if err != nil {
 				t.Fatal(err)
 			}
-			_, err = driver.Run(context.Background(), engine, map[string]any{"number": 21})
+			engine, err := dflow.NewEngine(publication, store, dflow.Options{})
 			if err != nil {
 				t.Fatal(err)
 			}
-			state, err := store.Load(context.Background())
-			if err != nil || state.Nodes["end"].Output["result"] != float64(42) {
+			_, err = driver.Run(context.Background(), engine, "js", nodes.RuntimeWithStore(map[string]any{"number": 21}, store))
+			if err != nil {
+				t.Fatal(err)
+			}
+			state, err := store.Snapshot(context.Background())
+			if err != nil || state["end"].Output["result"] != float64(42) {
 				t.Fatalf("unexpected JS result: %+v %v", state, err)
 			}
 		})
@@ -67,7 +68,7 @@ func TestCodeTimeoutIncludesTopLevelAndSerialization(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			_, err = node.Run(context.Background(), nil)
+			_, err = node.RunInput(context.Background(), nil)
 			if !errors.Is(err, context.DeadlineExceeded) {
 				t.Fatalf("expected deadline, got %v", err)
 			}
@@ -89,7 +90,7 @@ func TestCodeRejectsInvalidResultsAndSupportsCancellation(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if _, err := node.Run(context.Background(), nil); err == nil {
+		if _, err := node.RunInput(context.Background(), nil); err == nil {
 			t.Fatalf("expected script failure for %s", script)
 		}
 	}
@@ -99,7 +100,7 @@ func TestCodeRejectsInvalidResultsAndSupportsCancellation(t *testing.T) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	if _, err := node.Run(ctx, nil); !errors.Is(err, context.Canceled) {
+	if _, err := node.RunInput(ctx, nil); !errors.Is(err, context.Canceled) {
 		t.Fatalf("expected canceled context, got %v", err)
 	}
 }

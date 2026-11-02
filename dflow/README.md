@@ -1,181 +1,203 @@
 # dflow
 
-dflow 是节点级持久化的 DAG 执行框架。引擎每次只推进一个节点（`Drive`）：执行节点、持久化结果，并返回变就绪的下游节点 ID，交给调用方决定如何继续——同进程递归、入队交给消息队列、或停止。框架管理节点状态、租约、依赖到达和通知原子性；业务管理定义发布、类型构造、存储格式、调度编排和外部操作。
+dflow 是节点级持久化的 DAG 执行框架。每次 `Drive` 只执行一个节点，原子保存输入、输出、错误及下游到达信息，返回本次新就绪的节点 ID。业务负责执行初始化、取值、调度和异步任务进度；框架没有工作流整体状态。
 
-框架不提供并发 drain，也没有工作流整体状态；并发与失败处理都交给业务。执行权按节点划分：同一 run 的不同节点可以在多个 goroutine、worker 或高可用实例上同时 `Drive`。任一节点失败即为终态，调用方据此停止当前驱动（fail-fast）。
-
-## 使用
-
-```go
-graph, err := dflow.Compile(dflow.Definition{
-    Version: "order-v1",
-    Nodes: []dflow.NodeSpec{
-        {ID: "calculate", Node: dflow.NodeFunc(
-            func(ctx context.Context, input map[string]any) (dflow.Result, error) {
-                return dflow.Result{Output: map[string]any{
-                    "total": input["price"].(int) * 2,
-                }}, nil
-            }),
-            Inputs: dflow.Parameters{"price": dflow.Input("price")},
-        },
-        {ID: "out", Node: dflow.NodeFunc(
-            func(ctx context.Context, input map[string]any) (dflow.Result, error) {
-                return dflow.Result{Output: input}, nil
-            }),
-            Inputs: dflow.Parameters{"total": dflow.Ref("calculate", "total")}},
-    },
-    Edges: []dflow.Edge{{SourceNodeID: "calculate", TargetNodeID: "out"}},
-})
-if err != nil { return err }
-engine, err := dflow.NewEngine(graph, memory.New(), dflow.Options{})
-if err != nil { return err }
-
-// 单步原语：Start 返回唯一 start 节点，Drive 执行一个节点并返回新就绪的下游。
-start, err := engine.Start(ctx, map[string]any{"price": 21})
-if err != nil { return err }
-executed, err := engine.Drive(ctx, start)
-if err != nil { return err }
-// executed.Ready 是本步新就绪的下游节点，交给业务继续驱动或入队。
-_ = executed
-```
-
-同进程把整张图驱动到静止，可直接用参考驱动包 [driver](driver/driver.go)：`driver.Run(ctx, engine, input)`、`driver.Drain(ctx, engine)`、`driver.Resume(ctx, engine, nodeID, token, response...)`。它只是对 `Start`/`Drive`/`Resume`/`Recover`/`Wakeup` 的串行 BFS 封装；生产系统可换成把就绪节点 ID 入队、多 worker 各自 `Drive`。
-
-`Compile` 校验节点非空、拓扑无环、边和 ID 唯一、全图只有一个 root/start 节点，以及输入引用是否来自祖先节点。配置实现 `NodeValidator.Validate() error` 时也会提前校验。`Definition.Version` 必填，业务必须在节点实现、参数或拓扑变化时更新版本；`Manifest.Hash` 使用该版本作为执行身份，不自动序列化定义计算 hash。
-
-`Graph` 可复用；节点配置和 Parameter 不可变，可能被多个执行并发使用。业务依赖直接注入节点。函数节点可直接使用 `NodeFunc`。
-
-## 节点
-
-```go
-type Node interface {
-    Run(context.Context, map[string]any) (Result, error)
-}
-type ResumableNode interface {
-    Node
-    Resume(context.Context, map[string]any, ResumeInput) (Result, error)
-}
-```
-
-`Result.Output` 是 `map[string]any`，与节点输入同为对象形态；map 内字段值支持存储实现接受的 Go 值，不做 JSON 规范化。`Ports == nil` 激活所有出边；非 nil 空数组不激活出边；非空数组选择对应端口。未激活节点标记为 skipped，继续传播依赖到达；对 skipped 节点输出的引用返回 `ErrMissingValue`。同一前驱的多条端口边只计一次依赖到达。
-
-节点由业务实现，核心通过 `Node`／`ResumableNode` 契约调用它们。HTTP、JS、条件、JSON 解析、起始和结束节点的参考实现放在 [examples/nodes](examples/nodes/README.md)，业务可以复制或替换；使用 dflow 核心不会引入 JS VM 或 HTTP 节点依赖。
-
-图中的唯一 root 就是起始节点，无需指定节点类型。所有输入都通过 `Parameters` 声明，空 Inputs 对所有节点都解析为空对象；不会自动注入完整工作流输入。需要完整输入时使用 `dflow.Input()`，例如参考 `nodes.StartNode` 的 `Inputs: dflow.Parameters{"input": dflow.Input()}`。原 `dflow.StartNode` 等类型已移至示例包，迁移时应调整 import 并显式绑定输入。
-
-## 参数
-
-```go
-type Parameter interface {
-    References() ([][]string, error)
-    Resolve(context.Context, ValueResolver) (any, error)
-}
-type ValueResolver interface {
-    Resolve(context.Context, ...string) (any, error)
-}
-```
-
-三个默认实现分别只承载对应数据：
-
-| 实现 | 数据 | 便捷函数 |
-| --- | --- | --- |
-| `ConstantParameter` | Value | `Constant(value)` |
-| `ReferenceParameter` | Path | `Ref(nodeID, path...)`、`Input(path...)` |
-| `TemplateParameter` | Text、JSON | `Template(text)`、`PlainTemplate(text)` |
-
-`Ref("node", "items", "0", "name")` 读取祖先输出；`Input("name")` 读取工作流输入。路径支持 string key 的 map、数组/切片索引和导出 struct 的 Go 字段名。保留原始 Go 类型；存在的 nil 值有效，缺失路径返回 `ErrMissingValue`。
-
-原始输入缺失与上游引用缺失都会作为节点失败持久化为 Failed，并返回 NodeError；存储读取故障仍返回 InfrastructureError，保留 Running 供恢复。失败后的重试策略仍由业务决定。
-
-`Template("hello {{node.name}}")` 插入 JSON 字面量，字符串包含引号；`PlainTemplate` 插入纯文本，nil 渲染为空字符串。只处理原模板一次，取值中的 `{{...}}` 不会再次解析。
-
-自定义 Parameter 需在 `References` 中声明所有读取路径；Compile 校验祖先关系，执行时只加载这些依赖。返回空路径或 nil Parameter 会拒绝执行。节点和参数必须把收到的输入及上游值视为只读；需要修改时由业务复制。
-
-## 挂起与恢复
-
-```go
-type Suspension interface { Type() string }
-
-// 在 ResumableNode.Run 中：
-return dflow.Result{Suspend: &dflow.ValueSuspension{
-    Kind: "transcode",
-    Data: job,
-}}, nil
-```
-
-业务也可直接定义审批、上传等类型实现 Suspension。框架不注册类型，也不要求 MarshalJSON。挂起与 Output/Ports 互斥，只有 ResumableNode 可挂起；typed nil 和空 Type 会拒绝执行。
-
-框架为每轮挂起生成 token。Infrastructure 原子保存 suspended 节点状态、`SuspensionState{Token, Payload}` 和携带同一具体类型的 Request 通知。业务消费 Request 并按 Type 路由，接受操作后 Ack；外部操作使用业务 run scope + nodeID + token 作为幂等键。
-
-`engine.Wakeup(ctx, nodeID, token, response)` 原子保存首次回调和 Wake 通知，不占用节点租约。重复/过期回调返回 false，未知 token 返回 `ErrWaitNotFound`。Wakeup 后该节点重新变为可驱动。
-
-消费携带 token 的 Wake 时，使用 `engine.Resume(ctx, nodeID, token)`：它只推进该挂起轮次的一个节点，返回 Executed 和后继 Ready；旧 token 不会调用新一轮的 Resume，即使新回调已经到达。普通 `Drive(ctx, nodeID)` 仍按节点 ID 推进当前可驱动状态，适合普通任务投递和 Recover，未增加参数。
-
-参考驱动 `driver.Resume(ctx, engine, nodeID, token, response...)` 封装了「可选投递回调 + 按 token 恢复该节点 + 驱动可达后继」，可传一个显式 nil 响应。重复投递当前 token 的回调仍可消费尚未执行的持久化响应。
-
-`Resume` 使用普通 `ClaimNode` 取得受租约保护的快照，再核对 token。旧 token 可能短暂 claim/release 并增加 generation，但不会调用错误轮次的 Resume，也不会覆盖当前挂起和响应。token 感知的 claim 属于具体调度/存储策略，不是核心 Infrastructure 契约。
-
-恢复时调用 Resume，不重新进入 Run；`ResumeInput` 包含 Token、恢复后的具体 Suspension 和 Response。Resume 可再次挂起，产生新 token。失败或进程中断保留挂起数据和响应以便重试。节点副作用仍需幂等，框架不能保证外部操作 exactly-once。
-
-## Infrastructure 和恢复
-
-Infrastructure 绑定一个业务执行 scope，不在每个方法中传递 RunID/TenantID。实现负责：
-
-- 节点租约（`ClaimNode(ttl)`/`RenewNode`/`ReleaseNode`）、generation fencing、节点版本 CAS 和重复终态提交保护。
-- 原子保存节点结果、依赖到达、就绪标记和 Request 通知，并返回本次新就绪的下游节点 ID。
-- 原子保存首次响应和独立 Wake 通知。
-- 存储编码、具体类型恢复和快照隔离；不支持的值应返回错误。
-
-通知的轮询、确认和投递方式属于具体实现。memory 与 SQLite 分别在自己的包中声明 `Outbox` 能力接口，并由各自的 `Infrastructure` 实现；自定义 Infrastructure 可使用消息队列、变更流或自己的 outbox API，不需要实现框架层的统一 Outbox 接口。Request 按业务 run scope + NodeID + Token 去重；外部服务接受 Request 后 Ack，token 对应的 Resume 被安全处理后 Ack Wake。
-
-`Start` 幂等地初始化或校验已有执行并返回唯一 start 节点 ID，多实例并发调用安全；`Drive` 执行一个节点、持久化结果并返回新就绪的下游；`Recover` 不重新初始化地列出当前可驱动且未被有效租约占用的节点（就绪、租约过期的 Running、以及可被新一轮重试的 Failed）用于进程恢复；`Wakeup` 保存回调。Engine 只按需读取节点和原输入路径，不加载整份状态或定义。`Executed.Ready` 和 `Recover` 只报告可驱动的节点 ID；驱动与排程由业务完成。失败即终态，当前驱动据此停止；是否重试由业务发起新一轮 `Start`/`Drive`/`Recover` 决定。
-
-没有工作流整体 Status。业务通过 `GetNode` 或可选 `SnapshotReader.Load` 判断完成条件。`Options` 控制节点超时（默认 5 分钟）、节点租约选项和可观测性 `Hooks`。
-
-### 节点并发与高可用
-
-每次 `Drive(nodeID)` 只持有该节点的租约，不存在 run 级全局锁：
-
-1. **前置判断 + 抢占**：`ClaimNode(nodeID, ttl)` 在一个原子操作中校验节点可驱动（Ready、租约过期的 Running 或 Failed）且租约空闲/过期，然后递增 generation、置 Running 并占有租约。不满足条件返回 nil，`Drive` 返回零值 `Executed` 和 nil error，因此重复投递同一节点 ID 是安全的，只有一个实例会执行。
-2. **执行期续租**：节点 `Run/Resume` 期间每 TTL/3 调用一次 `RenewNode`；单次续租请求最多等待一个 TTL。续租失败（被其他实例 fencing 或存储不可用）会取消节点 ctx，`Drive` 返回 `InfrastructureError`，节点保持 Running，等待重试或接管，不会被记为 Failed。
-3. **提交即结束租约**：`Commit` 在同一事务中校验节点 generation 与存储侧当前到期时间，保存结果、写入下游 arrival 并结束租约。过期 owner 的晚到提交返回 `lease.ErrConflict`。多个前驱从不同实例并发提交时，下游只会就绪一次，并且只出现在完成最后一条依赖的那次提交的 `Executed.Ready` 中。
-4. **崩溃恢复**：实例宕机后，租约在 TTL 内无人续期而过期，节点重新出现在 `Recover` 结果中，可由任意实例接管；主动失败的 `Drive` 会立即 `ReleaseNode`，无需等待 TTL。
-
-每次 Drive 自己的本地互斥锁协调 Renew 与 Commit：在途续租结束后才能提交；真实续租错误会阻止提交，即使取消信号尚未传回执行 goroutine。提交开始后不再续租，避免提交清除租约后出现虚假的 renewal conflict。该锁不在节点或流程之间共享；提交时存储仍校验有效租约，慢提交过期会正常报冲突。
-
-租约只保证同一时刻最多一个有效 owner，并拒绝过期写入；它无法撤销副作用已发生、但结果尚未提交时丢失租约的那次执行，因此节点副作用仍需幂等。
-
-`Hooks` 观测节点生命周期用于 metrics、trace 和日志：`OnClaim`（节点被 claim 并置 Running 后）、`OnStart`（调用 Run/Resume 前）、`OnFinish`（完成 panic 恢复、超时与返回值校验后、Commit 前，带 `Outcome`、`Duration` 和失败时的 `Err`）。每次实际调用 Run/Resume 对应一次 OnFinish，Duration 只计节点调用；跳过节点、输入解析失败不会调用节点，也不产生 OnStart/OnFinish。OnFinish 不表示结果已成功持久化。所有字段可选，nil 跳过。Hook 是旁路，不影响调度、提交或重试；hook 内部 panic 会被框架 recover 并忽略，不污染执行。`NodeEvent.Attempt` 携带节点租约的 generation，同一节点 Attempt 递增即表示发生了重试或接管。
-
-`DefinitionProvider` 按发布版本返回可执行的 PublishedNode。业务从配置构造 Node、Parameter 并注入依赖；重启后按节点重建。编译 Graph 本身也实现这个接口，可传给 `NewEngine`。
-
-`memory.New()` 提供内存实现，通过复制导出字段、map、slice 和 pointer 隔离快照，保留具体类型并支持循环引用。函数和未导出字段共享，必须不可变；含私有可变对象的业务应使用自有存储实现。
-
-`sqlite.Open(ctx, path, scope, codec)` 提供持久化事务、索引和 outbox，必须传入业务 `sqlite.Codec`：
-
-```go
-type Codec interface {
-    Encode(any) ([]byte, error)
-    Decode([]byte, any) error
-}
-```
-
-Codec 必须恢复 Suspension、回调数据，以及发布记录中的 Node/Parameter 的具体类型；节点中的服务客户端或函数由业务重建。dflow 的定义、状态、结果和节点配置不声明 JSON tags，也不提供类型注册或默认编码协议；业务 DTO 决定字段名、布局和具体类型。
-
-完整实现见 [examples/xjson](examples/xjson/README.md)：业务通过 `xjson.G[NodeConfig]` 保存节点配置，显式构造可执行 Node 并注入服务；通过 `xjson.G[dflow.Parameter]`、`xjson.G[dflow.Suspension]` 和业务回调接口恢复具体类型。示例用 SQLite 演示定义发布、关闭数据库后重建依赖、挂起和回调恢复。dflow 不依赖 xjson。更换协议时由业务迁移存量记录或使用新数据库；直接序列化 dflow 类型的业务应先定义自己的 DTO。
-
-## 业务组合
-
-子流程、循环、审批和长任务都由业务基于同一挂起协议实现，框架不提供专用 childflow 类型。
-
-父节点在 Run 中返回业务自定义 Suspension；业务消费持久化 Request，根据 run scope + NodeID + Token 幂等创建或推进外部执行。外部执行完成后调用 Wakeup 保存结果，再用相同 token 调用 Resume。父节点在 Resume 中解释响应并返回普通 Result，也可以再次挂起以实现循环。
-
-子执行 ID、发布版本、完成条件、失败映射、取消传播、循环上限和结果聚合属于业务语义。大输入与累计结果可保存对象存储引用，避免把完整历史反复写入 Suspension。
-
-运行示例见 [examples](examples/README.md)。
+完整最小示例见 [examples/minimal](examples/minimal/main.go)，包含业务发布对象、从边表生成拓扑、初始化根节点、内存存储事务、读取依赖和调度后继。从模块根目录运行：
 
 ```sh
-go test ./dflow/...
-go test -race ./dflow/...
-go vet ./dflow/...
+go run ./dflow/examples/minimal
 ```
+
+## 构建与运行
+
+```go
+type Definition[V any, R any] interface {
+    GetNodes() []NodeSpec[V, R]
+    GetEdges() []Edge
+}
+
+type Edge interface {
+    GetSourceNodeID() string
+    GetTargetNodeID() string
+}
+
+type NodeSpec[V any, R any] interface {
+    GetID() string
+    Validate(context.Context, V) error
+    Build(context.Context, V) (PublishedNode[R], error)
+}
+
+type RuntimeNode[R any] interface {
+    Run(context.Context, R) NodeResult
+}
+```
+
+`V` 是业务校验上下文。`R` 是业务运行 API，节点直接通过它解析参数、执行 HTTP 操作或查询异步进度。每次 Drive 由调用方提供 R，不保存客户端和执行能力。
+
+NodeSpec 描述完整配置，Build 返回业务实现的 PublishedNode，其中包含轻量运行节点、入出边和依赖列表，不执行业务操作。返回对象必须不可变且可并发复用。Loop 的子图可在构建时单独校验发布，运行节点只保存子图标识和必要参数。
+
+```go
+type ExecutionAPI interface {
+    parameter.ValueResolver
+    HTTPClient() *http.Client
+}
+
+type HTTPNode struct {
+    URL parameter.Parameter[string]
+}
+
+func (n *HTTPNode) Run(ctx context.Context, runtime ExecutionAPI) dflow.NodeResult {
+    address, err := n.URL.Get(ctx, runtime)
+    if err != nil {
+        return dflow.ResultWithError(err)
+    }
+    // 使用 runtime.HTTPClient() 执行业务请求。
+    return dflow.Result{
+        Input: map[string]any{"url": address},
+        Output: map[string]any{"url": address},
+    }
+}
+```
+
+Compile 校验 ID、边唯一性、无环、唯一根节点和业务配置，以及业务发布对象与 `Definition.GetEdges()` 的一致性。`PublishedNode.GetDependencies()` 是唯一的依赖声明，包含该节点所有可能读取的节点 ID，不能有空值或重复项；编译校验这些节点都是当前节点的祖先，数据依赖不自动创建控制流边。业务 Build 从参数配置生成依赖列表，从边表统一生成入出边索引，无需在运行节点上重复声明。
+
+`PublishedNode[R]` 是只读接口，提供 `GetID`、`GetNode`、`GetIncoming`、`GetOutgoing`、`GetDependencies`。业务用自己的数据库记录或 DTO 实现它，`DefinitionProvider.LoadNode` 直接返回接口。Compile 返回按拓扑排序的业务原始对象，不提供发布对象或 Provider 的内置实现，也不规定序列化格式。
+
+```go
+records, err := dflow.Compile(ctx, definition, validationAPI)
+if err != nil {
+    return err
+}
+// 业务持久化 records、构建绑定该发布的 provider、保存输入并初始化根节点：
+// NodeState{Status: Pending, Ready: true, Enabled: true, Version: 1}
+// 之后按节点准备运行 API：
+engine, err := dflow.NewEngine(provider, infrastructure, dflow.Options{})
+if err != nil {
+    return err
+}
+executed, err := engine.Drive(ctx, records[0].GetID(), executionAPI)
+// executed.Result 是业务 Run 返回的原始 NodeResult；executed.Ready 交给业务调度。
+```
+
+`DefinitionProvider[R]` 由业务实现并绑定已校验的不可变发布，LoadNode 只读取当前节点。下游前驱索引由存储适配器在 Commit 时读取。业务负责发布标识和执行绑定，节点配置、代码或拓扑变化时创建新发布，已有执行继续绑定原发布。
+
+## 参数与数据加载
+
+参数工具位于可选子包 `github.com/k0923/go/dflow/parameter`，核心引擎不依赖它。业务也可以自行实现参数解析和依赖声明。
+
+```go
+type Parameter[T any] interface {
+    Get(context.Context, ValueResolver) (T, error)
+}
+
+constant := parameter.Const("https://example.com")
+reference := parameter.Ref[string]("prepare", "request", "url")
+rootInput := parameter.Ref[string]("root", "callbackURL")
+address, err := reference.Get(ctx, executionAPI)
+```
+
+路径首段是节点 ID，其余支持字符串 key、数组索引和导出 Go 字段名。Root 输入应作为 Root 节点的输出暴露给 resolver。取值保留具体 Go 类型，不隐式转换。缺失返回 `parameter.ErrMissingValue`，类型不符返回 `parameter.ParameterTypeError`，支持 `errors.Is(err, parameter.ErrParameterType)`。nil 适用于可为空类型，不能解析为 string 等标量。
+
+`Template` 插入 JSON 字面量；`PlainTemplate` 插入普通文本，二者返回 Parameter[string]。参数包不推导节点依赖；业务在 Build 时将依赖节点 ID 放入发布对象。
+
+取值由业务 R 实现，引擎不读取依赖输出，也不包装 R。建议业务按当前节点的 `PublishedNode.GetDependencies()` 预加载输出，把存储错误留在 Run 之前。仅暴露声明的依赖和原始输入；跳过的源视为缺失。
+
+`Values` 提供简单内存解析器，可嵌入业务运行对象：
+
+```go
+type Execution struct {
+    parameter.Values
+    Client *http.Client
+}
+
+func (r *Execution) HTTPClient() *http.Client { return r.Client }
+
+runtime := &Execution{
+    Values: parameter.Values{
+        "root": map[string]any{"orderID": "order-1"},
+        "prepare": map[string]any{
+            "request": map[string]any{"url": "https://example.com"},
+        },
+    },
+    Client: client,
+}
+```
+
+Values 没有数据库访问、锁或缓存。创建后只读；缺失源或路径返回 `parameter.ErrMissingValue`。业务负责快照隔离以及 resolver 的并发安全。若 R 在运行期间读取存储，必须通过 `NodeResult.GetError` 返回错误；引擎无法观察业务主动忽略的错误。
+
+## 节点结果与控制流
+
+```go
+type NodeResult interface {
+    GetInput() map[string]any
+    GetOutput() map[string]any
+    GetError() error
+}
+
+type AsyncNodeResult interface {
+    NodeResult
+    IsDone() bool
+}
+
+type BranchNodeResult interface {
+    NodeResult
+    GetOutgoing() []string
+}
+```
+
+默认实现为 Result、AsyncResult、BranchResult。输入和输出始终是 map[string]any，包含失败或未完成时的部分数据。nil Input/Output 表示保留已有持久化值，非 nil map 表示全量替换；空 map 可用于清空字段。
+
+自定义结果可以增加业务方法；框架只保存标准字段，提交成功后 Executed.Result 保留本次结果对象，重启不会恢复该对象。结果对象必须只读，getter 必须可重复调用。Run 或结果 getter 的 panic 被转换为节点失败，getter panic 后不会返回原始结果对象。已成功捕获的标准字段仍可保存；框架的 map 拷贝是浅拷贝，嵌套对象的快照隔离由存储适配器负责。
+
+- 普通节点成功后激活所有出边。
+- 分支节点返回实际下游节点 ID；nil 或空数组表示全部不选，重复或未知 ID 是错误。未选择的边仍传播 inactive 到达。
+- 异步节点只有无错误且 IsDone 为 true 才激活下游。done=false 保存 Input/Output，状态为 Suspended。
+- 失败保存 Input/Output/Error 后返回 NodeError，不传播下游。
+
+| Drive 结果 | 是否已提交 | 调用方处理 |
+| --- | --- | --- |
+| 零值 Executed、nil error | 否，本次未获取工作 | 不重复调度后继 |
+| Status=Succeeded / Skipped | 是 | 调度 Ready 中的节点 |
+| Status=Suspended | 是 | 由业务安排下一次 Drive，不自动轮询 |
+| Status=Failed、NodeError | 是 | 根据错误决定停止或重试当前节点 |
+| Status 为空、基础设施或租约错误 | 结果不确定 | 重试当前节点；恢复扫描修复可能丢失的后继投递 |
+
+`Executed.Status` 非空表示 Commit 已成功，即使退出清理时又发生取消或租约错误。NodeID 可能在提交前已设置，不能仅凭 NodeID 判断已落库。以 Drive 返回的 error 判断本次执行错误；原始 Result.GetError 只表示业务结果中的错误，不能替代 panic、超时或非法结果等框架错误。
+
+节点类型由 `Run` 返回的结果接口决定：优先识别 `BranchNodeResult`，其次识别 `AsyncNodeResult`，否则按普通 `NodeResult` 处理。一个结果不能同时实现分支和异步接口。
+
+节点收到所有预期前驱到达后才就绪：至少一条 active 则执行，全部 inactive 则 Skipped 并继续传播。完成和跳过都计入已到达前驱数，因此互斥分支可以汇合到普通节点。Skipped 不调用 Run。
+
+汇合的控制流就绪与取值独立。需要选择某个实际完成的分支数据时，应在业务节点逻辑里按自身规则读取对应分支输出，而不是在配置层声明兜底参数。
+
+## 异步调度
+
+异步节点始终调用同一个 Run，通过业务 R 启动任务或查询进度：
+
+```go
+return dflow.AsyncResult{
+    Result: dflow.Result{
+        Input: map[string]any{"taskID": taskID},
+        Output: map[string]any{"progress": progress},
+    },
+    Done: finished,
+}
+```
+
+done=false 不生成下游 Ready，也不自动重复入队。业务通过队列延迟、外部任务回调或其他策略再次调用 `Drive(ctx, nodeID, runtime)`。Suspended 可以显式重新 claim，仍受同一节点的租约保护。任务 ID、查询进度、外部幂等、过期回调判断及取消语义由业务 API 负责；框架不提供回调 token 和响应存储协议。
+
+## 基建与恢复
+
+核心 Infrastructure 只有 ClaimNode、RenewNode、ReleaseNode、Commit 四个方法。执行初始化、原始输入、依赖读取及回调不属于这个接口。
+
+ClaimNode 原子检查就绪/可重试性并获得节点租约，递增 generation/version、置 Running，返回独立状态快照。Commit 在事务内校验 lease generation、存储侧当前有效期及 ExpectedVersion，保存结果、释放租约并合并下游到达。适配器在事务内使用 ValidateCommit、ApplyCommitResult、ApplyArrival。
+
+通用续租、取消和退出清理直接复用 `github.com/k0923/go/lease.Runner`；节点适配层仅协调 ClaimNode 状态快照与 Commit 的结束租约行为。不同节点可并发推进，同一节点只有一个有效 owner。外部副作用仍需幂等。
+
+恢复扫描使用 `driver.RecoveryReader.ReadyNodes`，由业务显式提供 reader。它列出新就绪节点、失去租约的 Running 和 Failed 重试，排除未就绪节点、有效租约、终态以及等待业务调度的 Suspended，避免形成异步忙轮询。核心 Engine 只提供单节点 Drive。
+
+Ready 必须与结果一起持久化，使业务能修复提交后队列投递丢失。队列通知、定时检查和 outbox 方式由业务定义。
+
+调用方取消、租约丢失、InfrastructureError 表示结果不确定，不记为 Failed。节点超时、panic、参数错误、业务错误和非法结果保存为 Failed。Hooks 提供 claim、Run 开始和结果规范化后的观测；OnFinish 在提交前，不表示已落库。
+
+`driver.Run(ctx, engine, nodeID, runtime)` 串行推进指定节点及新就绪后继；`driver.Drain(ctx, engine, reader, runtime)` 执行一次恢复扫描。driver 不初始化执行，不自动轮询 Suspended。使用同一个 R 推进整图时，其 resolver 必须能读取每一步最新提交的输出；按节点预加载时由业务直接调用 Engine.Drive。

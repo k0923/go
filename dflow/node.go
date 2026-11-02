@@ -1,72 +1,88 @@
-// Package dflow executes declarative directed acyclic workflows.
-//
-// Package dflow 执行声明式有向无环工作流。
+// Package dflow executes persistent DAGs one node at a time.
 package dflow
 
-import (
-	"context"
-)
+import "context"
 
-// Node receives resolved input. Implementations must honor ctx and treat input
-// values as read-only. Configuration is immutable; nodes may run concurrently.
-//
-// Node 接收已经解析完成的输入。实现必须遵守 ctx，并将输入值视为只读。
-// 配置是不可变的，节点可能会并发运行。
-type Node interface {
-	Run(context.Context, map[string]any) (Result, error)
+// NodeSpec is a complete build-time definition. V supplies business validation
+// capabilities; R supplies execution capabilities. Build returns a business
+// implementation of PublishedNode with topology matching Definition.GetEdges and
+// all declared dependencies. Build must not execute work. Specs and publications
+// must be immutable and safe to reuse.
+type NodeSpec[V any, R any] interface {
+	GetID() string
+	Validate(context.Context, V) error
+	Build(context.Context, V) (PublishedNode[R], error)
 }
 
-// NodeValidator optionally validates configuration without executing the node.
-//
-// NodeValidator 可选地在不执行节点的情况下校验配置。
-type NodeValidator interface {
-	Validate() error
+type NoContext struct{}
+
+// RuntimeNode contains only execution configuration, never a complete NodeSpec.
+// Every invocation, including asynchronous continuation, uses Run. Side effects
+// must be idempotent: a lost lease may cause the invocation to be retried.
+type RuntimeNode[R any] interface {
+	Run(context.Context, R) NodeResult
 }
 
-// ResumableNode handles a persisted suspension's response. A recovered suspended
-// node calls Resume, never Run. Resume may finish or return another suspension.
-// Both methods may be retried after interruption; side effects need idempotency.
-//
-// ResumableNode 处理已持久化挂起的响应。恢复出的挂起节点会调用 Resume，
-// 而不会调用 Run。Resume 可以完成节点，也可以再次返回挂起。两个方法都可能
-// 在中断后重试，因此副作用需要具备幂等性。
-type ResumableNode interface {
-	Node
-	Resume(context.Context, map[string]any, ResumeInput) (Result, error)
+// NodeResult preserves object-shaped input/output for persistence. Custom
+// implementations may add business methods. Engine records only this contract
+// and returns the original implementation in Executed.Result after commit.
+// Results and their getters must be read-only and safe to read repeatedly.
+// The engine captures standard fields once; callers may inspect the original
+// result again. A panicking getter fails the node and discards the raw result.
+type NodeResult interface {
+	GetInput() map[string]any
+	GetOutput() map[string]any
+	GetError() error
 }
 
-type ResumeInput struct {
-	Token      string
-	Suspension Suspension
-	Response   any
+type AsyncNodeResult interface {
+	NodeResult
+	IsDone() bool
 }
 
-type NodeFunc func(context.Context, map[string]any) (Result, error)
-
-func (f NodeFunc) Run(ctx context.Context, input map[string]any) (Result, error) {
-	return f(ctx, input)
+// GetOutgoing selects target node IDs, not port names. Nil and empty both
+// select no targets. Duplicate IDs and IDs outside the topology are invalid.
+type BranchNodeResult interface {
+	NodeResult
+	GetOutgoing() []string
 }
 
-// Result output values must be supported by the application's Infrastructure.
-// Ports selects outgoing source ports: nil activates every edge; an empty
-// non-nil slice activates none.
-//
-// Result 输出值必须被应用的 Infrastructure 支持。Ports 选择出边源端口：
-// nil 会激活所有边；非 nil 的空切片不会激活任何边。
 type Result struct {
+	Input  map[string]any
 	Output map[string]any
-	Ports  []string
-	// Suspend is mutually exclusive with Output and Ports.
-	//
-	// Suspend 与 Output 和 Ports 互斥。
-	Suspend Suspension
+	Err    error
 }
 
-// NodeID returns the current node's stable ID, useful for business idempotency.
-// The business must combine it with its own run/tenant scope.
-//
-// NodeID 返回当前节点的稳定 ID，可用于业务幂等键。业务必须将它与自己的
-// run/tenant 作用域组合使用。
+func (r Result) GetInput() map[string]any  { return r.Input }
+func (r Result) GetOutput() map[string]any { return r.Output }
+func (r Result) GetError() error           { return r.Err }
+
+type AsyncResult struct {
+	Result
+	Done bool
+}
+
+func (r AsyncResult) IsDone() bool { return r.Done }
+
+type BranchResult struct {
+	Result
+	Outgoing []string
+}
+
+func (r BranchResult) GetOutgoing() []string { return r.Outgoing }
+
+func ResultWithError(err error) NodeResult { return Result{Err: err} }
+
+// NodeFunc adapts a function to RuntimeNode. Its result determines whether this
+// invocation is synchronous, asynchronous or branching.
+type NodeFunc[R any] func(context.Context, R) NodeResult
+
+func (f NodeFunc[R]) Run(ctx context.Context, runtime R) NodeResult {
+	return f(ctx, runtime)
+}
+
+// NodeID identifies the executing node. Combine it with business execution
+// scope when constructing an idempotency key.
 func NodeID(ctx context.Context) string {
 	id, _ := ctx.Value(nodeIDKey{}).(string)
 	return id

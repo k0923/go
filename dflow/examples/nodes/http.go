@@ -55,7 +55,7 @@ func (n *HTTPNode) Validate() error {
 	return err
 }
 
-func (n *HTTPNode) Run(parent context.Context, input map[string]any) (dflow.Result, error) {
+func (n *HTTPNode) RunInput(parent context.Context, input map[string]any) (dflow.NodeResult, error) {
 	if err := n.Validate(); err != nil {
 		return dflow.Result{}, err
 	}

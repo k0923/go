@@ -9,7 +9,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/google/uuid"
 	"github.com/k0923/go/lease"
 )
 
@@ -39,51 +38,25 @@ type Options struct {
 // 持久化结果，并返回因此变为 ready 的下游节点。执行所有权按节点划分，所以同一
 // run 的不同节点可以由 goroutine、worker 或实例并发推进。调用方决定如何继续：
 // 在进程内递归、入队，或者停止，从而让业务完全控制并发、顺序和失败处理。
-type Engine struct {
-	definitions DefinitionProvider
+type Engine[R any] struct {
+	definitions DefinitionProvider[R]
 	infra       Infrastructure
 	options     Options
 }
 
-// Executed reports the outcome of one Drive step. Ready lists downstream nodes
-// that became ready from THIS step, for the caller to drive next. Suspension
-// carries the business-defined payload when Status is Suspended; the caller
-// type-asserts it to its own type and decides what to do (spawn a child, request
-// approval, loop, ...), then later calls Wakeup and drives the node again.
-//
-// Executed 报告一次 Drive 步骤的结果。Ready 列出本步骤中新变为 ready 的下游
-// 节点，供调用方继续驱动。当 Status 为 Suspended 时，Suspension 携带业务定义
-// 的载荷；调用方将它断言为自己的类型并决定下一步动作（创建子流程、请求审批、
-// 循环等），随后调用 Wakeup 并再次驱动该节点。
+// Executed reports a committed Drive step. Result is the original business
+// result returned by Run; it is nil when the node was skipped, Run panicked,
+// or a result getter panicked. Status is non-empty only after a successful
+// commit. Ready contains downstream nodes that became ready after commit.
 type Executed struct {
-	NodeID     string
-	Status     Status
-	Output     map[string]any
-	Suspension Suspension
-	Token      string
-	Ready      []string
-	// Err is the business failure when Status is Failed. Drive also returns it as
-	// the function error so a caller loop stops on failure (fail-fast).
-	//
-	// Err 是 Status 为 Failed 时的业务失败。Drive 也会将它作为函数错误返回，
-	// 以便调用方循环按 fail-fast 方式停止。
-	Err error
+	NodeID string
+	Status Status
+	Result NodeResult
+	Ready  []string
 }
 
-// NewEngine is the in-process publication convenience API.
-//
-// NewEngine 是进程内发布的便捷 API。
-func NewEngine(graph *Graph, infra Infrastructure, options Options) (*Engine, error) {
-	if graph == nil {
-		return nil, ErrInvalidDefinition
-	}
-	return NewEngineWithProvider(graph, infra, options)
-}
-
-// NewEngineWithProvider loads executable nodes from an immutable publication.
-//
-// NewEngineWithProvider 从不可变发布版本加载可执行节点。
-func NewEngineWithProvider(provider DefinitionProvider, infra Infrastructure, options Options) (*Engine, error) {
+// NewEngine loads executable nodes from a business-owned immutable publication.
+func NewEngine[R any](provider DefinitionProvider[R], infra Infrastructure, options Options) (*Engine[R], error) {
 	if isNil(provider) || isNil(infra) {
 		return nil, fmt.Errorf("dflow: provider and infrastructure required")
 	}
@@ -99,70 +72,36 @@ func NewEngineWithProvider(provider DefinitionProvider, infra Infrastructure, op
 	if _, err := lease.NewRunner(&nodeLease{}, options.Lease); err != nil {
 		return nil, err
 	}
-	return &Engine{provider, infra, options}, nil
-}
-
-// Start initializes or verifies the execution and returns the unique start node
-// ID to drive. It is idempotent and takes no lease: concurrent calls from several
-// instances bind the same execution once.
-//
-// Start 初始化或校验一次执行，并返回要驱动的唯一 start 节点 ID。它是幂等的，
-// 且不持有租约：多个实例并发调用只会绑定同一次执行。
-func (e *Engine) Start(ctx context.Context, input map[string]any) (string, error) {
-	if input == nil {
-		input = map[string]any{}
-	}
-	manifest, err := e.definitions.Manifest(ctx)
-	if err != nil {
-		return "", err
-	}
-	if err := e.infra.Initialize(ctx, manifest, input); err != nil {
-		return "", &InfrastructureError{"Initialize", err}
-	}
-	return manifest.Start, nil
-}
-
-// Recover returns the node IDs that are currently drivable without reinitializing
-// the execution: freshly ready nodes and nodes whose previous owner lost its
-// lease. Nodes executing under a live lease elsewhere are not listed. It takes no
-// lease. Use it after process loss to repopulate a work queue.
-//
-// Recover 在不重新初始化执行的情况下返回当前可驱动的节点 ID：新变为 ready 的
-// 节点，以及前任 owner 丢失租约的节点。正在其他位置由有效租约执行的节点不会
-// 被列出。它不持有租约。进程丢失后可用它重新填充工作队列。
-func (e *Engine) Recover(ctx context.Context) ([]string, error) {
-	ready, err := e.infra.ReadyNodes(ctx)
-	if err != nil {
-		return nil, &InfrastructureError{"ReadyNodes", err}
-	}
-	return ready, nil
+	return &Engine[R]{provider, infra, options}, nil
 }
 
 // Drive executes exactly one node and persists its outcome. It holds only that
-// node's lease — claimed, renewed while Run/Resume executes, and ended by Commit
+// node's lease — claimed, renewed while Run executes, and ended by Commit
 // — so distinct nodes of one run proceed in parallel, across processes too.
 // Duplicate deliveries of the same node are safe: only one claim wins.
 //
-// A node that is pending, suspended, terminal or owned by a live lease yields a
+// A node that is unresolved pending, terminal or owned by a live lease yields a
 // zero Executed and nil error. A business node failure returns Status Failed with
 // the error (fail-fast): no downstream node becomes ready. Infrastructure/lease
 // errors are uncertain and should be retried by driving the same node again.
 //
 // Drive 精确执行一个节点并持久化其结果。它只持有该节点的租约：先 claim，
-// 在 Run/Resume 执行期间续租，并在 Commit 时结束。因此同一 run 的不同节点
+// 在 Run 执行期间续租，并在 Commit 时结束。因此同一 run 的不同节点
 // 可以跨进程并行推进。重复投递同一节点是安全的：只有一个 claim 会获胜。
 //
-// 如果节点处于 pending、suspended、terminal，或正被有效租约持有，Drive 会返回
+// 如果节点处于未就绪 pending、terminal，或正被有效租约持有，Drive 会返回
 // 零值 Executed 和 nil error。业务节点失败会返回 Status Failed 和对应错误
 // （fail-fast）：不会有下游节点变为 ready。Infrastructure/lease 错误的结果不确定，
 // 应通过再次驱动同一节点来重试。
-func (e *Engine) Drive(ctx context.Context, nodeID string) (executed Executed, err error) {
-	return e.drive(ctx, nodeID, "")
-}
-
-func (e *Engine) drive(ctx context.Context, nodeID, expectedToken string) (executed Executed, err error) {
+// R supplies both typed parameter resolution and business execution APIs. The
+// caller prepares it using PublishedNode.GetDependencies before driving the node.
+// A Suspended node is explicitly claimable; Drive never auto-polls it.
+func (e *Engine[R]) Drive(ctx context.Context, nodeID string, runtime R) (executed Executed, err error) {
 	if nodeID == "" {
 		return Executed{}, ErrInvalidDefinition
+	}
+	if isNil(runtime) {
+		return Executed{}, ErrInvalidRuntime
 	}
 	owner := &nodeLease{infra: e.infra}
 	runner, err := lease.NewRunner(owner, e.options.Lease)
@@ -171,18 +110,9 @@ func (e *Engine) drive(ctx context.Context, nodeID, expectedToken string) (execu
 	}
 	err = runner.Run(ctx, nodeID, func(ctx context.Context, token lease.Token) error {
 		task := owner.task
-		// ClaimNode's returned snapshot is protected by this lease. A stale
-		// resume may briefly claim and release the current node, but it can never
-		// invoke Resume for a different suspension round.
-		//
-		// ClaimNode 返回的快照受此租约保护。过期 resume 可能短暂 claim 并释放
-		// 当前节点，但绝不会调用另一个挂起轮次的 Resume。
-		if expectedToken != "" && (task.State.Suspension == nil || task.State.Suspension.Token != expectedToken) {
-			return nil
-		}
 		executed.NodeID = nodeID
 		e.options.Hooks.claim(ctx, NodeEvent{NodeID: nodeID, Attempt: task.State.Generation})
-		node, result, execErr := e.execute(ctx, task)
+		node, result, execErr := e.execute(ctx, task, runtime)
 		if ctx.Err() != nil {
 			// Lease lost or caller cancelled: the outcome is uncertain, not a
 			// business failure. Leave the node Running for a retry/reclaim.
@@ -191,42 +121,41 @@ func (e *Engine) drive(ctx context.Context, nodeID, expectedToken string) (execu
 			// Running 状态，等待重试或重新 claim。
 			return &InfrastructureError{"Execute", context.Cause(ctx)}
 		}
-		next := task.State
-		var arrivals []Arrival
+		var status Status
+		var arrivals map[string]bool
+		var resultErr error
 		if execErr != nil {
 			var infraErr *InfrastructureError
 			if errors.As(execErr, &infraErr) {
 				return execErr
 			}
-			next.Status, next.Error = Failed, execErr.Error()
-		} else if result.Suspend != nil {
-			next.Status = Suspended
-			next.Suspension = &SuspensionState{Token: uuid.NewString(), Payload: result.Suspend}
+			resultErr = execErr
+			status = Failed
+		} else if !result.done {
+			status = Suspended
 		} else {
-			next.Status = Succeeded
+			status = Succeeded
 			if !task.State.Enabled {
-				next.Status = Skipped
+				status = Skipped
 			}
-			next.Output, next.Ports, next.Suspension = result.Output, result.Ports, nil
-			arrivals, err = e.arrivals(ctx, nodeID, node, next)
-			if err != nil {
-				return err
-			}
+			arrivals = e.arrivals(node, status, result.outgoing)
 		}
-		next.Ready = false
-		ready, commitErr := owner.commit(ctx, token, NodeCommit{nodeID, task.State.Version, next, arrivals})
+		ready, commitErr := owner.commit(ctx, token, NodeCommit{
+			NodeID:          nodeID,
+			ExpectedVersion: task.State.Version,
+			Status:          status,
+			Input:           result.input,
+			Output:          result.output,
+			Error:           resultErr,
+			Arrivals:        arrivals,
+		})
 		if commitErr != nil {
 			return commitErr
 		}
-		executed.Status = next.Status
-		executed.Output = next.Output
+		executed.Status = status
+		executed.Result = result.raw
 		executed.Ready = ready
-		if next.Suspension != nil {
-			executed.Suspension = next.Suspension.Payload
-			executed.Token = next.Suspension.Token
-		}
 		if execErr != nil {
-			executed.Err = execErr
 			return &NodeError{nodeID, "execute", execErr}
 		}
 		return nil
@@ -270,6 +199,10 @@ func (l *nodeLease) Claim(ctx context.Context, nodeID string, ttl time.Duration)
 	}
 	if task == nil {
 		return nil, errNotDrivable
+	}
+	if task.NodeID != nodeID || task.Lease.Key != nodeID ||
+		task.Lease.Generation != task.State.Generation || task.State.Status != Running {
+		return nil, &InfrastructureError{"ClaimNode", ErrInvalidDefinition}
 	}
 	l.task = task
 	token := task.Lease
@@ -326,144 +259,112 @@ func (l *nodeLease) Release(ctx context.Context, token lease.Token) error {
 	return l.infra.ReleaseNode(ctx, token)
 }
 
-func (e *Engine) execute(parent context.Context, task *NodeTask) (published *PublishedNode, result Result, err error) {
+// executionResult is normalized while the node lease is held. Result getters
+// are evaluated once; arbitrary result implementations do not enter storage.
+type executionResult struct {
+	raw      NodeResult
+	input    map[string]any
+	output   map[string]any
+	outgoing []string
+	done     bool
+}
+
+func (e *Engine[R]) execute(parent context.Context, task *NodeTask, runtime R) (published PublishedNode[R], result executionResult, err error) {
 	ctx, cancel := context.WithTimeout(context.WithValue(parent, nodeIDKey{}, task.NodeID), e.options.NodeTimeout)
 	defer cancel()
 	var started time.Time
-	var duration time.Duration
+	result.done = true
 	defer func() {
 		if value := recover(); value != nil {
-			err = fmt.Errorf("panic: %v", value)
+			result.raw = nil
+			err = fmt.Errorf("%w: panic: %v", ErrInvalidResult, value)
 		}
 		if !started.IsZero() {
 			if ctx.Err() != nil {
-				result, err = Result{}, ctx.Err()
+				err = ctx.Err()
 			}
-			if duration == 0 {
-				// duration includes a panicking call.
-				//
-				// duration 包含发生 panic 的调用耗时。
-				duration = time.Since(started)
-			}
-			e.finish(ctx, task, duration, result, err)
+			e.finish(ctx, task, time.Since(started), result, err)
 		}
 	}()
 	published, err = e.definitions.LoadNode(ctx, task.NodeID)
 	if err != nil {
 		return nil, result, &InfrastructureError{"LoadNode", err}
 	}
-	if published == nil || published.Spec.ID != task.NodeID {
+	if isNil(published) || published.GetID() != task.NodeID {
 		return nil, result, &InfrastructureError{"LoadNode", ErrInvalidDefinition}
 	}
 	if !task.State.Enabled {
 		return published, result, nil
 	}
-	// Skipped nodes have no executable instance.
-	//
-	// 被跳过的节点没有可执行实例。
-	node := published.Spec.Node
+	node := published.GetNode()
 	if isNil(node) {
 		return published, result, &InfrastructureError{"LoadNode", ErrInvalidDefinition}
 	}
-	nodeInput := task.State.Input
-	if task.State.Suspension == nil {
-		upstream := map[string]NodeState{}
-		for _, parameter := range published.Spec.Inputs {
-			if isNil(parameter) {
-				return published, result, ErrInvalidReference
-			}
-			refs, refErr := parameter.References()
-			if refErr != nil {
-				return published, result, refErr
-			}
-			for _, path := range refs {
-				if err := validatePath(path); err != nil {
-					return published, result, err
-				}
-				if path[0] == InputSource {
-					continue
-				}
-				if _, loaded := upstream[path[0]]; loaded {
-					continue
-				}
-				state, readErr := e.infra.GetNode(ctx, path[0])
-				if readErr != nil {
-					return published, result, &InfrastructureError{"GetNode", readErr}
-				}
-				if state != nil {
-					upstream[path[0]] = *state
-				}
-			}
-		}
-		nodeInput, err = published.Spec.Inputs.resolveWithInput(e.infra, ctx, upstream)
-		if err != nil {
-			return published, result, err
-		}
-		task.State.Input = nodeInput
+	event := NodeEvent{NodeID: task.NodeID, Attempt: task.State.Generation}
+	e.options.Hooks.start(ctx, event)
+	started = time.Now()
+	result.raw = node.Run(ctx, runtime)
+	if isNil(result.raw) {
+		result.raw = nil
+		return published, result, fmt.Errorf("%w: nil result", ErrInvalidResult)
 	}
-	if suspension := task.State.Suspension; suspension != nil {
-		response, readErr := e.infra.GetResponse(ctx, task.NodeID, suspension.Token)
-		if readErr != nil {
-			return published, result, &InfrastructureError{"GetResponse", readErr}
-		}
-		if response == nil {
-			return published, result, &InfrastructureError{"GetResponse", ErrWaitNotFound}
-		}
-		resumable, ok := node.(ResumableNode)
-		if !ok {
-			return published, result, ErrInvalidSuspension
-		}
-		e.options.Hooks.start(ctx, NodeEvent{NodeID: task.NodeID, Attempt: task.State.Generation, IsResume: true, Token: suspension.Token})
-		started = time.Now()
-		result, err = resumable.Resume(ctx, maps.Clone(nodeInput), ResumeInput{Token: suspension.Token, Suspension: suspension.Payload, Response: response.Value})
-	} else {
-		e.options.Hooks.start(ctx, NodeEvent{NodeID: task.NodeID, Attempt: task.State.Generation})
-		started = time.Now()
-		result, err = node.Run(ctx, maps.Clone(nodeInput))
-	}
-	duration = time.Since(started)
+	result.input = maps.Clone(result.raw.GetInput())
+	result.output = maps.Clone(result.raw.GetOutput())
+	err = result.raw.GetError()
 	if ctx.Err() != nil {
-		return published, Result{}, ctx.Err()
+		return published, result, ctx.Err()
 	}
 	if err != nil {
 		return published, result, err
 	}
-	if result.Suspend != nil {
-		if _, ok := node.(ResumableNode); !ok || isNil(result.Suspend) || result.Suspend.Type() == "" || result.Output != nil || result.Ports != nil {
-			return published, result, ErrInvalidSuspension
-		}
+	asyncResult, async := result.raw.(AsyncNodeResult)
+	branchResult, branch := result.raw.(BranchNodeResult)
+	if async && branch {
+		return published, result, fmt.Errorf("%w: async and branch results are mutually exclusive", ErrInvalidResult)
 	}
-	for _, port := range result.Ports {
-		found := false
-		for _, edge := range published.Outgoing {
-			if edge.SourcePortID == port {
-				found = true
+	if branch {
+		result.outgoing = slices.Clone(branchResult.GetOutgoing())
+		if err := validateIDs(result.outgoing); err != nil {
+			return published, result, fmt.Errorf("%w: outgoing: %v", ErrInvalidResult, err)
+		}
+		for _, id := range result.outgoing {
+			if !slices.Contains(published.GetOutgoing(), id) {
+				return published, result, fmt.Errorf("%w: unknown outgoing node %q", ErrInvalidResult, id)
 			}
 		}
-		if !found {
-			return published, result, fmt.Errorf("unknown outgoing port %q", port)
-		}
+	} else if async {
+		result.done = asyncResult.IsDone()
 	}
-	return published, result, err
+	if !branch && result.done {
+		result.outgoing = slices.Clone(published.GetOutgoing())
+	}
+	return published, result, nil
 }
 
-func (e *Engine) finish(ctx context.Context, task *NodeTask, duration time.Duration, result Result, err error) {
+func validateIDs(ids []string) error {
+	seen := make(map[string]bool, len(ids))
+	for _, id := range ids {
+		if id == "" || seen[id] {
+			return ErrInvalidDefinition
+		}
+		seen[id] = true
+	}
+	return nil
+}
+
+func (e *Engine[R]) finish(ctx context.Context, task *NodeTask, duration time.Duration, result executionResult, err error) {
 	if e.options.Hooks.OnFinish == nil {
 		return
 	}
 	event := NodeEvent{
 		NodeID:   task.NodeID,
 		Attempt:  task.State.Generation,
-		IsResume: task.State.Suspension != nil,
 		Duration: duration,
-	}
-	if task.State.Suspension != nil {
-		event.Token = task.State.Suspension.Token
 	}
 	switch {
 	case err != nil:
 		event.Outcome, event.Err = Failed, err
-	case result.Suspend != nil:
+	case !result.done:
 		event.Outcome = Suspended
 	case !task.State.Enabled:
 		event.Outcome = Skipped
@@ -473,26 +374,11 @@ func (e *Engine) finish(ctx context.Context, task *NodeTask, duration time.Durat
 	e.options.Hooks.finish(ctx, event)
 }
 
-func (e *Engine) arrivals(ctx context.Context, source string, node *PublishedNode, state NodeState) ([]Arrival, error) {
-	targets := map[string]bool{}
-	var order []string
-	for _, edge := range node.Outgoing {
-		if _, exists := targets[edge.TargetNodeID]; !exists {
-			order = append(order, edge.TargetNodeID)
-		}
-		active := state.Status == Succeeded && (state.Ports == nil || slices.Contains(state.Ports, edge.SourcePortID))
-		targets[edge.TargetNodeID] = targets[edge.TargetNodeID] || active
+func (e *Engine[R]) arrivals(node PublishedNode[R], status Status, outgoing []string) map[string]bool {
+	result := map[string]bool{}
+	for _, id := range node.GetOutgoing() {
+		active := status == Succeeded && slices.Contains(outgoing, id)
+		result[id] = active
 	}
-	var result []Arrival
-	for _, id := range order {
-		incoming, err := e.definitions.Incoming(ctx, id)
-		if err != nil {
-			return nil, err
-		}
-		if !slices.Contains(incoming, source) {
-			return nil, ErrInvalidDefinition
-		}
-		result = append(result, Arrival{TargetNodeID: id, Incoming: incoming, Active: targets[id]})
-	}
-	return result, nil
+	return result
 }

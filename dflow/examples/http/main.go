@@ -20,29 +20,33 @@ func main() {
 		_ = json.NewEncoder(w).Encode(map[string]any{"message": "你好，" + r.URL.Query().Get("name")})
 	}))
 	defer server.Close()
-	graph, err := dflow.Compile(dflow.Definition{
-		Version: "http-v1",
-		Nodes: []dflow.NodeSpec{
+	ctx := context.Background()
+	records, err := nodes.Compile(ctx, nodes.Definition{
+		Nodes: []nodes.Spec{
 			{ID: "request", Node: &nodes.HTTPNode{Method: "GET", TimeoutMS: 5000},
-				Inputs: dflow.Parameters{
-					"url": dflow.Constant(server.URL), "params": dflow.Input("query"),
+				Inputs: map[string]nodes.Param{
+					"url": nodes.Const(server.URL), "params": nodes.Input("query"),
 				}},
-			{ID: "parse", Node: &nodes.JSONParseNode{}, Inputs: dflow.Parameters{"json": dflow.Ref("request", "body")}},
-			{ID: "end", Node: &nodes.EndNode{}, Inputs: dflow.Parameters{"message": dflow.Ref("parse", "message")}},
+			{ID: "parse", Node: &nodes.JSONParseNode{}, Inputs: map[string]nodes.Param{"json": nodes.Ref("request", "body")}},
+			{ID: "end", Node: &nodes.EndNode{}, Inputs: map[string]nodes.Param{"message": nodes.Ref("parse", "message")}},
 		},
-		Edges: []dflow.Edge{
-			{SourceNodeID: "request", TargetNodeID: "parse"},
-			{SourceNodeID: "parse", TargetNodeID: "end"},
+		Edges: []nodes.Edge{
+			{Source: "request", Target: "parse"},
+			{Source: "parse", Target: "end"},
 		},
 	})
 	if err != nil {
 		log.Fatal(err)
 	}
-	engine, err := dflow.NewEngine(graph, memory.New(), dflow.Options{})
+	store, publication, err := memory.NewRun(records, "request")
 	if err != nil {
 		log.Fatal(err)
 	}
-	state, err := driver.Run(context.Background(), engine, map[string]any{"query": map[string]any{"name": "HTTP"}})
+	engine, err := dflow.NewEngine(publication, store, dflow.Options{})
+	if err != nil {
+		log.Fatal(err)
+	}
+	state, err := driver.Run(ctx, engine, "request", nodes.RuntimeWithStore(map[string]any{"query": map[string]any{"name": "HTTP"}}, store))
 	if err != nil {
 		log.Fatal(err)
 	}

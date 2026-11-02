@@ -29,7 +29,7 @@ type greetingNode struct {
 	service greetingService
 }
 
-func (n *greetingNode) Run(ctx context.Context, input map[string]any) (dflow.Result, error) {
+func (n *greetingNode) RunInput(ctx context.Context, input map[string]any) (dflow.NodeResult, error) {
 	name, ok := input["name"].(string)
 	if !ok {
 		return dflow.Result{}, errors.New("name must be a string")
@@ -39,24 +39,28 @@ func (n *greetingNode) Run(ctx context.Context, input map[string]any) (dflow.Res
 }
 
 func main() {
+	ctx := context.Background()
 	service := greetingService{}
-	graph, err := dflow.Compile(dflow.Definition{
-		Version: "1",
-		Nodes: []dflow.NodeSpec{
+	records, err := nodes.Compile(ctx, nodes.Definition{
+		Nodes: []nodes.Spec{
 			{ID: "greeting", Node: &greetingNode{Suffix: "！", service: service},
-				Inputs: dflow.Parameters{"name": dflow.Input("name")}},
-			{ID: "end", Node: &nodes.EndNode{}, Inputs: dflow.Parameters{"text": dflow.Ref("greeting", "message")}},
+				Inputs: map[string]nodes.Param{"name": nodes.Input("name")}},
+			{ID: "end", Node: &nodes.EndNode{}, Inputs: map[string]nodes.Param{"text": nodes.Ref("greeting", "message")}},
 		},
-		Edges: []dflow.Edge{{SourceNodeID: "greeting", TargetNodeID: "end"}},
+		Edges: []nodes.Edge{{Source: "greeting", Target: "end"}},
 	})
 	if err != nil {
 		log.Fatal(err)
 	}
-	engine, err := dflow.NewEngine(graph, memory.New(), dflow.Options{})
+	store, publication, err := memory.NewRun(records, "greeting")
 	if err != nil {
 		log.Fatal(err)
 	}
-	state, err := driver.Run(context.Background(), engine, map[string]any{"name": "DAG"})
+	engine, err := dflow.NewEngine(publication, store, dflow.Options{})
+	if err != nil {
+		log.Fatal(err)
+	}
+	state, err := driver.Run(ctx, engine, "greeting", nodes.RuntimeWithStore(map[string]any{"name": "DAG"}, store))
 	if err != nil {
 		log.Fatal(err)
 	}

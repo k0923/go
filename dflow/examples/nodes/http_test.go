@@ -36,46 +36,47 @@ func TestHTTPNodeDAG(t *testing.T) {
 		_, _ = w.Write([]byte(`{"ok":true}`))
 	}))
 	defer server.Close()
-	def := dflow.Definition{
-		Version: "http-v1",
-		Nodes: []dflow.NodeSpec{
-			{ID: "start", Node: &nodes.StartNode{}, Inputs: dflow.Parameters{"input": dflow.Input()}},
+	records, err := nodes.Compile(context.Background(), nodes.Definition{
+		Nodes: []nodes.Spec{
+			{ID: "start", Node: &nodes.StartNode{}, Inputs: map[string]nodes.Param{"input": nodes.Input()}},
 			{ID: "request", Node: &nodes.HTTPNode{Method: "POST", BodyType: "JSON"},
-				Inputs: dflow.Parameters{
-					"url":     dflow.Ref("start", "url"),
-					"body":    dflow.Ref("start", "payload"),
-					"headers": dflow.Constant(map[string]any{"X-Custom": "test"}),
-					"params":  dflow.Constant(map[string]any{"tag": []string{"one", "two"}}),
-					"auth":    dflow.Ref("start", "auth"),
+				Inputs: map[string]nodes.Param{
+					"url":     nodes.Ref("start", "url"),
+					"body":    nodes.Ref("start", "payload"),
+					"headers": nodes.Const(map[string]any{"X-Custom": "test"}),
+					"params":  nodes.Const(map[string]any{"tag": []string{"one", "two"}}),
+					"auth":    nodes.Ref("start", "auth"),
 				}},
-			{ID: "parse", Node: &nodes.JSONParseNode{}, Inputs: dflow.Parameters{"json": dflow.Ref("request", "body")}},
+			{ID: "parse", Node: &nodes.JSONParseNode{}, Inputs: map[string]nodes.Param{"json": nodes.Ref("request", "body")}},
 		},
-		Edges: []dflow.Edge{{SourceNodeID: "start", TargetNodeID: "request"}, {SourceNodeID: "request", TargetNodeID: "parse"}},
-	}
-	graph, err := dflow.Compile(def)
-	if err != nil {
-		t.Fatal(err)
-	}
-	store := memory.New()
-	e, err := dflow.NewEngine(graph, store, dflow.Options{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	_, err = driver.Run(context.Background(), e, map[string]any{
-		"url": server.URL + "?existing=yes", "payload": map[string]any{"message": "hello"},
-		"auth": map[string]any{"type": "basic", "basicUsername": "user", "basicPassword": "pass"},
+		Edges: []nodes.Edge{{Source: "start", Target: "request"}, {Source: "request", Target: "parse"}},
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	state, err := store.Load(context.Background())
+	store, publication, err := memory.NewRun(records, "start")
 	if err != nil {
 		t.Fatal(err)
 	}
-	output := state.Nodes["request"].Output
+	e, err := dflow.NewEngine(publication, store, dflow.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = driver.Run(context.Background(), e, "start", nodes.RuntimeWithStore(map[string]any{
+		"url": server.URL + "?existing=yes", "payload": map[string]any{"message": "hello"},
+		"auth": map[string]any{"type": "basic", "basicUsername": "user", "basicPassword": "pass"},
+	}, store))
+	if err != nil {
+		t.Fatal(err)
+	}
+	state, err := store.Snapshot(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	output := state["request"].Output
 	headers := output["headers"].(map[string]any)
 	if output["statusCode"] != 201 || len(headers["X-Multi"].([]string)) != 2 ||
-		state.Nodes["parse"].Output["ok"] != true {
+		state["parse"].Output["ok"] != true {
 		t.Fatal("unexpected HTTP output", output)
 	}
 }
@@ -103,13 +104,13 @@ func TestHTTPNodeBodiesAndBearer(t *testing.T) {
 		{"none", nil, "", ""},
 	} {
 		node := &nodes.HTTPNode{Method: "POST", BodyType: tc.bodyType}
-		result, err := node.Run(context.Background(), map[string]any{
+		result, err := node.RunInput(context.Background(), map[string]any{
 			"url": server.URL, "body": tc.value, "auth": map[string]any{"type": "bearer", "bearerToken": "token"},
 		})
 		if err != nil {
 			t.Fatal(err)
 		}
-		out := result.Output
+		out := result.GetOutput()
 		if out["body"] != tc.expected || out["statusCode"] != 422 ||
 			out["headers"].(map[string]any)["X-Content-Type"] != tc.content {
 			t.Fatal("non-2xx must preserve HTTP response", out)
@@ -118,7 +119,7 @@ func TestHTTPNodeBodiesAndBearer(t *testing.T) {
 }
 
 func TestHTTPNodeValidationAndLimits(t *testing.T) {
-	if _, err := (&nodes.JSONParseNode{}).Run(context.Background(), map[string]any{"json": "null"}); err == nil {
+	if _, err := (&nodes.JSONParseNode{}).RunInput(context.Background(), map[string]any{"json": "null"}); err == nil {
 		t.Fatal("JSONParseNode accepted a non-object result")
 	}
 	for _, node := range []*nodes.HTTPNode{
@@ -140,7 +141,7 @@ func TestHTTPNodeValidationAndLimits(t *testing.T) {
 		{"url": "http://localhost", "auth": map[string]any{"type": "bearer", "unexpected": true}},
 		{"url": "http://localhost", "auth": (*struct{})(nil)},
 	} {
-		if _, err := node.Run(context.Background(), input); err == nil {
+		if _, err := node.RunInput(context.Background(), input); err == nil {
 			t.Fatal("invalid HTTP input accepted", input)
 		}
 	}
@@ -148,7 +149,7 @@ func TestHTTPNodeValidationAndLimits(t *testing.T) {
 		_, _ = w.Write([]byte("oversized"))
 	}))
 	defer server.Close()
-	if _, err := (&nodes.HTTPNode{MaxResponseBytes: 3}).Run(context.Background(), map[string]any{"url": server.URL}); err == nil {
+	if _, err := (&nodes.HTTPNode{MaxResponseBytes: 3}).RunInput(context.Background(), map[string]any{"url": server.URL}); err == nil {
 		t.Fatal("response limit was not enforced")
 	}
 }
@@ -163,15 +164,15 @@ func TestHTTPNodeRetryAndCancellation(t *testing.T) {
 		_, _ = w.Write([]byte("success"))
 	}))
 	defer server.Close()
-	result, err := (&nodes.HTTPNode{RetryTimes: 1}).Run(context.Background(), map[string]any{"url": server.URL})
-	if err != nil || calls.Load() != 2 || result.Output["body"] != "success" {
+	result, err := (&nodes.HTTPNode{RetryTimes: 1}).RunInput(context.Background(), map[string]any{"url": server.URL})
+	if err != nil || calls.Load() != 2 || result.GetOutput()["body"] != "success" {
 		t.Fatal("retry failed", result, err, calls.Load())
 	}
 	before := calls.Load()
-	if _, err := (&nodes.HTTPNode{Method: "POST", RetryTimes: 1}).Run(context.Background(), map[string]any{"url": server.URL}); err == nil || calls.Load() != before {
+	if _, err := (&nodes.HTTPNode{Method: "POST", RetryTimes: 1}).RunInput(context.Background(), map[string]any{"url": server.URL}); err == nil || calls.Load() != before {
 		t.Fatal("unsafe POST retry must be rejected before request")
 	}
-	result, err = (&nodes.HTTPNode{Method: "POST", RetryTimes: 1}).Run(context.Background(), map[string]any{
+	result, err = (&nodes.HTTPNode{Method: "POST", RetryTimes: 1}).RunInput(context.Background(), map[string]any{
 		"url": server.URL, "headers": map[string]any{"Idempotency-Key": "operation-1"},
 	})
 	if err != nil {
@@ -181,7 +182,7 @@ func TestHTTPNodeRetryAndCancellation(t *testing.T) {
 		w.WriteHeader(503)
 	}))
 	defer unavailable.Close()
-	_, err = (&nodes.HTTPNode{RetryTimes: 1, TimeoutMS: 20}).Run(context.Background(), map[string]any{"url": unavailable.URL})
+	_, err = (&nodes.HTTPNode{RetryTimes: 1, TimeoutMS: 20}).RunInput(context.Background(), map[string]any{"url": unavailable.URL})
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatal("retry backoff ignored timeout", err)
 	}
@@ -191,7 +192,7 @@ func TestHTTPNodeRetryAndCancellation(t *testing.T) {
 	defer blocking.Close()
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
 	defer cancel()
-	_, err = (&nodes.HTTPNode{}).Run(ctx, map[string]any{"url": blocking.URL})
+	_, err = (&nodes.HTTPNode{}).RunInput(ctx, map[string]any{"url": blocking.URL})
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatal("HTTP request ignored caller context", err)
 	}
@@ -205,8 +206,8 @@ func TestHTTPNodeClientInjection(t *testing.T) {
 	node := &nodes.HTTPNode{Client: &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error {
 		return http.ErrUseLastResponse
 	}}}
-	result, err := node.Run(context.Background(), map[string]any{"url": server.URL})
-	if err != nil || result.Output["statusCode"] != 302 {
+	result, err := node.RunInput(context.Background(), map[string]any{"url": server.URL})
+	if err != nil || result.GetOutput()["statusCode"] != 302 {
 		t.Fatal("injected client was not preserved", result, err)
 	}
 }

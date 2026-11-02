@@ -12,54 +12,29 @@ import (
 	"github.com/k0923/go/dflow/sqlite"
 )
 
-func TestSQLiteRestoresPublicationSuspensionAndCallback(t *testing.T) {
+func TestSQLiteRestoresJSONBuiltWorkflow(t *testing.T) {
 	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "review.db")
 	if err := publishAndRun(ctx, path); err != nil {
 		t.Fatal(err)
 	}
-	service := &reviewService{}
-	store, err := sqlite.Open(ctx, path, "demo", Codec{Service: service})
+	store, err := sqlite.Open(ctx, path, "demo")
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer store.Close()
-	node, err := store.Provider("review-v1").LoadNode(ctx, "review")
+	review, ok, err := store.Node(ctx, "review")
 	if err != nil {
 		t.Fatal(err)
 	}
-	review, ok := node.Spec.Node.(*reviewNode)
-	if !ok || review.service != service {
-		t.Fatal("publication did not rebuild the node with the current service")
+	store.Close()
+	if !ok || review.Status != dflow.Suspended || review.Output["total"] != float64(42) || review.Output["approver"] != "财务" {
+		t.Fatalf("review did not suspend with persisted request data: %+v", review)
 	}
-	state, err := store.GetNode(ctx, "review")
+	approved, err := saveCallback(ctx, path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if state == nil || state.Status != dflow.Suspended || state.Suspension == nil {
-		t.Fatal("suspension was not persisted", state)
-	}
-	request, ok := state.Suspension.Payload.(*ReviewRequest)
-	if !ok || request.Total != 42 || request.Approver != "财务" {
-		t.Fatal("suspension type/value was lost", state.Suspension.Payload)
-	}
-
-	token, err := saveCallback(ctx, path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	response, err := store.GetResponse(ctx, "review", token)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if response == nil {
-		t.Fatal("callback was not persisted")
-	}
-	reply, ok := response.Value.(*ReviewReply)
-	if !ok || !reply.Approved {
-		t.Fatal("callback type/value was lost", response.Value)
-	}
-	output, err := resume(ctx, path, token)
+	output, err := resume(ctx, path, approved)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -69,36 +44,6 @@ func TestSQLiteRestoresPublicationSuspensionAndCallback(t *testing.T) {
 	}
 	if !reflect.DeepEqual(output, expected) {
 		t.Fatalf("unexpected output: %v", output)
-	}
-	messages, err := store.Pending(ctx)
-	if err != nil || len(messages) != 0 {
-		t.Fatal("notifications were not acknowledged", messages, err)
-	}
-}
-
-func TestCodecPreservesPortSelectionAndNullCallback(t *testing.T) {
-	codec := Codec{}
-	for _, ports := range [][]string{nil, {}, {"true"}} {
-		original := dflow.NodeState{Status: dflow.Succeeded, Ports: ports}
-		raw, err := codec.Encode(original)
-		if err != nil {
-			t.Fatal(err)
-		}
-		var restored dflow.NodeState
-		if err := codec.Decode(raw, &restored); err != nil {
-			t.Fatal(err)
-		}
-		if !reflect.DeepEqual(original, restored) {
-			t.Fatalf("port selection changed: %s", raw)
-		}
-	}
-	raw, err := codec.Encode(dflow.Response{Value: nil})
-	if err != nil {
-		t.Fatal(err)
-	}
-	var response dflow.Response
-	if err := codec.Decode(raw, &response); err != nil || response.Value != nil {
-		t.Fatal("explicit nil callback was lost", response, err)
 	}
 }
 
@@ -115,11 +60,7 @@ func TestRejectInvalidDefinitionJSON(t *testing.T) {
 			var wire DefinitionJSON
 			err := json.Unmarshal([]byte(raw), &wire)
 			if err == nil {
-				var def dflow.Definition
-				def, err = wire.Build(&reviewService{})
-				if err == nil {
-					_, err = dflow.Compile(def)
-				}
+				_, err = wire.Compile(context.Background(), &reviewService{})
 			}
 			if err == nil {
 				t.Fatal("invalid definition accepted")
@@ -128,20 +69,29 @@ func TestRejectInvalidDefinitionJSON(t *testing.T) {
 	}
 }
 
-func TestCodecRejectsUnsupportedValues(t *testing.T) {
-	for _, value := range []any{
-		dflow.Response{Value: make(chan int)},
-		dflow.PublishedNode{Spec: dflow.NodeSpec{Node: &nodes.HTTPNode{}}},
-		dflow.PublishedNode{Spec: dflow.NodeSpec{
-			Node: &nodes.EndNode{}, Inputs: dflow.Parameters{"x": dflow.Constant("unregistered")},
-		}},
-		make(chan int),
-	} {
-		if _, err := (Codec{}).Encode(value); err == nil {
-			t.Fatalf("unsupported value %T accepted", value)
-		}
+func TestDefinitionJSONRoundTrip(t *testing.T) {
+	wire, err := loadDefinition()
+	if err != nil {
+		t.Fatal(err)
 	}
-	if err := (Codec{}).Decode([]byte(`{}`), new(dflow.Result)); err == nil {
-		t.Fatal("unsupported target accepted")
+	raw, err := json.Marshal(wire)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var restored DefinitionJSON
+	if err := json.Unmarshal(raw, &restored); err != nil {
+		t.Fatal(err)
+	}
+	records, err := restored.Compile(context.Background(), &reviewService{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(records) != 3 || records[0].GetID() != "calculate" {
+		t.Fatalf("unexpected publication order: %+v", records)
+	}
+	if _, ok := records[2].GetNode().(interface {
+		Run(context.Context, *nodes.Runtime) dflow.NodeResult
+	}); !ok {
+		t.Fatal("published node is not executable")
 	}
 }

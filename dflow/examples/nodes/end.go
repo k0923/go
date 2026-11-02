@@ -8,6 +8,6 @@ import (
 
 type EndNode struct{}
 
-func (*EndNode) Run(_ context.Context, input map[string]any) (dflow.Result, error) {
+func (*EndNode) RunInput(_ context.Context, input map[string]any) (dflow.NodeResult, error) {
 	return dflow.Result{Output: input}, nil
 }

@@ -8,11 +8,10 @@ import (
 var (
 	ErrInvalidDefinition = errors.New("invalid DAG definition")
 	ErrInvalidReference  = errors.New("invalid output reference")
-	ErrMissingValue      = errors.New("referenced value is missing")
 	ErrConflict          = errors.New("run state conflict")
 	ErrRunMismatch       = errors.New("infrastructure is bound to a different definition or input")
-	ErrWaitNotFound      = errors.New("wait is not registered")
-	ErrInvalidSuspension = errors.New("invalid node suspension")
+	ErrInvalidRuntime    = errors.New("runtime is nil")
+	ErrInvalidResult     = errors.New("invalid node result")
 )
 
 // ValidationError identifies a definition error before any node is executed.

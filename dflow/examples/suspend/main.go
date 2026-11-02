@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"encoding/gob"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -10,111 +9,81 @@ import (
 
 	"github.com/k0923/go/dflow"
 	"github.com/k0923/go/dflow/driver"
-	"github.com/k0923/go/dflow/examples/internal/appcodec"
 	"github.com/k0923/go/dflow/examples/nodes"
 	"github.com/k0923/go/dflow/sqlite"
 )
 
 type taskNode struct{}
 
-func init() { gob.Register(taskNode{}) }
-
-func (taskNode) Run(context.Context, map[string]any) (dflow.Result, error) {
-	fmt.Println("首次执行 task 节点")
-	return dflow.Result{Suspend: &dflow.ValueSuspension{Kind: "transcode",
-		Data: map[string]any{"format": "mp4", "action": "transcode"},
+func (taskNode) RunInput(_ context.Context, input map[string]any) (dflow.NodeResult, error) {
+	answer, _ := input["answer"].(string)
+	if answer == "" {
+		fmt.Println("task 节点挂起，等待业务回调")
+		return dflow.AsyncResult{Result: dflow.Result{
+			Output: map[string]any{"request": "transcode mp4"},
+		}}, nil
+	}
+	fmt.Println("task 节点收到业务回调:", answer)
+	return dflow.AsyncResult{Done: true, Result: dflow.Result{
+		Output: map[string]any{"request": "transcode mp4", "response": answer},
 	}}, nil
 }
 
-func (taskNode) Resume(_ context.Context, _ map[string]any, input dflow.ResumeInput) (dflow.Result, error) {
-	fmt.Println("恢复 task 节点，token:", input.Token)
-	payload, ok := input.Suspension.(*dflow.ValueSuspension)
-	if !ok {
-		return dflow.Result{}, dflow.ErrInvalidSuspension
-	}
-	return dflow.Result{Output: map[string]any{"operation": payload.Data, "response": input.Response}}, nil
+func compile(ctx context.Context) ([]dflow.PublishedNode[*nodes.Runtime], error) {
+	return nodes.Compile(ctx, nodes.Definition{
+		Nodes: []nodes.Spec{
+			{ID: "task", Node: taskNode{}, Inputs: map[string]nodes.Param{"answer": nodes.Input("answer")}},
+			{ID: "end", Node: &nodes.EndNode{}, Inputs: map[string]nodes.Param{"result": nodes.Ref("task")}},
+		},
+		Edges: []nodes.Edge{{Source: "task", Target: "end"}},
+	})
 }
 
 func main() {
 	path := flag.String("db", "", "SQLite file path (required)")
 	scope := flag.String("run", "demo", "unique run ID")
-	answer := flag.String("answer", "", "response to the existing wait")
-	token := flag.String("token", "", "suspension token from the request notification")
-	publish := flag.Bool("publish", false, "publish the definition before first execution")
+	initRun := flag.Bool("init", false, "initialize a new run before driving")
+	answer := flag.String("answer", "", "business response used to continue the suspended task")
 	flag.Parse()
 	if *path == "" {
 		log.Fatal("-db is required")
 	}
 	ctx := context.Background()
-	store, err := sqlite.Open(ctx, *path, *scope, appcodec.Codec{})
+	records, err := compile(ctx)
+	if err != nil {
+		log.Fatal(err)
+	}
+	var store *sqlite.Infrastructure
+	var publication *sqlite.Publication[*nodes.Runtime]
+	if *initRun {
+		store, publication, err = sqlite.NewRun(ctx, *path, *scope, records, "task")
+	} else {
+		store, err = sqlite.Open(ctx, *path, *scope)
+		if err == nil {
+			publication, err = sqlite.Publish(records)
+		}
+	}
 	if err != nil {
 		log.Fatal(err)
 	}
 	defer store.Close()
-	if *publish {
-		graph, err := dflow.Compile(dflow.Definition{
-			Version: "1",
-			Nodes: []dflow.NodeSpec{
-				{ID: "task", Node: taskNode{}},
-				{ID: "end", Node: &nodes.EndNode{}, Inputs: dflow.Parameters{"result": dflow.Ref("task")}},
-			},
-			Edges: []dflow.Edge{{SourceNodeID: "task", TargetNodeID: "end"}},
-		})
-		if err != nil {
-			log.Fatal(err)
-		}
-		if _, err := store.Publish(ctx, "transcode-v1", graph); err != nil {
-			log.Fatal(err)
-		}
-	}
-	// On restart only the publication ID is needed; nodes are decoded on demand.
-	//
-	// 重启时只需要 publication ID；节点会按需解码。
-	engine, err := dflow.NewEngineWithProvider(store.Provider("transcode-v1"), store, dflow.Options{})
+	engine, err := dflow.NewEngine(publication, store, dflow.Options{})
 	if err != nil {
 		log.Fatal(err)
 	}
-	if *answer != "" {
-		if *token == "" {
-			log.Fatal("-token from the original request is required with -answer")
-		}
-		_, err = driver.Resume(ctx, engine, "task", *token, *answer)
-	} else {
-		_, err = driver.Run(ctx, engine, nil)
-	}
+	state, err := driver.Run(ctx, engine, "task", nodes.RuntimeWithStore(map[string]any{"answer": *answer}, store))
 	if err != nil {
 		log.Fatal(err)
 	}
-	// Loading state is optional business observation, not engine scheduling.
-	//
-	// 加载状态是可选的业务观测，而不是引擎调度。
-	state, err := store.Load(ctx)
+	for id, node := range state.Nodes {
+		fmt.Printf("%s: %s\n", id, node.Status)
+	}
+	snapshot, err := store.Snapshot(ctx)
 	if err != nil {
 		log.Fatal(err)
 	}
-	fmt.Println("task 节点状态:", state.Nodes["task"].Status)
-	// This application's own completion rule; the engine has no workflow status.
-	//
-	// 这是本应用自己的完成规则；引擎没有工作流整体状态。
-	if state.Nodes["end"].Status == dflow.Succeeded {
-		data, _ := json.Marshal(state.Nodes["end"].Output)
+	if snapshot["end"].Status == dflow.Succeeded {
+		data, _ := json.Marshal(snapshot["end"].Output)
 		fmt.Println(string(data))
-	}
-	messages, err := store.Pending(ctx)
-	if err != nil {
-		log.Fatal(err)
-	}
-	for _, message := range messages {
-		// Production: REQUEST goes to a business provider using run+node+token as an
-		// idempotency key; WAKE retries Resume until it returns without error.
-		//
-		// 生产环境中，REQUEST 会发送给业务 provider，并使用 run+node+token 作为幂等键；
-		// WAKE 会重试 Resume，直到它无错误返回。
-		fmt.Printf("通知 %d: %s node=%s token=%s request=%+v\n", message.ID, message.Kind, message.NodeID, message.Token, message.Request)
-		if state.Nodes["end"].Status == dflow.Succeeded {
-			if err := store.Ack(ctx, message.ID); err != nil {
-				log.Fatal(err)
-			}
-		}
 	}
 }

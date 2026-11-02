@@ -14,7 +14,7 @@ type ConditionNode struct{}
 //
 // Run 根据已解析的布尔输入选择 true/false 端口。业务谓词可以由 code 或自定义
 // 前驱节点提供。
-func (*ConditionNode) Run(_ context.Context, input map[string]any) (dflow.Result, error) {
+func (*ConditionNode) RunInput(_ context.Context, input map[string]any) (dflow.NodeResult, error) {
 	value, ok := input["condition"].(bool)
 	if !ok {
 		return dflow.Result{}, fmt.Errorf("condition input must be a boolean")
@@ -23,5 +23,8 @@ func (*ConditionNode) Run(_ context.Context, input map[string]any) (dflow.Result
 	if value {
 		port = "true"
 	}
-	return dflow.Result{Output: map[string]any{"matchedKey": port}, Ports: []string{port}}, nil
+	return dflow.BranchResult{
+		Result:   dflow.Result{Output: map[string]any{"matchedKey": port}},
+		Outgoing: []string{port},
+	}, nil
 }

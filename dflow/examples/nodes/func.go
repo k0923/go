@@ -11,7 +11,7 @@ import (
 //
 // FuncNode 将处理函数适配为节点。
 type FuncNode struct {
-	Handler dflow.NodeFunc
+	Handler func(context.Context, map[string]any) (dflow.NodeResult, error)
 }
 
 func (n *FuncNode) Validate() error {
@@ -21,7 +21,7 @@ func (n *FuncNode) Validate() error {
 	return nil
 }
 
-func (n *FuncNode) Run(ctx context.Context, input map[string]any) (dflow.Result, error) {
+func (n *FuncNode) RunInput(ctx context.Context, input map[string]any) (dflow.NodeResult, error) {
 	if err := n.Validate(); err != nil {
 		return dflow.Result{}, err
 	}

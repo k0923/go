@@ -18,26 +18,30 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	graph, err := dflow.Compile(dflow.Definition{
-		Version: "basic-v1",
-		Nodes: []dflow.NodeSpec{
-			{ID: "start", Node: &nodes.StartNode{}, Inputs: dflow.Parameters{"input": dflow.Input()}},
-			{ID: "calculate", Node: code, Inputs: dflow.Parameters{"price": dflow.Ref("start", "price")}},
-			{ID: "end", Node: &nodes.EndNode{}, Inputs: dflow.Parameters{"total": dflow.Ref("calculate", "total")}},
+	ctx := context.Background()
+	records, err := nodes.Compile(ctx, nodes.Definition{
+		Nodes: []nodes.Spec{
+			{ID: "start", Node: &nodes.StartNode{}, Inputs: map[string]nodes.Param{"input": nodes.Input()}},
+			{ID: "calculate", Node: code, Inputs: map[string]nodes.Param{"price": nodes.Ref("start", "price")}},
+			{ID: "end", Node: &nodes.EndNode{}, Inputs: map[string]nodes.Param{"total": nodes.Ref("calculate", "total")}},
 		},
-		Edges: []dflow.Edge{
-			{SourceNodeID: "start", TargetNodeID: "calculate"},
-			{SourceNodeID: "calculate", TargetNodeID: "end"},
+		Edges: []nodes.Edge{
+			{Source: "start", Target: "calculate"},
+			{Source: "calculate", Target: "end"},
 		},
 	})
 	if err != nil {
 		log.Fatal(err)
 	}
-	engine, err := dflow.NewEngine(graph, memory.New(), dflow.Options{})
+	store, publication, err := memory.NewRun(records, "start")
 	if err != nil {
 		log.Fatal(err)
 	}
-	state, err := driver.Run(context.Background(), engine, map[string]any{"price": 21})
+	engine, err := dflow.NewEngine(publication, store, dflow.Options{})
+	if err != nil {
+		log.Fatal(err)
+	}
+	state, err := driver.Run(ctx, engine, "start", nodes.RuntimeWithStore(map[string]any{"price": 21}, store))
 	if err != nil {
 		log.Fatal(err)
 	}

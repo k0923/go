@@ -8,6 +8,6 @@ import (
 
 type PassthroughNode struct{}
 
-func (*PassthroughNode) Run(_ context.Context, input map[string]any) (dflow.Result, error) {
+func (*PassthroughNode) RunInput(_ context.Context, input map[string]any) (dflow.NodeResult, error) {
 	return dflow.Result{Output: input}, nil
 }

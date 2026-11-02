@@ -16,7 +16,8 @@
       "id": "review",
       "node": {"type": "review", "approver": "财务"},
       "inputs": {
-        "total": {"type": "reference", "path": ["calculate", "total"]}
+        "total": {"type": "reference", "path": ["calculate", "total"]},
+        "approved": {"type": "reference", "path": ["$input", "approved"], "optional": true}
       }
     },
     {

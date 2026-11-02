@@ -10,7 +10,7 @@ import (
 
 type JSONParseNode struct{}
 
-func (*JSONParseNode) Run(_ context.Context, input map[string]any) (dflow.Result, error) {
+func (*JSONParseNode) RunInput(_ context.Context, input map[string]any) (dflow.NodeResult, error) {
 	text, ok := input["json"].(string)
 	if !ok {
 		return dflow.Result{}, fmt.Errorf("json input must be a string")

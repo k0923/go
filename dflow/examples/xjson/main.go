@@ -11,6 +11,7 @@ import (
 
 	"github.com/k0923/go/dflow"
 	"github.com/k0923/go/dflow/driver"
+	"github.com/k0923/go/dflow/examples/nodes"
 	"github.com/k0923/go/dflow/sqlite"
 )
 
@@ -34,11 +35,11 @@ func run() error {
 	if err := publishAndRun(ctx, path); err != nil {
 		return err
 	}
-	token, err := saveCallback(ctx, path)
+	approved, err := saveCallback(ctx, path)
 	if err != nil {
 		return err
 	}
-	output, err := resume(ctx, path, token)
+	output, err := resume(ctx, path, approved)
 	if err != nil {
 		return err
 	}
@@ -46,117 +47,93 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	fmt.Println("JSON 定义发布、挂起和类型恢复成功：")
+	fmt.Println("JSON 定义构建、挂起和恢复成功：")
 	fmt.Println(string(raw))
 	return nil
 }
 
-func publishAndRun(ctx context.Context, path string) error {
+func loadDefinition() (DefinitionJSON, error) {
 	var wire DefinitionJSON
 	if err := json.Unmarshal(workflowJSON, &wire); err != nil {
-		return err
+		return wire, err
 	}
-	// The original DTO remains serializable even after runtime nodes are built.
 	raw, err := json.Marshal(wire)
 	if err != nil {
-		return err
+		return wire, err
 	}
 	var restored DefinitionJSON
-	if err := json.Unmarshal(raw, &restored); err != nil {
-		return err
+	return restored, json.Unmarshal(raw, &restored)
+}
+
+func compileRecords(ctx context.Context) ([]dflow.PublishedNode[*nodes.Runtime], error) {
+	wire, err := loadDefinition()
+	if err != nil {
+		return nil, err
 	}
-	def, err := restored.Build(&reviewService{})
+	return wire.Compile(ctx, &reviewService{})
+}
+
+func publishAndRun(ctx context.Context, path string) error {
+	records, err := compileRecords(ctx)
 	if err != nil {
 		return err
 	}
-	graph, err := dflow.Compile(def)
-	if err != nil {
-		return err
-	}
-	store, err := sqlite.Open(ctx, path, "demo", Codec{Service: &reviewService{}})
+	store, publication, err := sqlite.NewRun(ctx, path, "demo", records, "calculate")
 	if err != nil {
 		return err
 	}
 	defer store.Close()
-	provider, err := store.Publish(ctx, "review-v1", graph)
+	engine, err := dflow.NewEngine(publication, store, dflow.Options{})
 	if err != nil {
 		return err
 	}
-	engine, err := dflow.NewEngineWithProvider(provider, store, dflow.Options{})
-	if err != nil {
-		return err
-	}
-	// JSON numeric values are float64 in this application's input/output maps.
-	_, err = driver.Run(ctx, engine, map[string]any{"number": float64(21)})
+	_, err = driver.Run(ctx, engine, "calculate", nodes.RuntimeWithStore(map[string]any{"number": float64(21)}, store))
 	return err
 }
 
-func saveCallback(ctx context.Context, path string) (string, error) {
-	// Reopen with fresh dependencies, as a callback handler in another process.
-	store, err := sqlite.Open(ctx, path, "demo", Codec{Service: &reviewService{}})
+func saveCallback(ctx context.Context, path string) (bool, error) {
+	store, err := sqlite.Open(ctx, path, "demo")
 	if err != nil {
-		return "", err
+		return false, err
 	}
 	defer store.Close()
-	messages, err := store.Pending(ctx)
+	state, ok, err := store.Node(ctx, "review")
 	if err != nil {
-		return "", err
+		return false, err
 	}
-	for _, message := range messages {
-		if message.Kind != dflow.RequestNotification {
-			continue
-		}
-		request, ok := message.Request.(*ReviewRequest)
-		if !ok || request.Total != 42 {
-			return "", fmt.Errorf("request type/value was not restored: %T", message.Request)
-		}
-		engine, err := dflow.NewEngineWithProvider(store.Provider("review-v1"), store, dflow.Options{})
-		if err != nil {
-			return "", err
-		}
-		accepted, err := engine.Wakeup(ctx, message.NodeID, message.Token, &ReviewReply{Approved: true})
-		if err != nil {
-			return "", err
-		}
-		if !accepted {
-			return "", fmt.Errorf("callback was not accepted")
-		}
-		return message.Token, store.Ack(ctx, message.ID)
+	if !ok || state.Status != dflow.Suspended || state.Output["total"] != float64(42) || state.Output["approver"] != "财务" {
+		return false, fmt.Errorf("review request was not persisted as suspended output: %+v", state)
 	}
-	return "", fmt.Errorf("review request missing")
+	return true, nil
 }
 
-func resume(ctx context.Context, path, token string) (map[string]any, error) {
-	// Reopen again: Resume must restore both the suspension and typed callback.
-	store, err := sqlite.Open(ctx, path, "demo", Codec{Service: &reviewService{}})
+func resume(ctx context.Context, path string, approved bool) (map[string]any, error) {
+	records, err := compileRecords(ctx)
+	if err != nil {
+		return nil, err
+	}
+	store, err := sqlite.Open(ctx, path, "demo")
 	if err != nil {
 		return nil, err
 	}
 	defer store.Close()
-	engine, err := dflow.NewEngineWithProvider(store.Provider("review-v1"), store, dflow.Options{})
+	publication, err := sqlite.Publish(records)
 	if err != nil {
 		return nil, err
 	}
-	if _, err := driver.Resume(ctx, engine, "review", token); err != nil {
-		return nil, err
-	}
-	end, err := store.GetNode(ctx, "end")
+	engine, err := dflow.NewEngine(publication, store, dflow.Options{})
 	if err != nil {
 		return nil, err
 	}
-	if end == nil || end.Status != dflow.Succeeded {
+	if _, err := driver.Run(ctx, engine, "review", nodes.RuntimeWithStore(map[string]any{"approved": approved}, store)); err != nil {
+		return nil, err
+	}
+	end, ok, err := store.Node(ctx, "end")
+	if err != nil {
+		return nil, err
+	}
+	if !ok || end.Status != dflow.Succeeded {
 		return nil, fmt.Errorf("end did not succeed")
-	}
-	messages, err := store.Pending(ctx)
-	if err != nil {
-		return nil, err
-	}
-	for _, message := range messages {
-		if message.Kind == dflow.WakeNotification && message.Token == token {
-			if err := store.Ack(ctx, message.ID); err != nil {
-				return nil, err
-			}
-		}
 	}
 	return end.Output, nil
 }
