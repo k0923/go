@@ -15,8 +15,6 @@ Engine 用 `Start` 启动一次运行，之后每条唤醒用 `Resume` 从入口
 | `cflow/examples` | [可运行示例](examples/README.md)：依赖注入、竞争等待、独立子流程、多商品订单和调试器 |
 | `github.com/k0923/go/lease` | 通用租约 Runner，cflow 复用它；lease 不依赖 cflow |
 
-`cflow/legacy` 是旧实现，只保留做历史对照，与新版的数据格式不互通。
-
 ## 快速开始
 
 ```go
