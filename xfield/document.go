@@ -1,14 +1,14 @@
 package xfield
 
 import (
-	"sort"
+	"iter"
 	"strings"
 )
 
 // SchemaDocument holds reusable definitions and keyed use-site fields.
 // Serialization and loading definitions from storage belong to the caller.
 type SchemaDocument[P any] struct {
-	Definitions map[string]Field[P]
+	Definitions Schema[P]
 	Fields      Schema[P]
 }
 
@@ -57,19 +57,20 @@ type FieldCompiler[P any] interface {
 // Compiled declarations may share immutable leaf fields and definitions.
 func CompileDocument[P any](doc SchemaDocument[P]) (Schema[P], error) {
 	c := documentCompiler[P]{
-		definitions: doc.Definitions,
-		compiled:    make(map[string]compiledDefinition[P], len(doc.Definitions)),
+		definitions: make(map[string]Field[P]),
+		compiled:    make(map[string]compiledDefinition[P]),
 		visiting:    make(map[string]bool),
 	}
-	names := make([]string, 0, len(doc.Definitions))
-	for name := range doc.Definitions {
-		names = append(names, name)
-	}
-	sort.Strings(names)
-	for _, name := range names {
+	var names []string
+	for name, field := range schemaAll(doc.Definitions) {
 		if !validDefinitionName(name) {
 			return nil, wrapPathError("definitions."+name, invalidSchema("definition name must be non-empty and contain no whitespace"))
 		}
+		if _, exists := c.definitions[name]; exists {
+			return nil, wrapPathError("definitions."+name, invalidSchema("duplicate definition name"))
+		}
+		c.definitions[name] = field
+		names = append(names, name)
 	}
 	for _, name := range names {
 		if _, err := c.definition(name, 0); err != nil {
@@ -142,18 +143,57 @@ func (c *documentCompiler[P]) schema(schema Schema[P], depth int) (Schema[P], er
 	if depth >= MaxSchemaDepth {
 		return nil, invalidSchema("maximum schema depth exceeded")
 	}
-	if schema == nil {
+	if isNil(schema) {
 		return nil, nil
 	}
-	out := make(Schema[P], len(schema))
-	for _, key := range schemaKeys(schema) {
-		compiled, err := c.field(schema[key], depth)
+	out := &compiledSchema[P]{index: make(map[string]int)}
+	for key, field := range schemaAll(schema) {
+		if key == "" {
+			return nil, invalidSchema("property name is empty")
+		}
+		if _, exists := out.index[key]; exists {
+			return nil, wrapPathError(key, invalidSchema("duplicate property name"))
+		}
+		compiled, err := c.field(field, depth)
 		if err != nil {
 			return nil, wrapPathError(key, err)
 		}
-		out[key] = compiled
+		out.index[key] = len(out.fields)
+		out.fields = append(out.fields, compiledProperty[P]{key: key, field: compiled})
 	}
 	return out, nil
+}
+
+// compiledSchema preserves the source iteration order without depending on the
+// source container's mutators or serialization format.
+type compiledSchema[P any] struct {
+	index  map[string]int
+	fields []compiledProperty[P]
+}
+
+type compiledProperty[P any] struct {
+	key   string
+	field Field[P]
+}
+
+var _ Schema[any] = (*compiledSchema[any])(nil)
+
+func (s *compiledSchema[P]) Get(key string) (Field[P], bool) {
+	index, ok := s.index[key]
+	if !ok {
+		return nil, false
+	}
+	return s.fields[index].field, true
+}
+
+func (s *compiledSchema[P]) All() iter.Seq2[string, Field[P]] {
+	return func(yield func(string, Field[P]) bool) {
+		for _, property := range s.fields {
+			if !yield(property.key, property.field) {
+				return
+			}
+		}
+	}
 }
 
 func (c *documentCompiler[P]) field(field Field[P], depth int) (Field[P], error) {
@@ -293,7 +333,7 @@ func compiledFieldHeight[P any](field Field[P], depth int) (int, error) {
 	}
 	height := 1
 	if object, ok := field.(ObjectProvider[P]); ok {
-		for _, child := range object.ObjectFields() {
+		for _, child := range schemaAll(object.ObjectFields()) {
 			childHeight, err := compiledFieldHeight(child, depth+1)
 			if err != nil {
 				return 0, err

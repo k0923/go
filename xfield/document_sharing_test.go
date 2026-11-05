@@ -10,14 +10,14 @@ import (
 func TestCompileSharedDefinitions(t *testing.T) {
 	// Each level references the previous level twice. The document is small,
 	// while a fully expanded tree would contain tens of millions of fields.
-	definitions := map[string]xfield.Field[struct{}]{
+	definitions := schemaMap[struct{}]{
 		"000": &xfield.StringField[struct{}]{},
 	}
 	for i := 1; i <= 25; i++ {
 		name := fmt.Sprintf("%03d", i)
 		child := fmt.Sprintf("%03d", i-1)
 		definitions[name] = &xfield.ObjectField[struct{}]{
-			Properties: xfield.Schema[struct{}]{
+			Properties: schemaMap[struct{}]{
 				"left":  &xfield.RefField[struct{}]{Ref: child},
 				"right": &xfield.RefField[struct{}]{Ref: child},
 			},
@@ -25,7 +25,7 @@ func TestCompileSharedDefinitions(t *testing.T) {
 	}
 	doc := xfield.SchemaDocument[struct{}]{
 		Definitions: definitions,
-		Fields: xfield.Schema[struct{}]{
+		Fields: schemaMap[struct{}]{
 			"tree": &xfield.RefField[struct{}]{Ref: "025"},
 		},
 	}

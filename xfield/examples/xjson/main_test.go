@@ -148,7 +148,8 @@ func TestConstructWithNG(t *testing.T) {
 		if err != nil || !reflect.DeepEqual(data, clean) {
 			t.Fatalf("constructed containers: %v, %v", clean, err)
 		}
-		if schema["group"].(xfield.MetaProvider).FieldMeta().ID != "group-id" {
+		group, _ := schema.Get("group")
+		if group.(xfield.MetaProvider).FieldMeta().ID != "group-id" {
 			t.Fatal("metadata was lost")
 		}
 		invalid := map[string]any{"group": map[string]any{"active": true, "scores": []any{3}}, "flag": false}
@@ -227,15 +228,25 @@ func TestFrontendArrayOrderSurvivesConversion(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(doc.Definitions) != 2 || len(doc.Fields) != 2 || doc.Fields["z"] == nil {
+	if !reflect.DeepEqual(fieldKeys(doc.Definitions), []string{"zDef", "aDef"}) ||
+		!reflect.DeepEqual(fieldKeys(doc.Fields), []string{"z", "a"}) {
 		t.Fatalf("arrays did not convert to keyed declarations: %v", doc)
 	}
-	nested := doc.Definitions["aDef"].(*xfield.ObjectField[Params]).Properties
-	if len(nested) != 2 || nested["z"] == nil || nested["a"] == nil {
+	definition, _ := doc.Definitions.Get("aDef")
+	nested := definition.(*xfield.ObjectField[Params]).Properties
+	if !reflect.DeepEqual(fieldKeys(nested), []string{"z", "a"}) {
 		t.Fatal("nested property array was not converted")
 	}
-	if _, err := xfield.CompileDocument(doc); err != nil {
+	compiled, err := xfield.CompileDocument(doc)
+	if err != nil {
 		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(fieldKeys(compiled), []string{"z", "a"}) {
+		t.Fatal("compilation changed field order")
+	}
+	group, _ := compiled.Get("z")
+	if !reflect.DeepEqual(fieldKeys(group.(xfield.ObjectProvider[Params]).ObjectFields()), []string{"z", "a"}) {
+		t.Fatal("compilation changed referenced property order")
 	}
 	after, err := json.Marshal(wire)
 	if err != nil || string(before) != string(after) {
@@ -249,4 +260,12 @@ func TestFrontendArrayOrderSurvivesConversion(t *testing.T) {
 		restored.Definitions[1].Field.Value().(*ObjectJSON).Properties[0].Value().FieldKey() != "z" {
 		t.Fatal("saving changed definition, field or property array order")
 	}
+}
+
+func fieldKeys(schema xfield.Schema[Params]) []string {
+	var keys []string
+	for key := range schema.All() {
+		keys = append(keys, key)
+	}
+	return keys
 }

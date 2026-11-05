@@ -9,9 +9,9 @@ import (
 
 func TestPresentModel(t *testing.T) {
 	t.Run("nested params and unchanged fields", func(t *testing.T) {
-		schema := xfield.Schema[*dependencies]{
+		schema := schemaMap[*dependencies]{
 			"profile": &xfield.ObjectField[*dependencies]{
-				Properties: xfield.Schema[*dependencies]{
+				Properties: schemaMap[*dependencies]{
 					"images": &xfield.ArrayField[*dependencies]{
 						Items: &resourceField{},
 					},
@@ -46,7 +46,7 @@ func TestPresentModel(t *testing.T) {
 	})
 
 	t.Run("nil and empty params", func(t *testing.T) {
-		schema := xfield.Schema[struct{}]{
+		schema := schemaMap[struct{}]{
 			"active": &xfield.BooleanField[struct{}]{},
 		}
 		if result := xfield.PresentModel(nil, schema, struct{}{}); result != nil {

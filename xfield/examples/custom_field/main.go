@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/k0923/go/xfield"
+	"github.com/k0923/go/xfield/examples/internal/schema"
 )
 
 type Params struct {
@@ -67,7 +68,7 @@ func main() {
 }
 
 func run() error {
-	schema := xfield.Schema[Params]{
+	schema := schema.Map[Params]{
 		"images": &xfield.ArrayField[Params]{
 			Items: &ResourceField{},
 		},

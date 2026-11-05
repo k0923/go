@@ -6,6 +6,7 @@ import (
 	"fmt"
 
 	"github.com/k0923/go/xfield"
+	"github.com/k0923/go/xfield/examples/internal/schema"
 )
 
 func main() {
@@ -15,10 +16,10 @@ func main() {
 }
 
 func run() error {
-	schema := xfield.Schema[struct{}]{
+	schema := schema.Map[struct{}]{
 		"title": &xfield.StringField[struct{}]{Meta: xfield.Meta{Required: true}},
 		"members": &xfield.ArrayField[struct{}]{
-			Items: &xfield.ObjectField[struct{}]{Properties: xfield.Schema[struct{}]{
+			Items: &xfield.ObjectField[struct{}]{Properties: schema.Map[struct{}]{
 				"name":  &xfield.StringField[struct{}]{Meta: xfield.Meta{Required: true}},
 				"score": &xfield.NumberField[struct{}]{},
 			}},

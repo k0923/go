@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"iter"
 
 	xjson "github.com/k0923/go/json"
 	"github.com/k0923/go/xfield"
@@ -18,6 +19,35 @@ type FieldConfig interface {
 
 type FieldJSON = xjson.G[FieldConfig]
 type SchemaJSON []FieldJSON
+
+// runtimeFields adapts a caller-owned array to xfield without changing its order.
+type runtimeFields []runtimeField
+
+type runtimeField struct {
+	key   string
+	field xfield.Field[Params]
+}
+
+var _ xfield.Schema[Params] = runtimeFields{}
+
+func (s runtimeFields) Get(key string) (xfield.Field[Params], bool) {
+	for _, entry := range s {
+		if entry.key == key {
+			return entry.field, true
+		}
+	}
+	return nil, false
+}
+
+func (s runtimeFields) All() iter.Seq2[string, xfield.Field[Params]] {
+	return func(yield func(string, xfield.Field[Params]) bool) {
+		for _, entry := range s {
+			if !yield(entry.key, entry.field) {
+				return
+			}
+		}
+	}
+}
 
 type DefinitionJSON struct {
 	Name  string    `json:"name"`
@@ -44,47 +74,51 @@ func (s SchemaJSON) Fields(depth int) (xfield.Schema[Params], error) {
 	if s == nil {
 		return nil, nil
 	}
-	fields := make(xfield.Schema[Params], len(s))
+	fields := make(runtimeFields, 0, len(s))
+	seen := make(map[string]bool, len(s))
 	for i, wrapped := range s {
 		config := wrapped.Value()
 		if config == nil || config.FieldKey() == "" {
 			return nil, configError("[%d]: field is null or missing key", i)
 		}
 		key := config.FieldKey()
-		if _, exists := fields[key]; exists {
+		if seen[key] {
 			return nil, configError("[%d]: duplicate property key %q", i, key)
 		}
 		field, err := buildField(wrapped, depth)
 		if err != nil {
 			return nil, fmt.Errorf("[%d].%s: %w", i, key, err)
 		}
-		fields[key] = field
+		seen[key] = true
+		fields = append(fields, runtimeField{key: key, field: field})
 	}
 	return fields, nil
 }
 
 func (d DocumentJSON) Document() (xfield.SchemaDocument[Params], error) {
-	doc := xfield.SchemaDocument[Params]{
-		Definitions: make(map[string]xfield.Field[Params], len(d.Definitions)),
-	}
+	var doc xfield.SchemaDocument[Params]
+	definitions := make(runtimeFields, 0, len(d.Definitions))
+	seen := make(map[string]bool, len(d.Definitions))
 	for i, definition := range d.Definitions {
 		if definition.Name == "" {
 			return doc, configError("definitions[%d]: missing name", i)
 		}
-		if _, exists := doc.Definitions[definition.Name]; exists {
+		if seen[definition.Name] {
 			return doc, configError("definitions[%d]: duplicate definition name %q", i, definition.Name)
 		}
 		field, err := buildField(definition.Field, 0)
 		if err != nil {
 			return doc, fmt.Errorf("definitions[%d].field: %w", i, err)
 		}
-		doc.Definitions[definition.Name] = field
+		seen[definition.Name] = true
+		definitions = append(definitions, runtimeField{key: definition.Name, field: field})
 	}
 	fields, err := d.Fields.Fields(0)
 	if err != nil {
 		return doc, fmt.Errorf("fields: %w", err)
 	}
 	doc.Fields = fields
+	doc.Definitions = definitions
 	return doc, nil
 }
 

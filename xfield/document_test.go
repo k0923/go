@@ -13,9 +13,9 @@ import (
 
 func dialogDocument() xfield.SchemaDocument[struct{}] {
 	return xfield.SchemaDocument[struct{}]{
-		Definitions: map[string]xfield.Field[struct{}]{
+		Definitions: schemaMap[struct{}]{
 			"dialog": &xfield.ObjectField[struct{}]{
-				Properties: xfield.Schema[struct{}]{
+				Properties: schemaMap[struct{}]{
 					"speaker": &xfield.StringField[struct{}]{Meta: xfield.Meta{Required: true}},
 					"start":   &xfield.NumberField[struct{}]{Meta: xfield.Meta{Required: true}},
 					"end":     &xfield.NumberField[struct{}]{Meta: xfield.Meta{Required: true}},
@@ -23,7 +23,7 @@ func dialogDocument() xfield.SchemaDocument[struct{}] {
 				},
 			},
 		},
-		Fields: xfield.Schema[struct{}]{
+		Fields: schemaMap[struct{}]{
 			"start": &xfield.NumberField[struct{}]{Meta: xfield.Meta{Required: true}},
 			"end":   &xfield.NumberField[struct{}]{Meta: xfield.Meta{Required: true}},
 			"tags": &xfield.ArrayField[struct{}]{
@@ -95,31 +95,38 @@ func TestCompileDialogDocument(t *testing.T) {
 			t.Fatal("object reference exposes array children")
 		}
 	}
-	if _, ok := doc.Fields["dialog"].(*xfield.RefField[struct{}]); !ok {
+	dialogField, _ := doc.Fields.Get("dialog")
+	if _, ok := dialogField.(*xfield.RefField[struct{}]); !ok {
 		t.Fatal("source reference was replaced")
 	}
-	if _, ok := doc.Fields["mappedDialogs"].(*xfield.ArrayField[struct{}]).Items.(*xfield.RefField[struct{}]); !ok {
+	mappedDialogs, _ := doc.Fields.Get("mappedDialogs")
+	if _, ok := mappedDialogs.(*xfield.ArrayField[struct{}]).Items.(*xfield.RefField[struct{}]); !ok {
 		t.Fatal("source array item reference was replaced")
 	}
-	if doc.Definitions["dialog"].(xfield.MetaProvider).FieldMeta().Label != "" {
+	definition, _ := doc.Definitions.Get("dialog")
+	if definition.(xfield.MetaProvider).FieldMeta().Label != "" {
 		t.Fatal("use-site metadata leaked into definition")
 	}
 	second, err := xfield.CompileDocument(doc)
-	if err != nil || !xfield.RequiredOf(second["dialog"]) {
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondDialog, _ := second.Get("dialog")
+	if !xfield.RequiredOf(secondDialog) {
 		t.Fatalf("repeated compilation: %v, %v", second, err)
 	}
 }
 
 func TestReferencesPreserveCustomParsePresentAndMappings(t *testing.T) {
 	doc := xfield.SchemaDocument[*dependencies]{
-		Definitions: map[string]xfield.Field[*dependencies]{
+		Definitions: schemaMap[*dependencies]{
 			"resource": &resourceField{Meta: xfield.Meta{Required: true}},
 			"imagesDef": &xfield.ArrayField[*dependencies]{
 				Items: &xfield.RefField[*dependencies]{Ref: "resource"},
 			},
 			"alias": &xfield.RefField[*dependencies]{Ref: "imagesDef"},
 		},
-		Fields: xfield.Schema[*dependencies]{
+		Fields: schemaMap[*dependencies]{
 			"optional": &xfield.RefField[*dependencies]{Ref: "resource"},
 			"images":   &xfield.RefField[*dependencies]{Meta: xfield.Meta{Required: true}, Ref: "alias"},
 		},
@@ -141,7 +148,8 @@ func TestReferencesPreserveCustomParsePresentAndMappings(t *testing.T) {
 	if err != nil || xfield.TypeOf(field) != "resource" {
 		t.Fatalf("array alias traversal: %v, %v", field, err)
 	}
-	if _, ok := schema["images"].(xfield.ObjectProvider[*dependencies]); ok {
+	images, _ := schema.Get("images")
+	if _, ok := images.(xfield.ObjectProvider[*dependencies]); ok {
 		t.Fatal("array reference exposes object children")
 	}
 	mapped, err := xfield.ApplyMappings(
@@ -165,37 +173,37 @@ func TestCompileDocumentRejectsInvalidDeclarations(t *testing.T) {
 	type field = xfield.Field[struct{}]
 	type ref = xfield.RefField[struct{}]
 	tests := map[string]xfield.SchemaDocument[struct{}]{
-		"empty definition name": {Definitions: map[string]field{"": &xfield.StringField[struct{}]{}}},
-		"whitespace name":       {Definitions: map[string]field{"bad name": &xfield.StringField[struct{}]{}}},
-		"nil definition":        {Definitions: map[string]field{"bad": (*xfield.StringField[struct{}])(nil)}},
-		"missing reference":     {Fields: xfield.Schema[struct{}]{"dialog": &ref{Ref: "missing"}}},
-		"empty reference":       {Fields: xfield.Schema[struct{}]{"dialog": &ref{}}},
-		"self reference":        {Definitions: map[string]field{"aDef": &ref{Ref: "aDef"}}},
-		"indirect reference": {Definitions: map[string]field{
+		"empty definition name": {Definitions: schemaMap[struct{}]{"": &xfield.StringField[struct{}]{}}},
+		"whitespace name":       {Definitions: schemaMap[struct{}]{"bad name": &xfield.StringField[struct{}]{}}},
+		"nil definition":        {Definitions: schemaMap[struct{}]{"bad": (*xfield.StringField[struct{}])(nil)}},
+		"missing reference":     {Fields: schemaMap[struct{}]{"dialog": &ref{Ref: "missing"}}},
+		"empty reference":       {Fields: schemaMap[struct{}]{"dialog": &ref{}}},
+		"self reference":        {Definitions: schemaMap[struct{}]{"aDef": &ref{Ref: "aDef"}}},
+		"indirect reference": {Definitions: schemaMap[struct{}]{
 			"aDef": &ref{Ref: "bDef"},
 			"bDef": &xfield.ArrayField[struct{}]{Items: &ref{Ref: "aDef"}},
 		}},
-		"unused invalid definition": {Definitions: map[string]field{
-			"bad": &xfield.ObjectField[struct{}]{Properties: xfield.Schema[struct{}]{"": &xfield.StringField[struct{}]{}}},
+		"unused invalid definition": {Definitions: schemaMap[struct{}]{
+			"bad": &xfield.ObjectField[struct{}]{Properties: schemaMap[struct{}]{"": &xfield.StringField[struct{}]{}}},
 		}},
-		"empty property name": {Fields: xfield.Schema[struct{}]{"": &xfield.StringField[struct{}]{}}},
-		"missing array items": {Fields: xfield.Schema[struct{}]{"items": &xfield.ArrayField[struct{}]{}}},
+		"empty property name": {Fields: schemaMap[struct{}]{"": &xfield.StringField[struct{}]{}}},
+		"missing array items": {Fields: schemaMap[struct{}]{"items": &xfield.ArrayField[struct{}]{}}},
 	}
 	cycle := &xfield.ArrayField[struct{}]{}
 	cycle.Items = cycle
-	tests["pointer cycle"] = xfield.SchemaDocument[struct{}]{Fields: xfield.Schema[struct{}]{"cycle": cycle}}
+	tests["pointer cycle"] = xfield.SchemaDocument[struct{}]{Fields: schemaMap[struct{}]{"cycle": cycle}}
 	var deep field = &xfield.StringField[struct{}]{}
 	for range xfield.MaxSchemaDepth {
 		deep = &xfield.ArrayField[struct{}]{Items: deep}
 	}
-	tests["deep definition"] = xfield.SchemaDocument[struct{}]{Definitions: map[string]field{"deep": deep}}
-	aliases := make(map[string]field)
+	tests["deep definition"] = xfield.SchemaDocument[struct{}]{Definitions: schemaMap[struct{}]{"deep": deep}}
+	aliases := make(schemaMap[struct{}])
 	for i := range xfield.MaxSchemaDepth + 1 {
 		aliases[fmt.Sprintf("%03d", i)] = &ref{Ref: fmt.Sprintf("%03d", i+1)}
 	}
 	aliases[fmt.Sprintf("%03d", xfield.MaxSchemaDepth+1)] = &xfield.StringField[struct{}]{}
 	tests["deep aliases"] = xfield.SchemaDocument[struct{}]{Definitions: aliases}
-	cachedAliases := map[string]field{"000": &xfield.StringField[struct{}]{}}
+	cachedAliases := schemaMap[struct{}]{"000": &xfield.StringField[struct{}]{}}
 	for i := 1; i <= xfield.MaxSchemaDepth; i++ {
 		cachedAliases[fmt.Sprintf("%03d", i)] = &ref{Ref: fmt.Sprintf("%03d", i-1)}
 	}
@@ -208,7 +216,7 @@ func TestCompileDocumentRejectsInvalidDeclarations(t *testing.T) {
 		})
 	}
 	refField := &ref{Ref: "dialog"}
-	if err := xfield.ValidateSchema(xfield.Schema[struct{}]{"refField": refField}); !errors.Is(err, xfield.ErrInvalidSchema) {
+	if err := xfield.ValidateSchema(schemaMap[struct{}]{"refField": refField}); !errors.Is(err, xfield.ErrInvalidSchema) {
 		t.Fatalf("uncompiled schema: %v", err)
 	}
 	if _, err := refField.Parse(struct{}{}, nil); !errors.Is(err, xfield.ErrInvalidSchema) {
@@ -231,32 +239,33 @@ func (f *customReferenceObject) Parse(params *dependencies, value any) (any, err
 }
 func (f *customReferenceObject) CompileField(compile func(xfield.Field[*dependencies]) (xfield.Field[*dependencies], error)) (xfield.Field[*dependencies], error) {
 	copy := *f
-	copy.Properties = make(xfield.Schema[*dependencies], len(f.Properties))
-	for i, child := range f.Properties {
+	properties := make(schemaMap[*dependencies])
+	for key, child := range f.Properties.All() {
 		compiled, err := compile(child)
 		if err != nil {
 			return nil, err
 		}
-		copy.Properties[i] = compiled
+		properties[key] = compiled
 	}
+	copy.Properties = properties
 	return &copy, nil
 }
 
 func TestCustomContainerCompiler(t *testing.T) {
 	container := &customReferenceObject{
 		ObjectField: xfield.ObjectField[*dependencies]{
-			Properties: xfield.Schema[*dependencies]{
+			Properties: schemaMap[*dependencies]{
 				"image": &xfield.RefField[*dependencies]{Ref: "resource"},
 			},
 		},
 		Marker: "preserved",
 	}
 	doc := xfield.SchemaDocument[*dependencies]{
-		Definitions: map[string]xfield.Field[*dependencies]{
+		Definitions: schemaMap[*dependencies]{
 			"resource": &resourceField{},
 			"assetDef": container,
 		},
-		Fields: xfield.Schema[*dependencies]{
+		Fields: schemaMap[*dependencies]{
 			"asset": &xfield.RefField[*dependencies]{Ref: "assetDef"},
 		},
 	}
@@ -273,7 +282,8 @@ func TestCustomContainerCompiler(t *testing.T) {
 	if err != nil || mapped["asset"].(map[string]any)["marker"] != "preserved" || deps.calls != 1 {
 		t.Fatalf("custom container behavior: %v, %v, calls=%d", mapped, err, deps.calls)
 	}
-	if _, ok := container.Properties["image"].(*xfield.RefField[*dependencies]); !ok {
+	image, _ := container.Properties.Get("image")
+	if _, ok := image.(*xfield.RefField[*dependencies]); !ok {
 		t.Fatal("custom source container was mutated")
 	}
 }

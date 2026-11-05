@@ -2,6 +2,8 @@
 // Declaration serialization is the caller's responsibility.
 package xfield
 
+import "iter"
+
 // Field is implemented by built-in and application-defined fields.
 // Type identifies the field kind, independent of the Go type name.
 // Parse must not modify its input. A nil value represents clearing a field.
@@ -10,9 +12,14 @@ type Field[P any] interface {
 	Parse(params P, data any) (any, error)
 }
 
-// Schema maps object property names to field declarations.
-// Presentation order belongs to the caller's UI configuration.
-type Schema[P any] map[string]Field[P]
+// Schema is a read-only collection of named field declarations.
+// All must yield each name exactly once, with the same field returned by Get.
+// The implementation owns iteration order and serialization. Declarations must
+// remain unchanged while in use. A nil Schema is treated as an empty collection.
+type Schema[P any] interface {
+	Get(key string) (Field[P], bool)
+	All() iter.Seq2[string, Field[P]]
+}
 
 // MaxSchemaDepth bounds schema validation, compilation and traversal.
 const MaxSchemaDepth = 64

@@ -9,17 +9,18 @@ xfield 用字段接口描述结构化数据，提供声明校验、数据清洗�
 ## 快速使用
 
 ```go
-schema := xfield.Schema[struct{}]{
-	"name": &xfield.StringField[struct{}]{
-		Meta: xfield.Meta{Required: true},
-	},
-	"tags": &xfield.ArrayField[struct{}]{
-		Items: &xfield.StringField[struct{}]{},
-	},
-}
+// orderedmap 由调用方引入，xfield 核心不依赖它。
+// import "github.com/k0923/go/orderedmap"
+var schema orderedmap.Map[xfield.Field[struct{}]]
+schema.Set("name", &xfield.StringField[struct{}]{
+	Meta: xfield.Meta{Required: true},
+})
+schema.Set("tags", &xfield.ArrayField[struct{}]{
+	Items: &xfield.StringField[struct{}]{},
+})
 clean, err := xfield.ValidateModel(map[string]any{
 	"name": "张三", "tags": []any{"Go"}, "extra": true,
-}, schema, struct{}{})
+}, &schema, struct{}{})
 // clean 只包含 name、tags。
 ```
 
@@ -33,12 +34,25 @@ type Field[P any] interface {
 	Parse(params P, data any) (any, error)
 }
 
-type Schema[P any] map[string]Field[P]
+type Schema[P any] interface {
+	Get(key string) (Field[P], bool)
+	All() iter.Seq2[string, Field[P]]
+}
 ```
 
-`Schema[P]` 将字段名映射到声明，直接放入具体字段，无需 Wrap 或 FieldRef。字段名由 map 的 key 提供，Meta 不重复保存 Key。`ObjectField.Properties` 是 Schema，`ArrayField.Items` 是 Field。路径查找直接按 key 访问；校验、解析和展示按字段名排序，保持执行顺序与首个错误稳定。
+`Schema[P]` 是只读字段集合，容器实现负责查找、遍历顺序和序列化。`All` 必须每个名称只返回一次，且与 `Get` 返回同一字段；声明在使用期间保持不变。nil 接口及包含 nil 指针、map 或 slice 的接口视为空集合。
 
-前端 definitions、fields、properties 可以保持数组，用于交互排序。应用层转换为运行时 map，转换时检查重复名称；编辑和保存保留原始数组。完整转换过程见 xjson 示例。
+字段名由集合提供，Meta 不重复保存 Key。`ObjectField.Properties`、`SchemaDocument.Fields`、`SchemaDocument.Definitions` 都使用 Schema，`ArrayField.Items` 使用 Field。路径查找通过 `Get`；校验、解析和展示按照 `All` 的顺序执行。需要稳定执行顺序和首个错误时，由适配器提供稳定顺序。
+
+| 调用方容器 | 接入方式 | 编解码 |
+| --- | --- | --- |
+| `*orderedmap.Map[Field[P]]` | 直接实现接口 | 有序 JSON 对象，字段多态解码仍需应用处理 |
+| 原生 map 的命名类型 | 实现 `Get`、`All`，可自行排序 | 普通 JSON 对象 |
+| 字段数组 | 按名称查找、按数组顺序遍历 | 保留应用自定义 JSON 数组 |
+
+普通 map 的适配见 [示例适配器](examples/internal/schema/map.go)。[xjson 示例](examples/xjson/README.md)使用数组 DTO，并转换成应用自有的数组 Schema，转换和编译均保留顺序。[多种容器示例](examples/containers/main.go)展示普通 map、orderedmap、数组使用同一套 xfield API。
+
+接口不要求 `Set`、`Delete`、`Len` 或 JSON 方法。xfield 不会自动将 JSON 解码为 Schema 接口，也不会替应用决定 `Field` 的具体类型。
 
 | 类型 | 支持的规则 |
 | --- | --- |
@@ -51,42 +65,34 @@ type Schema[P any] map[string]Field[P]
 
 `Meta` 包含 ID、Label、Required。Required 表示键必须存在；内置字段允许显式 nil 清空。NumberField 不限制整数，时间先后和角色 ID 等跨字段业务规则由应用处理。
 
-`ValidateSchema` / `ValidateField` 检查空属性名、空 items、非法规则和嵌套深度。数组输入中的重复名称由转换层检查，map 自身只保存每个名称的一条声明。`ValidateModel` 检查完整模型，`ValidatePartial` 只跳过顶层 required；提供的嵌套对象仍须满足自身 required。两者过滤未声明字段，返回新容器。
+`ValidateSchema` / `ValidateField` 检查空属性名、重复属性名、空 items、非法规则和嵌套深度。数组转换层也应检查重复名称，避免在构建索引时静默覆盖。`ValidateModel` 检查完整模型，`ValidatePartial` 只跳过顶层 required；提供的嵌套对象仍须满足自身 required。两者过滤未声明字段，返回新的普通 `map[string]any`。声明容器的选择不改变业务数据容器。
 
 数字比较避免将大整数转为 float64。StringField 的 Config.EnumOptions 是展示元数据，数据约束使用 Enum。
 
 ## 公共定义与引用
 
 ```go
-doc := xfield.SchemaDocument[struct{}]{
-	Definitions: map[string]xfield.Field[struct{}]{
-		"dialog": &xfield.ObjectField[struct{}]{
-			Properties: xfield.Schema[struct{}]{
-				"content": &xfield.StringField[struct{}]{
-					Meta: xfield.Meta{Required: true},
-				},
-			},
-		},
-	},
-	Fields: xfield.Schema[struct{}]{
-		"dialog": &xfield.RefField[struct{}]{
-			Meta: xfield.Meta{Required: true},
-			Ref: "dialog",
-		},
-		"mappedDialogs": &xfield.ArrayField[struct{}]{
-			Items: &xfield.RefField[struct{}]{Ref: "dialog"},
-		},
-	},
-}
+var properties, definitions, fields orderedmap.Map[xfield.Field[struct{}]]
+properties.Set("content", &xfield.StringField[struct{}]{
+	Meta: xfield.Meta{Required: true},
+})
+definitions.Set("dialog", &xfield.ObjectField[struct{}]{Properties: &properties})
+fields.Set("dialog", &xfield.RefField[struct{}]{
+	Meta: xfield.Meta{Required: true}, Ref: "dialog",
+})
+fields.Set("mappedDialogs", &xfield.ArrayField[struct{}]{
+	Items: &xfield.RefField[struct{}]{Ref: "dialog"},
+})
+doc := xfield.SchemaDocument[struct{}]{Definitions: &definitions, Fields: &fields}
 schema, err := xfield.CompileDocument(doc)
 // 检查 err 后，将 schema 交给 ValidateModel / PresentModel / ApplyMappings。
 ```
 
 公共定义的名称是普通字符串，例如 `dialog`，要求非空且不包含空白。定义可为对象、数组、叶子字段或其他定义的引用。引用位置的 Meta 决定该位置的 Label、Required 等，不覆盖公共定义；使用位置的字段名由 Schema 的 key 决定。
 
-CompileDocument 检查所有定义，包括未使用的定义；拒绝缺失引用、循环引用和过深结构。它返回可直接使用的 Schema，保留被引用字段的类型、Parse、Present 及容器遍历行为。未编译的引用不能用于校验。
+CompileDocument 检查所有定义，包括未使用的定义；拒绝重复定义名、缺失引用、循环引用和过深结构。它返回可直接使用的只读 Schema，保留输入字段的遍历顺序、被引用字段的类型、Parse、Present 及容器遍历行为。未编译的引用不能用于校验。
 
-保留原始 SchemaDocument 用于编辑和保存，使用编译结果处理数据。编译不修改原始声明，但可能共享不可变的叶子字段和公共定义；声明使用期间应保持不变。
+原始声明及其应用 DTO 用于编辑和保存，编译结果用于计算，不提供持久化格式。编译结果由 xfield 私有的有序字段切片和查找索引承载，不依赖原始容器的写入 API。编译不修改原始声明，但可能共享不可变的叶子字段和公共定义；声明使用期间应保持不变。
 
 ## Parse、Present 与自定义字段
 
@@ -154,4 +160,4 @@ type ValueResolver interface {
 
 旧版 `Wrap` / `FieldRef` 改为直接使用 Field；`.Value()` 改为直接访问字段。Registry、Factory、Decoder、FieldDecoder、字段 JSON 编解码及基于 JSON 的 FieldEqual 已移除，声明编解码交给应用层。
 
-旧的 Schema 切片改为 `map[string]Field[P]`；将 `Meta.Key` 移至 map key，按位置的访问改为按字段名访问。Meta.Key 和 KeyOf 已移除。前端字段数组的 key 保留在应用 DTO 中。
+`Schema[P]` 是接口，不能再使用 `Schema[P]{...}`、`make(Schema[P])` 或下标访问。调用方构建自己的 map、有序 map 或数组适配器，读取用 `Get`，遍历用 `All`。`Meta.Key` 和 KeyOf 已移除；数组 DTO 可以自行携带字段名。

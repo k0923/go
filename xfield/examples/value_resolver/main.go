@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/k0923/go/xfield"
+	"github.com/k0923/go/xfield/examples/internal/schema"
 )
 
 const MappingTypePointer xfield.MappingType = "json_pointer"
@@ -68,7 +69,7 @@ func main() {
 }
 
 func run() error {
-	schema := xfield.Schema[struct{}]{
+	schema := schema.Map[struct{}]{
 		"name":     &xfield.StringField[struct{}]{Meta: xfield.Meta{Required: true}},
 		"nickname": &xfield.StringField[struct{}]{},
 		"missing":  &xfield.StringField[struct{}]{},

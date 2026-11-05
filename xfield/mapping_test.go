@@ -10,12 +10,12 @@ import (
 )
 
 func TestMappingsNestedParseOnce(t *testing.T) {
-	schema := xfield.Schema[*dependencies]{
+	schema := schemaMap[*dependencies]{
 		"teams": &xfield.ArrayField[*dependencies]{
-			Items: &xfield.ObjectField[*dependencies]{Properties: xfield.Schema[*dependencies]{
+			Items: &xfield.ObjectField[*dependencies]{Properties: schemaMap[*dependencies]{
 				"name": &xfield.StringField[*dependencies]{Meta: xfield.Meta{Required: true}},
 				"images": &xfield.ArrayField[*dependencies]{
-					Items: &xfield.ObjectField[*dependencies]{Properties: xfield.Schema[*dependencies]{
+					Items: &xfield.ObjectField[*dependencies]{Properties: schemaMap[*dependencies]{
 						"url": &resourceField{Meta: xfield.Meta{Required: true}},
 					}},
 				},
@@ -48,7 +48,7 @@ func TestMappingsNestedParseOnce(t *testing.T) {
 }
 
 func TestMappingsMissingNullResolverAndRawJSON(t *testing.T) {
-	schema := xfield.Schema[struct{}]{
+	schema := schemaMap[struct{}]{
 		"name": &xfield.StringField[struct{}]{Meta: xfield.Meta{Required: true}},
 		"id":   &xfield.NumberField[struct{}]{},
 	}
@@ -91,9 +91,9 @@ func TestMappingsMissingNullResolverAndRawJSON(t *testing.T) {
 }
 
 func TestMappingsDoNotMutateInput(t *testing.T) {
-	schema := xfield.Schema[struct{}]{
+	schema := schemaMap[struct{}]{
 		"profile": &xfield.ObjectField[struct{}]{
-			Properties: xfield.Schema[struct{}]{
+			Properties: schemaMap[struct{}]{
 				"name": &xfield.StringField[struct{}]{},
 			},
 		}}
@@ -110,9 +110,9 @@ func TestMappingsDoNotMutateInput(t *testing.T) {
 }
 
 func TestPathsAndSourceValidation(t *testing.T) {
-	schema := xfield.Schema[struct{}]{
+	schema := schemaMap[struct{}]{
 		"items": &xfield.ArrayField[struct{}]{
-			Items: &xfield.ObjectField[struct{}]{Properties: xfield.Schema[struct{}]{
+			Items: &xfield.ObjectField[struct{}]{Properties: schemaMap[struct{}]{
 				"name": &xfield.StringField[struct{}]{},
 			}},
 		}}
@@ -159,9 +159,9 @@ type customObject struct {
 func (*customObject) Type() string { return "custom_object" }
 
 func TestExternalContainer(t *testing.T) {
-	schema := xfield.Schema[*dependencies]{
+	schema := schemaMap[*dependencies]{
 		"asset": &customObject{ObjectField: xfield.ObjectField[*dependencies]{
-			Properties: xfield.Schema[*dependencies]{
+			Properties: schemaMap[*dependencies]{
 				"image": &resourceField{},
 			},
 		}},

@@ -136,8 +136,10 @@ func findFieldInField[P any](field Field[P], parts []string, depth int) (Field[P
 		return field, nil
 	}
 	if object, ok := field.(ObjectProvider[P]); ok {
-		if child, exists := object.ObjectFields()[parts[0]]; exists {
-			return findFieldInField(child, parts[1:], depth+1)
+		if children := object.ObjectFields(); !isNil(children) {
+			if child, exists := children.Get(parts[0]); exists {
+				return findFieldInField(child, parts[1:], depth+1)
+			}
 		}
 		return nil, fmt.Errorf("field %q not found", parts[0])
 	}

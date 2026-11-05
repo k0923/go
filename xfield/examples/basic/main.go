@@ -6,6 +6,7 @@ import (
 	"fmt"
 
 	"github.com/k0923/go/xfield"
+	"github.com/k0923/go/xfield/examples/internal/schema"
 )
 
 func main() {
@@ -16,7 +17,7 @@ func main() {
 
 func run() error {
 	minLength, minAge, maxAge := 1, 0.0, 150.0
-	schema := xfield.Schema[struct{}]{
+	schema := schema.Map[struct{}]{
 		"name": &xfield.StringField[struct{}]{
 			Meta: xfield.Meta{Required: true}, MinLength: &minLength,
 		},

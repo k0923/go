@@ -59,10 +59,10 @@ type dependencies struct {
 }
 
 func TestExternalFieldNested(t *testing.T) {
-	schema := xfield.Schema[*dependencies]{
+	schema := schemaMap[*dependencies]{
 		"assets": &xfield.ArrayField[*dependencies]{
 			Items: &xfield.ObjectField[*dependencies]{
-				Properties: xfield.Schema[*dependencies]{
+				Properties: schemaMap[*dependencies]{
 					"image": &resourceField{Meta: xfield.Meta{Required: true}},
 				},
 			},
@@ -102,7 +102,7 @@ func TestExternalFieldNested(t *testing.T) {
 func TestBuiltinsRules(t *testing.T) {
 	minLength, maxLength, pattern := 2, 4, "^[一二三]+$"
 	min, max := 0.0, 100.0
-	schema := xfield.Schema[struct{}]{
+	schema := schemaMap[struct{}]{
 		"name": &xfield.StringField[struct{}]{
 			MinLength: &minLength, MaxLength: &maxLength,
 			Pattern: &pattern, Enum: []string{"一二"},
@@ -125,7 +125,7 @@ func TestBuiltinsRules(t *testing.T) {
 }
 
 func TestRequiredPartialAndSchemaErrors(t *testing.T) {
-	schema := xfield.Schema[struct{}]{"name": &xfield.StringField[struct{}]{Meta: xfield.Meta{Required: true}}}
+	schema := schemaMap[struct{}]{"name": &xfield.StringField[struct{}]{Meta: xfield.Meta{Required: true}}}
 	if _, err := xfield.ValidateModel(map[string]any{}, schema, struct{}{}); !errors.Is(err, xfield.ErrInvalidValue) {
 		t.Fatal(err)
 	}
@@ -137,7 +137,7 @@ func TestRequiredPartialAndSchemaErrors(t *testing.T) {
 	}
 	minusOne, min, max := -1, 5, 2
 	badPattern := "["
-	cases := []xfield.Schema[struct{}]{
+	cases := []schemaMap[struct{}]{
 		{"": &xfield.StringField[struct{}]{}},
 		{"a": &xfield.ArrayField[struct{}]{}},
 		{"s": &xfield.StringField[struct{}]{MinLength: &minusOne}},
@@ -160,9 +160,9 @@ func TestRequiredPartialAndSchemaErrors(t *testing.T) {
 func TestNestedPathPreservesExternalError(t *testing.T) {
 	sentinel := errors.New("upload unavailable")
 	deps := &dependencies{ctx: context.Background(), err: sentinel}
-	schema := xfield.Schema[*dependencies]{
+	schema := schemaMap[*dependencies]{
 		"assets": &xfield.ArrayField[*dependencies]{
-			Items: &xfield.ObjectField[*dependencies]{Properties: xfield.Schema[*dependencies]{
+			Items: &xfield.ObjectField[*dependencies]{Properties: schemaMap[*dependencies]{
 				"image": &resourceField{},
 			}},
 		}}
@@ -204,7 +204,7 @@ func TestSchemaDepthLimit(t *testing.T) {
 func TestNamedContainers(t *testing.T) {
 	type namedMap map[string]any
 	type namedSlice []any
-	field := &xfield.ObjectField[struct{}]{Properties: xfield.Schema[struct{}]{
+	field := &xfield.ObjectField[struct{}]{Properties: schemaMap[struct{}]{
 		"items": &xfield.ArrayField[struct{}]{Items: &xfield.NumberField[struct{}]{}},
 	}}
 	got, err := field.Parse(struct{}{}, namedMap{"items": namedSlice{int8(1), uint16(2)}, "extra": true})

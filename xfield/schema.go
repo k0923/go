@@ -2,7 +2,7 @@ package xfield
 
 import (
 	"fmt"
-	"sort"
+	"iter"
 )
 
 // ValidateSchema checks keys, nested items and rule configuration.
@@ -15,11 +15,15 @@ func validateSchema[P any](schema Schema[P], depth int) error {
 	if depth >= MaxSchemaDepth {
 		return invalidSchema("maximum schema depth exceeded")
 	}
-	for _, key := range schemaKeys(schema) {
-		field := schema[key]
+	seen := make(map[string]bool)
+	for key, field := range schemaAll(schema) {
 		if key == "" {
 			return invalidSchema("property name is empty")
 		}
+		if seen[key] {
+			return wrapPathError(key, invalidSchema("duplicate property name"))
+		}
+		seen[key] = true
 		if err := validateField(field, depth); err != nil {
 			return wrapPathError(key, err)
 		}
@@ -83,9 +87,8 @@ func parseModel[P any](data map[string]any, model Schema[P], partial bool, param
 
 func parseProperties[P any](data map[string]any, model Schema[P], partial bool, params P) (map[string]any, error) {
 	result := make(map[string]any, len(data))
-	// Property-name order makes parsing and the first error deterministic.
-	for _, key := range schemaKeys(model) {
-		field := model[key]
+	// The caller's schema determines parsing order and the first error.
+	for key, field := range schemaAll(model) {
 		value, exists := data[key]
 		if !exists {
 			if !partial && RequiredOf(field) {
@@ -102,11 +105,10 @@ func parseProperties[P any](data map[string]any, model Schema[P], partial bool, 
 	return result, nil
 }
 
-func schemaKeys[P any](schema Schema[P]) []string {
-	keys := make([]string, 0, len(schema))
-	for key := range schema {
-		keys = append(keys, key)
+func schemaAll[P any](schema Schema[P]) iter.Seq2[string, Field[P]] {
+	return func(yield func(string, Field[P]) bool) {
+		if !isNil(schema) {
+			schema.All()(yield)
+		}
 	}
-	sort.Strings(keys)
-	return keys
 }

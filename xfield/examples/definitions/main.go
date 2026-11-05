@@ -5,6 +5,7 @@ import (
 	"fmt"
 
 	"github.com/k0923/go/xfield"
+	"github.com/k0923/go/xfield/examples/internal/schema"
 )
 
 type Params = struct{}
@@ -18,9 +19,9 @@ func main() {
 func run() error {
 	// 前端配置经过应用层反序列化后，得到这样的声明。
 	doc := xfield.SchemaDocument[Params]{
-		Definitions: map[string]xfield.Field[Params]{
+		Definitions: schema.Map[Params]{
 			"dialog": &xfield.ObjectField[Params]{
-				Properties: xfield.Schema[Params]{
+				Properties: schema.Map[Params]{
 					"speaker": &xfield.StringField[Params]{Meta: xfield.Meta{Required: true}},
 					"start":   &xfield.NumberField[Params]{Meta: xfield.Meta{Required: true}},
 					"end":     &xfield.NumberField[Params]{Meta: xfield.Meta{Required: true}},
@@ -28,7 +29,7 @@ func run() error {
 				},
 			},
 		},
-		Fields: xfield.Schema[Params]{
+		Fields: schema.Map[Params]{
 			"start": &xfield.NumberField[Params]{Meta: xfield.Meta{Required: true}},
 			"end":   &xfield.NumberField[Params]{Meta: xfield.Meta{Required: true}},
 			"tags": &xfield.ArrayField[Params]{

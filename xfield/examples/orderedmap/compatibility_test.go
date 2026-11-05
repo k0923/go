@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"iter"
 	"reflect"
 	"strings"
 	"sync"
@@ -182,16 +183,16 @@ func TestConcurrentReadOnly(t *testing.T) {
 func TestXFieldRuntimeMapCompatibility(t *testing.T) {
 	m := orderedmap.New[string, any]()
 	m.Set("content", "你好")
+	properties := newSchema()
+	properties.Set("content", &xfield.StringField[Params]{Meta: xfield.Meta{Required: true}})
 	field := &xfield.ObjectField[Params]{
-		Properties: xfield.Schema[Params]{
-			"content": &xfield.StringField[Params]{Meta: xfield.Meta{Required: true}},
-		},
+		Properties: properties,
 	}
 	if _, err := field.Parse(Params{}, m); err == nil {
 		t.Fatal("ordered map unexpectedly accepted by xfield's native-map parser")
 	}
 	// OrderedMap is a struct containing a map and list, not a native Go map.
-	// Explicit conversion preserves values; xfield sorts schema property names.
+	// Explicit conversion preserves data values; schema order is adapter-owned.
 	native := make(map[string]any, m.Len())
 	for pair := m.Oldest(); pair != nil; pair = pair.Next() {
 		native[pair.Key] = pair.Value
@@ -203,6 +204,26 @@ func TestXFieldRuntimeMapCompatibility(t *testing.T) {
 
 // Each evaluation application owns its own xjson binding.
 type Params struct{}
+
+type schemaAdapter struct {
+	*orderedmap.OrderedMap[string, xfield.Field[Params]]
+}
+
+var _ xfield.Schema[Params] = (*schemaAdapter)(nil)
+
+func newSchema() *schemaAdapter {
+	return &schemaAdapter{orderedmap.New[string, xfield.Field[Params]]()}
+}
+
+func (s *schemaAdapter) All() iter.Seq2[string, xfield.Field[Params]] {
+	return func(yield func(string, xfield.Field[Params]) bool) {
+		for pair := s.Oldest(); pair != nil; pair = pair.Next() {
+			if !yield(pair.Key, pair.Value) {
+				return
+			}
+		}
+	}
+}
 
 type FieldJSON = xjson.G[xfield.Field[Params]]
 
@@ -250,11 +271,12 @@ func init() {
 	}, xjson.WithFlatLayout(), xjson.WithInitializer(func(field xfield.Field[Params]) xfield.Field[Params] {
 		switch field := field.(type) {
 		case *ObjectJSON:
-			field.ObjectField.Properties = make(xfield.Schema[Params], len(field.Properties))
+			properties := newSchema()
 			for _, child := range field.Properties {
 				key := child.Value().(interface{ FieldKey() string }).FieldKey()
-				field.ObjectField.Properties[key] = child.Value()
+				properties.Set(key, child.Value())
 			}
+			field.ObjectField.Properties = properties
 		case *ArrayJSON:
 			field.ArrayField.Items = field.Items.Value()
 		case *RefJSON:
@@ -266,14 +288,15 @@ func init() {
 
 func (f *ObjectJSON) CompileField(compile func(xfield.Field[Params]) (xfield.Field[Params], error)) (xfield.Field[Params], error) {
 	result := f.ObjectField
-	result.Properties = make(xfield.Schema[Params], len(f.ObjectField.Properties))
-	for i, child := range f.ObjectField.Properties {
+	properties := newSchema()
+	for key, child := range f.ObjectField.Properties.All() {
 		field, err := compile(child)
 		if err != nil {
 			return nil, err
 		}
-		result.Properties[i] = field
+		properties.Set(key, field)
 	}
+	result.Properties = properties
 	return &result, nil
 }
 
@@ -314,17 +337,15 @@ func TestXJSONAndXField(t *testing.T) {
 	if !reflect.DeepEqual(keys(&wire.Definitions), []string{"zDef", "dialog", "aDef"}) {
 		t.Fatal("xjson values changed definition order")
 	}
-	doc := xfield.SchemaDocument[Params]{
-		Definitions: make(map[string]xfield.Field[Params]),
-		Fields:      make(xfield.Schema[Params]),
-	}
+	definitions, fields := newSchema(), newSchema()
 	for pair := wire.Definitions.Oldest(); pair != nil; pair = pair.Next() {
-		doc.Definitions[pair.Key] = pair.Value.Value()
+		definitions.Set(pair.Key, pair.Value.Value())
 	}
 	for _, field := range wire.Fields {
 		key := field.Value().(interface{ FieldKey() string }).FieldKey()
-		doc.Fields[key] = field.Value()
+		fields.Set(key, field.Value())
 	}
+	doc := xfield.SchemaDocument[Params]{Definitions: definitions, Fields: fields}
 	schema, err := xfield.CompileDocument(doc)
 	if err != nil {
 		t.Fatal(err)
