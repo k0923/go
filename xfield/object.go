@@ -26,7 +26,17 @@ func (f *ObjectField[P]) Parse(params P, data any) (any, error) {
 	if !ok {
 		return nil, invalidValue("expect object")
 	}
+	if schemaIsEmpty(f.Properties) {
+		return cloneMappingValue(object, 0)
+	}
 	return parseProperties(object, f.Properties, false, params)
+}
+
+func schemaIsEmpty[P any](schema Schema[P]) bool {
+	for range schemaAll(schema) {
+		return false
+	}
+	return true
 }
 
 func (f *ObjectField[P]) Present(params P, data any) any {

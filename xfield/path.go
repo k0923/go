@@ -6,8 +6,7 @@ import (
 	"strings"
 )
 
-// GetData returns nil for a missing path. Use a ValueResolver when missing
-// values must be distinguished from explicit null.
+// GetData returns nil for a missing path or an explicitly stored nil value.
 func GetData(data any, path []string) any {
 	value, _ := lookupData(data, path)
 	return value

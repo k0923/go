@@ -154,8 +154,8 @@ func TestReferencesPreserveCustomParsePresentAndMappings(t *testing.T) {
 	}
 	mapped, err := xfield.ApplyMappings(
 		map[string]any{"source": []any{"c"}},
-		[]xfield.Mapping{{From: "source", To: "images"}},
-		schema, deps, xfield.MappingOptions{},
+		[]xfield.Mapping{xfield.PathMapping([]string{"source"}, []string{"images"})},
+		schema, deps,
 	)
 	if err != nil || mapped["images"].([]any)[0] != "stored:c" || deps.calls != 3 {
 		t.Fatalf("custom mapping: %v, %v, calls=%d", mapped, err, deps.calls)
@@ -276,8 +276,10 @@ func TestCustomContainerCompiler(t *testing.T) {
 	deps := &dependencies{ctx: context.Background()}
 	mapped, err := xfield.ApplyMappings(
 		map[string]any{"source": map[string]any{"url": "a"}},
-		[]xfield.Mapping{{From: "source", To: "asset", Children: []xfield.Mapping{{From: "url", To: "image"}}}},
-		schema, deps, xfield.MappingOptions{},
+		[]xfield.Mapping{xfield.PathMapping([]string{"source"}, []string{"asset"},
+			xfield.PathMapping([]string{"url"}, []string{"image"}),
+		)},
+		schema, deps,
 	)
 	if err != nil || mapped["asset"].(map[string]any)["marker"] != "preserved" || deps.calls != 1 {
 		t.Fatalf("custom container behavior: %v, %v, calls=%d", mapped, err, deps.calls)

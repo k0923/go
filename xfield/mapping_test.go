@@ -9,6 +9,17 @@ import (
 	"github.com/k0923/go/xfield"
 )
 
+type customMapping struct {
+	target  []string
+	resolve func(any) (any, error)
+}
+
+func (m customMapping) Target() []string               { return m.target }
+func (m customMapping) Resolve(input any) (any, error) { return m.resolve(input) }
+func (customMapping) Children() []xfield.Mapping       { return nil }
+
+var _ xfield.Mapping = customMapping{}
+
 func TestMappingsNestedParseOnce(t *testing.T) {
 	schema := schemaMap[*dependencies]{
 		"teams": &xfield.ArrayField[*dependencies]{
@@ -22,20 +33,20 @@ func TestMappingsNestedParseOnce(t *testing.T) {
 			}},
 		},
 	}
-	mappings := []xfield.Mapping{{
-		From: "groups", To: "teams", Children: []xfield.Mapping{
-			{From: "title", To: "name"},
-			{From: "assets", To: "images", Children: []xfield.Mapping{
-				{From: "link", To: "url"},
-			}},
-		},
-	}}
+	mappings := []xfield.Mapping{
+		xfield.PathMapping([]string{"groups"}, []string{"teams"},
+			xfield.PathMapping([]string{"title"}, []string{"name"}),
+			xfield.PathMapping([]string{"assets"}, []string{"images"},
+				xfield.PathMapping([]string{"link"}, []string{"url"}),
+			),
+		),
+	}
 	input := map[string]any{"groups": []any{
 		map[string]any{"title": "A", "assets": []any{map[string]any{"link": "a"}}},
 		map[string]any{"title": "B", "assets": []any{map[string]any{"link": "b"}}},
 	}}
 	deps := &dependencies{ctx: context.Background()}
-	out, err := xfield.ApplyMappings(input, mappings, schema, deps, xfield.MappingOptions{})
+	out, err := xfield.ApplyMappings(input, mappings, schema, deps)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -47,44 +58,38 @@ func TestMappingsNestedParseOnce(t *testing.T) {
 	}
 }
 
-func TestMappingsMissingNullResolverAndRawJSON(t *testing.T) {
+func TestMappingsNullCustomResolverAndRawJSON(t *testing.T) {
 	schema := schemaMap[struct{}]{
 		"name": &xfield.StringField[struct{}]{Meta: xfield.Meta{Required: true}},
 		"id":   &xfield.NumberField[struct{}]{},
 	}
-	mappings := []xfield.Mapping{{From: "name", To: "name"}, {From: "id", To: "id"}}
-	out, err := xfield.ApplyMappings(`{"name":null,"id":9007199254740993}`, mappings, schema, struct{}{}, xfield.MappingOptions{})
+	mappings := []xfield.Mapping{
+		xfield.PathMapping([]string{"name"}, []string{"name"}),
+		xfield.PathMapping([]string{"id"}, []string{"id"}),
+	}
+	out, err := xfield.ApplyMappings(`{"name":null,"id":9007199254740993}`, mappings, schema, struct{}{})
 	if err != nil || out["name"] != nil || out["id"] != json.Number("9007199254740993") {
 		t.Fatalf("null/number: %v, %v", out, err)
 	}
-	out, err = xfield.ApplyMappings(map[string]any{}, mappings, schema, struct{}{}, xfield.MappingOptions{})
-	if err != nil || len(out) != 0 {
-		t.Fatalf("missing skip: %v, %v", out, err)
+	out, err = xfield.ApplyMappings(map[string]any{}, mappings, schema, struct{}{})
+	if err != nil || len(out) != 2 || out["name"] != nil || out["id"] != nil {
+		t.Fatalf("missing path should resolve to nil: %v, %v", out, err)
 	}
-	if _, err := xfield.ApplyMappings(map[string]any{}, mappings, schema, struct{}{},
-		xfield.MappingOptions{MissingPolicy: xfield.MissingError}); err == nil {
-		t.Fatal("missing error policy ignored")
-	}
-	if _, err := xfield.ApplyMappings(nil, nil, schema, struct{}{},
-		xfield.MappingOptions{MissingPolicy: "invalid"}); err == nil {
-		t.Fatal("invalid missing policy accepted")
-	}
-	mappings = []xfield.Mapping{{Type: xfield.MappingTypeGJSON, From: `items.#(active==true).name`, To: "name"}}
-	if _, err := xfield.ApplyMappings(map[string]any{}, mappings, schema, struct{}{}, xfield.MappingOptions{}); err == nil {
-		t.Fatal("GJSON expression accepted without resolver")
-	}
-	resolver := xfield.ValueResolverFunc(func(_ any, kind xfield.MappingType, path string) (any, bool, error) {
-		if kind != xfield.MappingTypeGJSON || path != mappings[0].From {
-			t.Fatal("resolver did not receive the original expression")
-		}
-		return "resolved", true, nil
-	})
-	out, err = xfield.ApplyMappings(map[string]any{}, mappings, schema, struct{}{}, xfield.MappingOptions{Resolver: resolver})
+	mappings = []xfield.Mapping{xfield.MappingFunc(
+		[]string{"name"},
+		func(input any) (any, error) {
+			if input == nil {
+				t.Fatal("resolver did not receive normalized input")
+			}
+			return "resolved", nil
+		},
+	)}
+	out, err = xfield.ApplyMappings(map[string]any{}, mappings, schema, struct{}{})
 	if err != nil || out["name"] != "resolved" {
-		t.Fatalf("external resolver: %v, %v", out, err)
+		t.Fatalf("custom resolver: %v, %v", out, err)
 	}
 	for _, raw := range []string{`{`, `{} {}`} {
-		if _, err := xfield.ApplyMappings(raw, mappings, schema, struct{}{}, xfield.MappingOptions{Resolver: resolver}); err == nil {
+		if _, err := xfield.ApplyMappings(raw, mappings, schema, struct{}{}); err == nil {
 			t.Fatalf("invalid JSON accepted: %s", raw)
 		}
 	}
@@ -98,8 +103,11 @@ func TestMappingsDoNotMutateInput(t *testing.T) {
 			},
 		}}
 	input := map[string]any{"profile": map[string]any{"name": "old"}, "replacement": "new"}
-	mappings := []xfield.Mapping{{From: "profile", To: "profile"}, {From: "replacement", To: "profile.name"}}
-	out, err := xfield.ApplyMappings(input, mappings, schema, struct{}{}, xfield.MappingOptions{})
+	mappings := []xfield.Mapping{
+		xfield.PathMapping([]string{"profile"}, []string{"profile"}),
+		xfield.PathMapping([]string{"replacement"}, []string{"profile", "name"}),
+	}
+	out, err := xfield.ApplyMappings(input, mappings, schema, struct{}{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -109,22 +117,98 @@ func TestMappingsDoNotMutateInput(t *testing.T) {
 	}
 }
 
-func TestPathsAndSourceValidation(t *testing.T) {
+func TestMappingInterfaceAndPathSegments(t *testing.T) {
+	schema := schemaMap[struct{}]{
+		"a.b":  &xfield.StringField[struct{}]{},
+		"name": &xfield.StringField[struct{}]{},
+	}
+	sourcePath := []string{"source"}
+	targetPath := []string{"name"}
+	pathMapping := xfield.PathMapping(sourcePath, targetPath)
+	sourcePath[0] = "other"
+	targetPath[0] = "other"
+	returnedTarget := pathMapping.Target()
+	returnedTarget[0] = "other"
+
+	mappings := []xfield.Mapping{
+		customMapping{
+			target: []string{"a.b"},
+			resolve: func(any) (any, error) {
+				return "literal segment", nil
+			},
+		},
+		pathMapping,
+	}
+	out, err := xfield.ApplyMappings(
+		map[string]any{"source": "cloned paths"},
+		mappings,
+		schema,
+		struct{}{},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out["a.b"] != "literal segment" || out["name"] != "cloned paths" {
+		t.Fatalf("mapping interface/path segments: %v", out)
+	}
+}
+
+func TestMappingsOpenObjectAcceptsFullValue(t *testing.T) {
+	schema := schemaMap[struct{}]{
+		"profile": &xfield.ObjectField[struct{}]{},
+	}
+	input := map[string]any{"source": map[string]any{
+		"name": "Alice",
+		"meta": map[string]any{"role": "admin"},
+		"tags": []any{"owner"},
+	}}
+	out, err := xfield.ApplyMappings(input,
+		[]xfield.Mapping{xfield.PathMapping([]string{"source"}, []string{"profile"})},
+		schema, struct{}{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]any{"profile": map[string]any{
+		"name": "Alice",
+		"meta": map[string]any{"role": "admin"},
+		"tags": []any{"owner"},
+	}}
+	if !reflect.DeepEqual(out, want) {
+		t.Fatalf("open object mapping: %v", out)
+	}
+	out["profile"].(map[string]any)["meta"].(map[string]any)["role"] = "changed"
+	if xfield.GetData(input, []string{"source", "meta", "role"}) != "admin" {
+		t.Fatalf("output aliases input: input=%v output=%v", input, out)
+	}
+}
+
+func TestPathsAndMappingValidation(t *testing.T) {
 	schema := schemaMap[struct{}]{
 		"items": &xfield.ArrayField[struct{}]{
 			Items: &xfield.ObjectField[struct{}]{Properties: schemaMap[struct{}]{
 				"name": &xfield.StringField[struct{}]{},
 			}},
 		}}
-	if err := xfield.ValidateMappingsWithSource(
-		[]xfield.Mapping{{From: "items.0.name", To: "items.1.name"}}, schema, schema,
+	if err := xfield.ValidateMappings(
+		[]xfield.Mapping{xfield.PathMapping([]string{"source"}, []string{"items", "1", "name"})},
+		schema,
 	); err != nil {
 		t.Fatal(err)
 	}
-	if err := xfield.ValidateMappingsWithSource(
-		[]xfield.Mapping{{From: "items.0.missing", To: "items.1.name"}}, schema, schema,
+	if err := xfield.ValidateMappings(
+		[]xfield.Mapping{xfield.PathMapping([]string{"source"}, []string{"items", "1", "missing"})},
+		schema,
 	); err == nil {
-		t.Fatal("missing source path accepted")
+		t.Fatal("missing target path accepted")
+	}
+	if err := xfield.ValidateMappings([]xfield.Mapping{nil}, schema); err == nil {
+		t.Fatal("nil mapping accepted")
+	}
+	if err := xfield.ValidateMappings(
+		[]xfield.Mapping{xfield.MappingFunc(nil, func(any) (any, error) { return nil, nil })},
+		schema,
+	); err == nil {
+		t.Fatal("empty target path accepted")
 	}
 	for _, path := range []string{"", "$", ".items", "items..name", "items[0].name"} {
 		if _, err := xfield.FindFieldByPath(schema, path); err == nil {
@@ -168,8 +252,10 @@ func TestExternalContainer(t *testing.T) {
 	}
 	deps := &dependencies{ctx: context.Background()}
 	out, err := xfield.ApplyMappings(map[string]any{"source": map[string]any{"url": "link"}},
-		[]xfield.Mapping{{From: "source", To: "asset", Children: []xfield.Mapping{{From: "url", To: "image"}}}},
-		schema, deps, xfield.MappingOptions{})
+		[]xfield.Mapping{xfield.PathMapping([]string{"source"}, []string{"asset"},
+			xfield.PathMapping([]string{"url"}, []string{"image"}),
+		)},
+		schema, deps)
 	if err != nil || xfield.GetData(out, []string{"asset", "image"}) != "stored:link" || deps.calls != 1 {
 		t.Fatalf("external container mapping: %v, %v, calls=%d", out, err, deps.calls)
 	}

@@ -33,18 +33,16 @@ func run() error {
 		},
 	}
 	mappings := []xfield.Mapping{
-		{From: "group", To: "title"},
-		{From: "users", To: "members", Children: []xfield.Mapping{
-			{From: "display_name", To: "name"},
-			{From: "points", To: "score"},
-		}},
+		xfield.PathMapping([]string{"group"}, []string{"title"}),
+		xfield.PathMapping([]string{"users"}, []string{"members"},
+			xfield.PathMapping([]string{"display_name"}, []string{"name"}),
+			xfield.PathMapping([]string{"points"}, []string{"score"}),
+		),
 	}
-	if err := xfield.ValidateMappings(mappings, schema, nil); err != nil {
+	if err := xfield.ValidateMappings(mappings, schema); err != nil {
 		return err
 	}
-	out, err := xfield.ApplyMappings(input, mappings, schema, struct{}{}, xfield.MappingOptions{
-		MissingPolicy: xfield.MissingError,
-	})
+	out, err := xfield.ApplyMappings(input, mappings, schema, struct{}{})
 	if err != nil {
 		return err
 	}

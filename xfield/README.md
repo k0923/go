@@ -128,27 +128,30 @@ P 是使用方定义的强类型参数，可包含 context、服务或 URL 生�
 
 ```go
 out, err := xfield.ApplyMappings(input, []xfield.Mapping{
-	{From: "person.full_name", To: "name"},
-}, schema, params, xfield.MappingOptions{
-	MissingPolicy: xfield.MissingSkip,
-})
+	xfield.PathMapping(
+		[]string{"person", "full_name"},
+		[]string{"name"},
+	),
+}, schema, params)
 ```
 
-Mapping.From 指定输入位置，To 指定目标字段，Children 表示对象/数组内的相对映射。ApplyMappings 先取值并构造独立数据，再按部分模型解析，避免单次映射重复解析子字段。需要完整模型时，再使用 ValidateModel；自定义解析有副作用时应注意额外验证会再次调用 Parse。
-
-`ValueResolver` 决定如何从输入取值，字段 Parse 决定目标值是否合法及如何转换：
+`Mapping` 负责来源取值、目标路径和嵌套映射：
 
 ```go
-type ValueResolver interface {
-	Resolve(input any, mappingType MappingType, path string) (value any, exists bool, err error)
+type Mapping interface {
+	Target() []string
+	Resolve(input any) (any, error)
+	Children() []Mapping
 }
 ```
 
-默认 PathResolver 支持点路径。exists=false 表示路径缺失；value=nil、exists=true 表示显式 null。MissingSkip 跳过缺失路径，MissingError 返回错误；显式 null 仍传入 Parse。
+目标路径使用分段形式，因此字段名可以包含 `.`。`Children` 的目标路径相对于当前对象或数组元素。声明及其返回的路径和子映射在使用期间应保持不变。
 
-通过 `ValueResolverFunc` 或自己的实现可以接入 JSON Pointer、GJSON/JSONPath、业务列名。MappingTypeGJSON 需应用提供 Resolver，默认 Resolver 不执行 GJSON 表达式。ValidateMappings 支持目标路径和可选的简单 source 路径检查，不静态推断任意表达式。
+`PathMapping` 使用路径分段从输入取值；来源不存在时解析为 `nil` 并写入目标。跳过、报错、默认值及区分缺失与显式 null 等策略由业务 Mapping 决定。简单自定义取值可使用 `MappingFunc`，复杂实现可以直接实现 `Mapping`。xfield 不检查来源结构，`ValidateMappings` 只检查目标路径和嵌套结构。
 
-映射输入仍可使用 JSON 字符串、[]byte、json.RawMessage，它们作为数据值预先转换为 map/array/json.Number，保留数字精度。这与字段声明的序列化无关。Children 中的 Resolver 接收当前子对象或数组元素。[JSON Pointer 示例](examples/value_resolver/main.go)演示特殊 key、null 和缺失路径。
+`ApplyMappings` 先取值并构造独立数据，再按部分模型解析，避免单次映射重复解析子字段。需要完整模型时，再使用 `ValidateModel`；自定义解析有副作用时应注意额外验证会再次调用 Parse。
+
+映射输入仍可使用 JSON 字符串、[]byte、json.RawMessage，它们作为数据值预先转换为 map/array/json.Number，保留数字精度。这与字段声明的序列化无关。子 Mapping 的 `Resolve` 接收当前子对象或数组元素。[JSON Pointer 示例](examples/value_resolver/main.go)演示业务 Mapping 处理特殊 key、显式 null 和来源缺失。
 
 ## 路径、错误与迁移
 
